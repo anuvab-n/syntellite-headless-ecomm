@@ -251,6 +251,49 @@ export const ChangePasswordRequestSchema = z.strictObject({
 
 export type ChangePasswordRequest = z.infer<typeof ChangePasswordRequestSchema>;
 
+/* ── POST /auth/forgot-password ──────────────────────────────────────────── */
+
+/**
+ * Begin a password reset.
+ *
+ * One field, and `strictObject` so that is enforceable. Reuses the same `emailField` login and
+ * registration use — trimmed and lowercased — so a customer who typed `  Ada@Example.COM  `
+ * when registering is found by the same address here.
+ *
+ * There is deliberately no `redirectUrl` or `returnTo`. A client-supplied URL that ends up in
+ * an email is an open-redirect and a phishing vector: the link would carry a live reset token
+ * to wherever the caller asked. Where the link points is a deployment decision, not a request
+ * parameter.
+ */
+export const ForgotPasswordRequestSchema = z.strictObject({
+  email: emailField,
+});
+
+export type ForgotPasswordRequest = z.infer<typeof ForgotPasswordRequestSchema>;
+
+/* ── POST /auth/reset-password ───────────────────────────────────────────── */
+
+/**
+ * Complete a password reset.
+ *
+ * `token` is bounded but otherwise unvalidated in shape: it is opaque to the client and to this
+ * schema, and the only thing that decides whether it is real is the digest lookup. A regex
+ * asserting base64url would be a second place the token format is defined, and it would reject
+ * a future format change with a `400` that looked like a client bug.
+ *
+ * `newPassword` goes through the SAME `passwordField` as registration and change-password, so
+ * the reset path cannot become a way to set a password the other two would refuse.
+ *
+ * No `email` field. The token identifies the account; asking for the address as well would let
+ * a caller pair a stolen token with a different account and learn something from the mismatch.
+ */
+export const ResetPasswordRequestSchema = z.strictObject({
+  token: z.string().min(1).max(512),
+  newPassword: passwordField,
+});
+
+export type ResetPasswordRequest = z.infer<typeof ResetPasswordRequestSchema>;
+
 /* ── PATCH /users/me ─────────────────────────────────────────────────────── */
 
 /**

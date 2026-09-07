@@ -35,6 +35,7 @@ import { createIdentityRepository } from '../../identity/identity.repository.js'
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
 import { createRefreshSessionRepository } from '../../identity/refresh-session.repository.js';
+import { createPasswordResetRepository } from '../../identity/password-reset.repository.js';
 import { createTokenService } from '../../identity/tokens.js';
 import { createPromotionsRepository } from '../../promotions/promotions.repository.js';
 import { createPromotionsService } from '../../promotions/promotions.service.js';
@@ -107,6 +108,7 @@ describe('orders (integration)', () => {
     const identity = createIdentityService({
       repository: identityRepository,
       sessions: createRefreshSessionRepository({ db: db() }),
+      passwordResets: createPasswordResetRepository({ db: db() }),
       tokens,
       db: db(),
       config: testDb.config,
@@ -143,6 +145,12 @@ describe('orders (integration)', () => {
       promotions: {
         evaluateApplied: (input) => promotions.evaluateApplied(input),
       },
+      /*
+       * This suite exercises checkout, which never consults a payment. A stub answering 'no
+       * payment' is the truthful wiring for it; cancellation against a real payment is covered
+       * by `order-cancellation.integration.test.ts`, which wires the real service.
+       */
+      payments: { statusForOrder: async () => null },
       idempotency: {
         complete: (input) =>
           idempotency.complete({

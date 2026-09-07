@@ -15,6 +15,7 @@ import { createIdentityRepository } from '../../modules/identity/identity.reposi
 import { createIdentityRoutes } from '../../modules/identity/identity.routes.js';
 import { createIdentityService } from '../../modules/identity/identity.service.js';
 import { createRefreshSessionRepository } from '../../modules/identity/refresh-session.repository.js';
+import { createPasswordResetRepository } from '../../modules/identity/password-reset.repository.js';
 import { createTokenService } from '../../modules/identity/tokens.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../modules/stores/index.js';
 import {
@@ -104,6 +105,7 @@ describe('auth rate limiting (integration)', () => {
     const identity = createIdentityService({
       repository: createIdentityRepository({ db: db() }),
       sessions: createRefreshSessionRepository({ db: db() }),
+      passwordResets: createPasswordResetRepository({ db: db() }),
       tokens,
       db: db(),
       config: testDb.config,

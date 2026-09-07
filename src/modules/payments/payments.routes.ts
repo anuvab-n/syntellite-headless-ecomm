@@ -2,21 +2,24 @@ import { Router, type Request, type RequestHandler } from 'express';
 
 import { asyncHandler } from '../../http/async-handler.js';
 import { requireAuth, requireUser, type AccessTokenVerifier } from '../../http/middleware/auth.js';
-import { validate, validatedBody, validatedParams } from '../../http/validate.js';
+import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
 import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
 import {
   InitiatePaymentRequestSchema,
+  ListPaymentsQuerySchema,
   OrderNumberParamsSchema,
+  toPaymentListResponse,
   toHandoffResponse,
   toPaymentResponse,
   type InitiatePaymentRequest,
+  type ListPaymentsQuery,
   type OrderNumberParams,
 } from './dto.js';
 import type { PaymentsService } from './payments.service.js';
 
 /**
- * The payments module's customer HTTP surface: two routes.
+ * The payments module's customer HTTP surface: three customer routes.
  *
  * **No admin or staff surface.** The approved scope names the customer read and initiation
  * endpoints as the minimum and excludes admin payment management outright. An operator payment
@@ -140,6 +143,30 @@ export function createPaymentsRoutes(deps: {
         payment: toPaymentResponse(view, orderNumber),
         ...(handoff === null ? {} : { handoff: toHandoffResponse(handoff) }),
       });
+    }),
+  );
+
+  /**
+   * GET /users/me/payments
+   *
+   * 200 with a page of this customer's payments, newest first.
+   *
+   * Mounted BEFORE the two `/users/me/orders/...` routes below only incidentally — the paths do
+   * not overlap. `limit` defaults to 20 and is capped at 100, matching the order list, and each
+   * row carries its `orderNumber` so a client can drill in without a second lookup.
+   *
+   * `history` is empty on a list row; the single-payment read is where the timeline lives.
+   */
+  router.get(
+    '/users/me/payments',
+    auth,
+    validate({ query: ListPaymentsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { limit, offset } = validatedQuery<ListPaymentsQuery>(req);
+      const { userId, storeId } = scope(req);
+
+      const page = await payments.listForUser({ userId, storeId, limit, offset });
+      res.status(200).json(toPaymentListResponse(page));
     }),
   );
 

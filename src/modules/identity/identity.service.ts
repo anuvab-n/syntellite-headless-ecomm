@@ -26,6 +26,12 @@ import {
   type RefreshSessionRepository,
 } from './refresh-session.repository.js';
 import { generateRefreshToken, hashRefreshToken } from './refresh-token.js';
+import {
+  generatePasswordResetToken,
+  hashPasswordResetToken,
+  PASSWORD_RESET_TTL_MINUTES,
+} from './password-reset-token.js';
+import type { PasswordResetRepository } from './password-reset.repository.js';
 import { AUTH_AUDIT, USER_AGGREGATE, USER_EVENTS, USER_RESOURCE } from './identity.events.js';
 import type { TokenService } from './tokens.js';
 import {
@@ -34,6 +40,7 @@ import {
   type LoginRequest,
   type LoginResponse,
   type RefreshRequest,
+  type ResetPasswordRequest,
   type UpdateProfileRequest,
 } from './dto.js';
 
@@ -101,6 +108,26 @@ export class InvalidRefreshToken extends DomainError {
   }
 }
 
+/**
+ * The single response to every reset-token failure.
+ *
+ * ONE error for: never existed, malformed, expired, already spent, minted for another store,
+ * or belonging to an account since deactivated. A caller holding a token learns only whether
+ * it worked — telling "expired" from "wrong" would help somebody with access to an old
+ * inbox decide which stale link is worth racing.
+ *
+ * 400 rather than 401: the request is malformed with respect to the resource it names, and
+ * there is no credential to re-present. Modelled on how a bad path parameter is answered.
+ */
+export class InvalidResetToken extends DomainError {
+  readonly code = 'INVALID_RESET_TOKEN';
+  readonly statusCode = 400;
+
+  constructor() {
+    super('This password reset link is invalid or has expired. Please request a new one.');
+  }
+}
+
 /** `revoked_reason` written when a replayed token triggers family revocation. */
 export const REVOKED_REASON_ROTATION_REUSE = 'rotation_reuse';
 
@@ -115,6 +142,15 @@ export const REVOKED_REASON_LOGOUT = 'logout';
  * old one was cut" — different events with different follow-up.
  */
 export const REVOKED_REASON_PASSWORD_CHANGE = 'password_change';
+
+/**
+ * `revoked_reason` written when a password RESET invalidates every session.
+ *
+ * Distinct from `password_change`, and the distinction is the point: a change was made by
+ * somebody who knew the old password, a reset by somebody who proved control of the inbox.
+ * During an investigation those are very different facts about how an account moved hands.
+ */
+export const REVOKED_REASON_PASSWORD_RESET = 'password_reset';
 
 /**
  * A password nobody can log in with, hashed to give unknown accounts something to verify
@@ -152,6 +188,8 @@ export type LoginAttemptTracker = {
 export function createIdentityService(deps: {
   repository: IdentityRepository;
   sessions: RefreshSessionRepository;
+  /** Reset-token persistence. Its own repository, like `sessions`. */
+  passwordResets: PasswordResetRepository;
   tokens: TokenService;
   db: Database;
   config: Config;
@@ -165,7 +203,7 @@ export function createIdentityService(deps: {
   events: EventBus;
   audit: AuditTrail;
 }) {
-  const { repository, sessions, tokens, db, config, logger, events, audit } = deps;
+  const { repository, sessions, passwordResets, tokens, db, config, logger, events, audit } = deps;
 
   /**
    * Report an attempt outcome to the failure budget. Never throws.
@@ -624,6 +662,200 @@ export function createIdentityService(deps: {
      * outstanding access token stop working, and §20 already records that trade-off honestly
      * rather than implying a revocation that does not happen.
      */
+    /**
+     * Begin a password reset. **Always succeeds, whatever the email.**
+     *
+     * ## Why the answer never varies
+     *
+     * A forgot-password endpoint that said "no such account" would be a free account-existence
+     * oracle: anyone could test an address list against it and learn who shops here. So an
+     * unknown address, a deactivated account and a soft-deleted one all take the same path as a
+     * real one — the caller gets the same response, and the only difference is that no token is
+     * issued and no mail is queued.
+     *
+     * That makes the endpoint's timing the remaining tell, and it is deliberately not evened
+     * out here: an artificial delay would be a guess at the real path's cost that drifts the
+     * moment anything changes. The rate limiter is what makes the oracle impractical, and it is
+     * applied per IP and per email at the route.
+     *
+     * ## What is emitted, and what is in it
+     *
+     * The token goes into the outbox payload, because the email has to contain it and the
+     * mailer is a separate process. That is a real trade-off, stated plainly: a live reset
+     * token is briefly persisted in `outbox_event.payload`. It is bounded by being single-use
+     * and by `PASSWORD_RESET_TTL_MINUTES`, and the row is purged with the rest of the outbox.
+     * The alternative — sending mail inline — would put an SMTP round trip inside the request
+     * and lose the retry the outbox gives, which for the mail that recovers an account is the
+     * worse bargain.
+     *
+     * Emitted INSIDE the transaction that issued the token, so a queued mail always has a token
+     * behind it and a committed token always has a mail queued.
+     */
+    async requestPasswordReset(params: { storeId: string; email: string }): Promise<void> {
+      const { storeId } = params;
+      const email = params.email.trim().toLowerCase();
+
+      const user = await repository.findCredentialsByEmail({ storeId, email });
+
+      if (!user || !user.isActive) {
+        /*
+         * Logged at `info` with the OUTCOME but never the email: this is a routine event, and a
+         * log of addresses that tried to reset is a log of who has an account here.
+         */
+        logger.info({ storeId, issued: false }, 'password_reset_requested_no_account');
+        return;
+      }
+
+      const token = generatePasswordResetToken();
+      const at = new Date();
+      const expiresAt = new Date(at.getTime() + PASSWORD_RESET_TTL_MINUTES * 60_000);
+
+      await withTransaction(db, logger, async () => {
+        await passwordResets.issue({
+          storeId,
+          userId: user.id,
+          tokenHash: hashPasswordResetToken(token),
+          expiresAt,
+          at,
+        });
+
+        await events.emit({
+          type: USER_EVENTS.passwordResetRequested,
+          aggregateType: USER_AGGREGATE,
+          aggregateId: user.id,
+          storeId,
+          payload: {
+            email,
+            /** The bearer credential. See the note above on why it is here. */
+            token,
+            expiresAt: expiresAt.toISOString(),
+          },
+        });
+
+        await audit.record({
+          storeId,
+          actor: { type: 'customer', userId: user.id },
+          action: AUTH_AUDIT.passwordResetRequested,
+          resourceType: USER_RESOURCE,
+          resourceId: user.id,
+          metadata: { expiresAt: expiresAt.toISOString() },
+        });
+      });
+
+      logger.info({ storeId, userId: user.id, issued: true }, 'password_reset_requested');
+    },
+
+    /**
+     * Complete a password reset with a token from the email.
+     *
+     * ## One error for every failure
+     *
+     * Unknown token, expired token, already-used token, and a token whose account has since
+     * been deactivated all raise the same `InvalidResetToken`. A caller holding a token learns
+     * only whether it worked — distinguishing "expired" from "wrong" would tell an attacker
+     * with a stolen inbox which of several old links is worth racing.
+     *
+     * ## Every session is cut
+     *
+     * A reset is the recovery path for an account the owner may have LOST control of, so it
+     * revokes every refresh session exactly as `changePassword` does. Skipping that would leave
+     * an attacker's session alive after the owner had "recovered" the account, which is the
+     * failure mode a reset exists to close.
+     *
+     * The token is spent, the password set, the sessions revoked and the audit written in ONE
+     * transaction. Any partial application is a security hole: a spent token with an unchanged
+     * password locks the customer out, and a changed password with a live token leaves a second
+     * free takeover in the inbox.
+     */
+    async resetPassword(params: { storeId: string; input: ResetPasswordRequest }): Promise<void> {
+      const { storeId, input } = params;
+
+      const record = await passwordResets.findByHash(hashPasswordResetToken(input.token));
+      const at = new Date();
+
+      /*
+       * The store is checked against the resolved one. The token lookup is global by necessity
+       * — see the repository — so this is where a token minted for another tenant is refused,
+       * and it must not be skipped: without it a token from store A would reset an account in
+       * store A while the request was scoped to store B.
+       */
+      if (
+        !record ||
+        record.storeId !== storeId ||
+        record.usedAt !== null ||
+        record.expiresAt.getTime() <= at.getTime()
+      ) {
+        logger.warn(
+          {
+            storeId,
+            found: record !== undefined,
+            spent: record?.usedAt !== null && record !== undefined,
+          },
+          'password_reset_rejected_invalid_token',
+        );
+        throw new InvalidResetToken();
+      }
+
+      const user = await repository.findCredentialsById({ storeId, userId: record.userId });
+      if (!user || !user.isActive) {
+        logger.warn({ storeId, userId: record.userId }, 'password_reset_rejected_not_active');
+        throw new InvalidResetToken();
+      }
+
+      const newHash = await hashPassword(input.newPassword);
+
+      await withTransaction(db, logger, async () => {
+        /**
+         * Spend the token FIRST.
+         *
+         * The `used_at IS NULL` predicate makes this the compare-and-set that decides a race
+         * between two requests carrying the same token. Doing it before the password write
+         * means the loser rolls back having changed nothing, rather than both setting a
+         * password and one of them winning arbitrarily.
+         */
+        const spent = await passwordResets.markUsed({ id: record.id, at });
+        if (!spent) {
+          logger.warn({ storeId, userId: user.id }, 'password_reset_token_already_spent');
+          throw new InvalidResetToken();
+        }
+
+        const updated = await repository.updatePasswordHash({
+          storeId,
+          userId: user.id,
+          expectedCurrentHash: user.passwordHash,
+          passwordHash: newHash,
+        });
+
+        if (!updated) {
+          /*
+           * A concurrent change rehashed the row. A `Conflict`, not an invalid token: the token
+           * WAS valid, and telling the customer it was not would send them to request another
+           * one for a problem retrying solves.
+           */
+          logger.warn({ storeId, userId: user.id }, 'password_reset_conflicted');
+          throw new Conflict('The password was changed by another request. Please try again.');
+        }
+
+        const revokedCount = await sessions.revokeAllForUser({
+          storeId,
+          userId: user.id,
+          reason: REVOKED_REASON_PASSWORD_RESET,
+          at,
+        });
+
+        await audit.record({
+          storeId,
+          actor: { type: 'customer', userId: user.id },
+          action: AUTH_AUDIT.passwordReset,
+          resourceType: USER_RESOURCE,
+          resourceId: user.id,
+          metadata: { revokedCount },
+        });
+
+        logger.info({ storeId, userId: user.id, revokedCount }, 'password_reset_succeeded');
+      });
+    },
+
     async changePassword(params: {
       storeId: string;
       userId: string;

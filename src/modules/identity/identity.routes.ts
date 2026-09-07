@@ -14,12 +14,16 @@ import type { Logger } from '../../shared/logger.js';
 import {
   ChangePasswordRequestSchema,
   LoginRequestSchema,
+  ForgotPasswordRequestSchema,
   RegisterRequestSchema,
+  ResetPasswordRequestSchema,
   UpdateProfileRequestSchema,
   toUserResponse,
   type ChangePasswordRequest,
   type LoginRequest,
+  type ForgotPasswordRequest,
   type RegisterRequest,
+  type ResetPasswordRequest,
   RefreshRequestSchema,
   type RefreshRequest,
   type UpdateProfileRequest,
@@ -107,6 +111,8 @@ export function createIdentityRoutes(deps: {
   const limiters = (options: {
     ipBucket: string;
     email: boolean;
+    /** Which per-email bucket. Defaults to login's, which is what login and nothing else wants. */
+    emailBucket?: string | undefined;
     /** Override the per-IP policy. Refresh uses its own; login and register share the default. */
     ipPolicy?: RateLimitPolicy | undefined;
   }): RequestHandler[] => {
@@ -127,7 +133,7 @@ export function createIdentityRoutes(deps: {
         rateLimitByEmail({
           limiter,
           policy: emailPolicy,
-          bucket: RATE_LIMIT_BUCKETS.loginEmail,
+          bucket: options.emailBucket ?? RATE_LIMIT_BUCKETS.loginEmail,
           logger,
         }),
       );
@@ -167,6 +173,71 @@ export function createIdentityRoutes(deps: {
       // `toUserResponse` is an allowlist, so `passwordHash` cannot reach a response even if
       // the repository were later changed to select it.
       res.status(201).json({ user: toUserResponse(user) });
+    }),
+  );
+
+  /**
+   * POST /auth/forgot-password
+   *
+   * **204, always.** An unknown address, a deactivated account and a real one are
+   * indistinguishable, because any difference here is an account-existence oracle: anyone
+   * could test an address list against this endpoint and learn who shops here.
+   *
+   * That makes rate limiting the actual defence, and it is applied on both dimensions — per IP
+   * so the endpoint cannot be swept, and per EMAIL so one customer's inbox cannot be flooded
+   * with reset mail by someone who knows their address.
+   *
+   * No body in the response, and nothing about whether a mail was queued. A client cannot
+   * usefully act on that information and an attacker very much can.
+   */
+  router.post(
+    '/auth/forgot-password',
+    ...limiters({
+      ipBucket: RATE_LIMIT_BUCKETS.forgotPasswordIp,
+      email: true,
+      emailBucket: RATE_LIMIT_BUCKETS.forgotPasswordEmail,
+    }),
+    validate({ body: ForgotPasswordRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+      await identity.requestPasswordReset({
+        storeId: store.id,
+        email: validatedBody<ForgotPasswordRequest>(req).email,
+      });
+      res.status(204).send();
+    }),
+  );
+
+  /**
+   * POST /auth/reset-password
+   *
+   * 204 on success. The customer must sign in with the new password afterwards — no tokens are
+   * issued here, for the same reason registration issues none: completing a reset and
+   * establishing a session are separate operations, and handing out a session would make this
+   * endpoint a login that skipped the password check it just replaced.
+   *
+   * **Every existing session is revoked.** A reset is the recovery path for an account whose
+   * owner may have lost control of it, so leaving an attacker's refresh session alive would
+   * defeat the point of resetting.
+   *
+   * Rate limited per IP only — the request carries a token rather than an address, so there is
+   * no per-account key to bucket on, and guessing a 256-bit token is not a threat a counter
+   * defends against. The limit is there to cap the Argon2 hashing cost of a flood.
+   *
+   * `400 INVALID_RESET_TOKEN` covers every failure: unknown, malformed, expired, already used,
+   * minted for another store, or belonging to an account since deactivated.
+   */
+  router.post(
+    '/auth/reset-password',
+    ...limiters({ ipBucket: RATE_LIMIT_BUCKETS.resetPasswordIp, email: false }),
+    validate({ body: ResetPasswordRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+      await identity.resetPassword({
+        storeId: store.id,
+        input: validatedBody<ResetPasswordRequest>(req),
+      });
+      res.status(204).send();
     }),
   );
 

@@ -182,6 +182,43 @@ export function createOrdersRoutes(deps: {
    * Every value returned is a snapshot taken at checkout. Renaming the product, repricing or
    * deleting the SKU, or editing or deleting the address changes nothing here.
    */
+  /**
+   * POST /users/me/orders/:orderNumber/cancel
+   *
+   * 200 with the cancelled order. **No request body** — there is nothing to supply: the order
+   * comes from the path, the customer from the token, and the only decision is one the server
+   * makes about eligibility.
+   *
+   * No `Idempotency-Key`, deliberately. Cancellation has a natural guard — the
+   * `status = 'placed'` predicate on the update — so a duplicate request cannot cancel twice.
+   * It answers `409` rather than replaying a `200`, because a client that is told "cancelled"
+   * twice cannot tell whether it cancelled something or nothing, and for a state change that is
+   * worth knowing.
+   *
+   * Failure modes: `400` for a malformed order number; `404` for an order that is unknown,
+   * another customer's or another store's — all indistinguishable; `409 ORDER_NOT_CANCELLABLE`
+   * when the order is already cancelled (`details.reason = "status"`), when a payment is still
+   * in progress (`"payment_in_progress"`), or when it has been paid (`"paid"`).
+   *
+   * **Paid orders cannot be cancelled**, because refunds do not exist yet and cancelling one
+   * would take money the system has no way to return.
+   */
+  router.post(
+    '/users/me/orders/:orderNumber/cancel',
+    auth,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const { userId, storeId } = scope(req);
+      const view = await orders.cancelOrder({
+        userId,
+        storeId,
+        orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+        actor: customerActor(req),
+      });
+      res.status(200).json({ order: toOrderResponse(view) });
+    }),
+  );
+
   router.get(
     '/users/me/orders/:orderNumber',
     auth,

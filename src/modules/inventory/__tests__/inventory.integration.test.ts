@@ -24,6 +24,7 @@ import { createIdentityRepository } from '../../identity/identity.repository.js'
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
 import { createRefreshSessionRepository } from '../../identity/refresh-session.repository.js';
+import { createPasswordResetRepository } from '../../identity/password-reset.repository.js';
 import { createTokenService } from '../../identity/tokens.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
 import { createInventoryRepository } from '../inventory.repository.js';
@@ -83,6 +84,7 @@ describe('inventory (integration)', () => {
     const identity = createIdentityService({
       repository: identityRepository,
       sessions: createRefreshSessionRepository({ db: db() }),
+      passwordResets: createPasswordResetRepository({ db: db() }),
       tokens,
       db: db(),
       config: testDb.config,

@@ -18,6 +18,7 @@ import { createIdentityRepository } from '../identity.repository.js';
 import { createIdentityRoutes } from '../identity.routes.js';
 import { createIdentityService } from '../identity.service.js';
 import { createRefreshSessionRepository } from '../refresh-session.repository.js';
+import { createPasswordResetRepository } from '../password-reset.repository.js';
 import { createTokenService } from '../tokens.js';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 
@@ -61,6 +62,7 @@ describe('PATCH /api/v1/users/me (integration)', () => {
     const identity = createIdentityService({
       repository,
       sessions: createRefreshSessionRepository({ db: db() }),
+      passwordResets: createPasswordResetRepository({ db: db() }),
       tokens,
       db: db(),
       config: testDb.config,

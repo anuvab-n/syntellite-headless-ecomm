@@ -18,7 +18,13 @@ import {
   type Currency,
 } from '../../shared/money.js';
 import { ORDER_AUDIT, ORDER_RESOURCE } from './orders.events.js';
-import type { OrderLineRecord, OrderRecord, OrdersRepository } from './orders.repository.js';
+import {
+  CANCELLABLE_ORDER_STATUSES,
+  CANCELLED_ORDER_STATUS,
+  type OrderLineRecord,
+  type OrderRecord,
+  type OrdersRepository,
+} from './orders.repository.js';
 
 /**
  * Checkout, and reading the orders it produced.
@@ -140,7 +146,38 @@ export type CheckoutIdempotency = {
   }): Promise<void>;
 };
 
+/**
+ * What this module needs to know about an order's payment, and nothing more.
+ *
+ * Declared HERE because orders is the consumer; the payments module never imports it, and
+ * `container.ts` adapts one onto the other. `no-cross-module-imports` is satisfied by
+ * construction rather than by an exception.
+ *
+ * Deliberately a STATUS rather than a payment. Cancellation needs to answer one question — has
+ * money moved, or might it be moving — and handing this module a whole payment would let it
+ * start reasoning about amounts and providers, which are not its business.
+ *
+ * `null` means no payment exists. That is a different answer from any status, and the
+ * cancellation rule treats it differently, so it must not be collapsed into one.
+ */
+export type OrderPayments = {
+  statusForOrder(params: { orderId: string; storeId: string }): Promise<string | null>;
+};
+
 /* ── Errors ──────────────────────────────────────────────────────────────── */
+
+/**
+ * The order cannot be cancelled. A `409`: a conflict with existing state.
+ *
+ * Carries a machine-readable `reason` in `details` so a client can tell the two cases apart
+ * without parsing prose — one is "wait and try again", the other is "contact support".
+ */
+export class OrderNotCancellable extends Conflict {
+  override readonly code = 'ORDER_NOT_CANCELLABLE';
+  constructor(reason: string, message: string) {
+    super(message, { reason });
+  }
+}
 
 /** Nothing to order. A `422`: well-formed request, business rules say no. */
 export class CheckoutCartEmpty extends BusinessRuleViolation {
@@ -236,11 +273,12 @@ export function createOrdersService(deps: {
   cart: CheckoutCart;
   promotions: CheckoutPromotions;
   idempotency: CheckoutIdempotency;
+  payments: OrderPayments;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
 }) {
-  const { repository, cart, promotions, idempotency, db, audit, logger } = deps;
+  const { repository, cart, promotions, idempotency, payments, db, audit, logger } = deps;
 
   /**
    * A store configured with a currency this build does not know is an OPERATOR error, so it
@@ -552,6 +590,164 @@ export function createOrdersService(deps: {
         );
 
         return view;
+      });
+    },
+
+    /**
+     * Cancel one of this customer's orders.
+     *
+     * ## The rule, and why it is this rule
+     *
+     * Refunds are out of scope, so nothing here may create money the system cannot return.
+     * That fixes the eligibility test to the payment's state:
+     *
+     * | Payment state        | Cancel? | Why |
+     * | -------------------- | ------- | --- |
+     * | none                 | yes     | nobody has been asked for money |
+     * | `failed`, `expired`  | yes     | terminal and unpaid; no money moved |
+     * | `pending`            | **no**  | an online capture may land at any moment |
+     * | `succeeded`          | **no**  | money was taken; releasing it needs a refund |
+     *
+     * `pending` is the interesting one. It is refused rather than allowed because a pending
+     * gateway payment is a race with real money: the customer's browser may be mid-checkout,
+     * and a capture arriving a second after we cancelled would leave a cancelled order that
+     * had been paid — the exact state the refund exclusion makes unfixable. The customer's
+     * route out is to let the payment fail or expire, and then cancel.
+     *
+     * ## Concurrency
+     *
+     * The order row is locked FOR UPDATE first, so two concurrent cancellations serialise, and
+     * the payment status is read INSIDE that lock — reading it before would let a payment be
+     * created between the read and the write. The `status = 'placed'` predicate on the update
+     * is the second defence, and it is what makes the loser of a race learn from a row count
+     * rather than by overwriting the winner.
+     *
+     * A payment created concurrently with a cancellation is the mirror hazard, and it is
+     * covered on the other side: payment initiation refuses an order whose status is not
+     * `placed`, and it reads that status inside its own transaction.
+     */
+    async cancelOrder(params: {
+      userId: string;
+      storeId: string;
+      orderNumber: string;
+      actor: AuditActor;
+    }): Promise<OrderView> {
+      return withTransaction(db, logger, async () => {
+        const header = await repository.lockOwnedOrderByNumber({
+          orderNumber: params.orderNumber,
+          userId: params.userId,
+          storeId: params.storeId,
+        });
+        if (!header) throw new NotFound('order');
+
+        if (!CANCELLABLE_ORDER_STATUSES.includes(header.status as 'placed')) {
+          /*
+           * Already cancelled, or in some future status that forbids it. Idempotency is
+           * deliberately NOT offered here: a second cancellation is a conflict rather than a
+           * no-op, because a client that gets `204` twice cannot tell whether it cancelled
+           * something or nothing.
+           */
+          logger.info(
+            { storeId: params.storeId, orderNumber: params.orderNumber, status: header.status },
+            'order_cancel_rejected_status',
+          );
+          throw new OrderNotCancellable(
+            'status',
+            `An order with status ${header.status} cannot be cancelled.`,
+          );
+        }
+
+        const paymentStatus = await payments.statusForOrder({
+          orderId: header.id,
+          storeId: params.storeId,
+        });
+
+        if (paymentStatus === 'succeeded') {
+          logger.info(
+            { storeId: params.storeId, orderNumber: params.orderNumber },
+            'order_cancel_rejected_paid',
+          );
+          throw new OrderNotCancellable(
+            'paid',
+            'This order has been paid for and cannot be cancelled. Refunds are not supported yet.',
+          );
+        }
+
+        if (paymentStatus === 'pending') {
+          logger.info(
+            { storeId: params.storeId, orderNumber: params.orderNumber },
+            'order_cancel_rejected_payment_in_progress',
+          );
+          throw new OrderNotCancellable(
+            'payment_in_progress',
+            'A payment for this order is still in progress. Cancel once it has failed or expired.',
+          );
+        }
+
+        const at = new Date();
+
+        const moved = await repository.updateOrderStatus({
+          orderId: header.id,
+          storeId: params.storeId,
+          fromStatus: header.status,
+          toStatus: CANCELLED_ORDER_STATUS,
+          at,
+        });
+
+        if (!moved) {
+          /*
+           * The row changed under the lock, which in practice means a concurrent cancellation
+           * committed first. Throwing rolls this transaction back, so no history row or audit
+           * entry records a transition that did not happen.
+           */
+          logger.info(
+            { storeId: params.storeId, orderNumber: params.orderNumber },
+            'order_cancel_lost_race',
+          );
+          throw new OrderNotCancellable('status', 'This order was already cancelled.');
+        }
+
+        /** Append-only, exactly as checkout writes the creation row. §3 #8. */
+        await repository.insertStatusHistory({
+          id: newId(),
+          orderId: header.id,
+          storeId: params.storeId,
+          fromStatus: header.status,
+          toStatus: CANCELLED_ORDER_STATUS,
+          actorType: params.actor.type,
+          actorUserId: 'userId' in params.actor ? params.actor.userId : null,
+        });
+
+        await audit.record({
+          storeId: params.storeId,
+          actor: params.actor,
+          action: ORDER_AUDIT.cancelled,
+          resourceType: ORDER_RESOURCE,
+          resourceId: header.id,
+          metadata: {
+            orderNumber: header.orderNumber,
+            from: header.status,
+            to: CANCELLED_ORDER_STATUS,
+            /* Recorded so an investigation can see the order was genuinely unpaid. */
+            paymentStatus: paymentStatus ?? 'none',
+          },
+        });
+
+        logger.info(
+          {
+            storeId: params.storeId,
+            userId: params.userId,
+            orderId: header.id,
+            orderNumber: header.orderNumber,
+          },
+          'order_cancelled',
+        );
+
+        const lines = await repository.listOrderLines({
+          orderId: header.id,
+          storeId: params.storeId,
+        });
+        return { order: { ...header, status: CANCELLED_ORDER_STATUS }, lines };
       });
     },
 

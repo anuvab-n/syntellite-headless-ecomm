@@ -34,6 +34,7 @@ import { createIdentityRepository } from '../../identity/identity.repository.js'
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
 import { createRefreshSessionRepository } from '../../identity/refresh-session.repository.js';
+import { createPasswordResetRepository } from '../../identity/password-reset.repository.js';
 import { createTokenService } from '../../identity/tokens.js';
 import { createOrdersRepository } from '../../orders/orders.repository.js';
 import { createOrdersRoutes } from '../../orders/orders.routes.js';
@@ -122,6 +123,7 @@ describe('payments (integration)', () => {
     const identity = createIdentityService({
       repository: identityRepository,
       sessions: createRefreshSessionRepository({ db: db() }),
+      passwordResets: createPasswordResetRepository({ db: db() }),
       tokens,
       db: db(),
       config: testDb.config,
@@ -155,6 +157,11 @@ describe('payments (integration)', () => {
         markCheckedOut: (input) => cartService.markCheckedOut(input),
       },
       promotions: { evaluateApplied: (input) => promotions.evaluateApplied(input) },
+      /*
+       * Late-bound, exactly as `container.ts` does it: `payments` is constructed below and
+       * needs `orders` through its own port, so the arrow defers the lookup to call time.
+       */
+      payments: { statusForOrder: (input) => payments.statusForOrder(input) },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -1480,6 +1487,216 @@ describe('payments (integration)', () => {
         key: 'k-2-00000002',
       });
       expect(second.status).toBe(409);
+    });
+  });
+
+  /* ══ The customer's payment list ════════════════════════════════════════ */
+
+  describe('listing payments', () => {
+    /** Narrow the response body once, so the assertions below are not calls on `any`. */
+    const orderNumbersOf = (body: unknown): string[] =>
+      (body as { payments: { orderNumber: string }[] }).payments.map((p) => p.orderNumber);
+
+    /** Create `count` orders, each with a COD payment, oldest first. */
+    async function givenPayments(
+      harness: Harness,
+      options: { token: string; userId: string; count: number },
+    ): Promise<string[]> {
+      const numbers: string[] = [];
+      for (let i = 0; i < options.count; i += 1) {
+        const { orderNumber } = await givenOrder(harness, {
+          token: options.token,
+          userId: options.userId,
+          code: `LIST-${String(i)}`,
+        });
+        expect(
+          (
+            await initiate(harness, {
+              token: options.token,
+              orderNumber,
+              method: 'cod',
+              key: `list-key-${String(i).padStart(4, '0')}`,
+            })
+          ).status,
+        ).toBe(201);
+        numbers.push(orderNumber);
+      }
+      return numbers;
+    }
+
+    it('returns this customer’s payments, newest first, with their order numbers', async () => {
+      const harness = build();
+      const { token, userId } = await signIn(harness.app, harness.identity);
+      const numbers = await givenPayments(harness, { token, userId, count: 3 });
+
+      const response = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.payments).toHaveLength(3);
+      expect(response.body.pagination).toEqual({ limit: 20, offset: 0, total: 3 });
+
+      /* Newest first: the reverse of creation order. */
+      expect(orderNumbersOf(response.body)).toEqual([...numbers].reverse());
+
+      /* Each row is a full payment, with an empty history. */
+      for (const row of response.body.payments) {
+        expect(row).toMatchObject({ method: 'cod', provider: null, status: 'pending' });
+        expect(row.history).toEqual([]);
+      }
+    });
+
+    it('paginates, and reports the total independently of the page', async () => {
+      const harness = build();
+      const { token, userId } = await signIn(harness.app, harness.identity);
+      const numbers = await givenPayments(harness, { token, userId, count: 3 });
+      const newestFirst = [...numbers].reverse();
+
+      const page1 = await request(harness.app)
+        .get('/api/v1/users/me/payments?limit=2&offset=0')
+        .set('authorization', `Bearer ${token}`);
+      expect(page1.status).toBe(200);
+      expect(orderNumbersOf(page1.body)).toEqual(newestFirst.slice(0, 2));
+      expect(page1.body.pagination).toEqual({ limit: 2, offset: 0, total: 3 });
+
+      const page2 = await request(harness.app)
+        .get('/api/v1/users/me/payments?limit=2&offset=2')
+        .set('authorization', `Bearer ${token}`);
+      expect(orderNumbersOf(page2.body)).toEqual(newestFirst.slice(2));
+      expect(page2.body.pagination).toEqual({ limit: 2, offset: 2, total: 3 });
+
+      /* Past the end is an empty page, not an error. */
+      const page3 = await request(harness.app)
+        .get('/api/v1/users/me/payments?limit=2&offset=99')
+        .set('authorization', `Bearer ${token}`);
+      expect(page3.status).toBe(200);
+      expect(page3.body.payments).toEqual([]);
+      expect(page3.body.pagination.total).toBe(3);
+    });
+
+    it('returns an empty page for a customer with no payments', async () => {
+      const harness = build();
+      const { token } = await signIn(harness.app, harness.identity);
+
+      const response = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        payments: [],
+        pagination: { limit: 20, offset: 0, total: 0 },
+      });
+    });
+
+    /** The isolation property: one customer's list can never contain another's payment. */
+    it("never includes another customer's payments", async () => {
+      const harness = build();
+      const ada = await signIn(harness.app, harness.identity, { email: 'ada@example.com' });
+      const adaOrders = await givenPayments(harness, {
+        token: ada.token,
+        userId: ada.userId,
+        count: 2,
+      });
+
+      const bob = await signIn(harness.app, harness.identity, { email: 'bob@example.com' });
+
+      const bobList = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${bob.token}`);
+      expect(bobList.status).toBe(200);
+      expect(bobList.body.payments).toEqual([]);
+      expect(bobList.body.pagination.total).toBe(0);
+
+      const adaList = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${ada.token}`);
+      expect(adaList.body.pagination.total).toBe(2);
+      expect(orderNumbersOf(adaList.body).sort()).toEqual([...adaOrders].sort());
+    });
+
+    it('rejects an unauthenticated request', async () => {
+      const harness = build();
+      expect((await request(harness.app).get('/api/v1/users/me/payments')).status).toBe(401);
+    });
+
+    it('validates pagination and rejects unknown query keys', async () => {
+      const harness = build();
+      const { token } = await signIn(harness.app, harness.identity);
+
+      for (const query of [
+        '?limit=0',
+        '?limit=101',
+        '?limit=-1',
+        '?limit=abc',
+        '?limit=1.5',
+        '?offset=-1',
+        '?offset=abc',
+        '?page=2',
+        '?sort=asc',
+      ]) {
+        const response = await request(harness.app)
+          .get(`/api/v1/users/me/payments${query}`)
+          .set('authorization', `Bearer ${token}`);
+        expect(response.status, query).toBe(400);
+      }
+
+      /* The boundaries themselves are accepted. */
+      for (const query of ['?limit=1', '?limit=100', '?offset=0']) {
+        const response = await request(harness.app)
+          .get(`/api/v1/users/me/payments${query}`)
+          .set('authorization', `Bearer ${token}`);
+        expect(response.status, query).toBe(200);
+      }
+    });
+
+    /** A list row must not publish more than the single read does. */
+    it('publishes exactly the documented fields on a list row', async () => {
+      const harness = build();
+      const { token, userId } = await signIn(harness.app, harness.identity);
+      await givenPayments(harness, { token, userId, count: 1 });
+
+      const response = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${token}`);
+
+      expect(Object.keys(response.body.payments[0]).sort()).toEqual([
+        'amount',
+        'createdAt',
+        'currency',
+        'failureCode',
+        'history',
+        'method',
+        'orderNumber',
+        'provider',
+        'status',
+        'updatedAt',
+      ]);
+
+      const serialised = JSON.stringify(response.body);
+      for (const leaked of ['userId', 'storeId', 'orderId', 'amountMinor', 'providerRef']) {
+        expect(serialised).not.toContain(leaked);
+      }
+    });
+
+    it('reflects a transition on the next read', async () => {
+      const harness = build();
+      const { token, userId } = await signIn(harness.app, harness.identity);
+      const { orderNumber } = await givenOrder(harness, { token, userId });
+      expect((await initiate(harness, { token, orderNumber })).status).toBe(201);
+
+      const before = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${token}`);
+      expect(before.body.payments[0].status).toBe('pending');
+
+      expect((await webhook(harness)).status).toBe(200);
+
+      const after = await request(harness.app)
+        .get('/api/v1/users/me/payments')
+        .set('authorization', `Bearer ${token}`);
+      expect(after.body.payments[0].status).toBe('succeeded');
     });
   });
 

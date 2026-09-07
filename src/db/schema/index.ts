@@ -13,6 +13,7 @@
 export * from './_shared.js';
 export * from './store.js';
 export * from './identity.js';
+export * from './password-reset.js';
 export * from './catalogue.js';
 export * from './outbox.js';
 export * from './idempotency.js';

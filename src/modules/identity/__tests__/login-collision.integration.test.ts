@@ -46,6 +46,7 @@ const { createIdentityRoutes } = await import('../identity.routes.js');
 const { createIdentityService } = await import('../identity.service.js');
 const { hashPassword } = await import('../password.js');
 const { createRefreshSessionRepository } = await import('../refresh-session.repository.js');
+const { createPasswordResetRepository } = await import('../password-reset.repository.js');
 const { hashRefreshToken } = await import('../refresh-token.js');
 const { createTokenService } = await import('../tokens.js');
 
@@ -82,6 +83,7 @@ describe('refresh-token collision handling (integration)', () => {
     const identity = createIdentityService({
       repository,
       sessions: createRefreshSessionRepository({ db: db() }),
+      passwordResets: createPasswordResetRepository({ db: db() }),
       tokens,
       db: db(),
       config: testDb.config,

@@ -40,6 +40,21 @@ export const RATE_LIMIT_BUCKETS = {
   loginEmail: 'login:email',
   registerIp: 'register:ip',
   refreshIp: 'refresh:ip',
+  /**
+   * Password reset, and it needs BOTH dimensions.
+   *
+   * Per IP, because the endpoint is unauthenticated and each call costs a database read and a
+   * queued mail. Per EMAIL, because without it one address can be targeted repeatedly — which
+   * is both a mail-bombing vector aimed at a customer and the practical way an
+   * account-existence oracle would be worked, given the response never varies.
+   *
+   * Separate buckets from login's, so a customer who forgot their password does not spend the
+   * budget that lets them sign in once they have reset it.
+   */
+  forgotPasswordIp: 'forgot_password:ip',
+  forgotPasswordEmail: 'forgot_password:email',
+  /** Completing a reset. Per IP only: the request carries a token, not an address. */
+  resetPasswordIp: 'reset_password:ip',
 } as const;
 
 /**

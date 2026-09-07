@@ -17,6 +17,7 @@ import { createIdentityRepository } from '../identity.repository.js';
 import { createIdentityRoutes } from '../identity.routes.js';
 import { createIdentityService } from '../identity.service.js';
 import { createRefreshSessionRepository } from '../refresh-session.repository.js';
+import { createPasswordResetRepository } from '../password-reset.repository.js';
 import { createTokenService } from '../tokens.js';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 
@@ -62,9 +63,11 @@ describe('POST /api/v1/users/me/password (integration)', () => {
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const repository = createIdentityRepository({ db: db() });
     const sessions = createRefreshSessionRepository({ db: db() });
+    const passwordResets = createPasswordResetRepository({ db: db() });
     const identity = createIdentityService({
       repository,
       sessions,
+      passwordResets,
       tokens,
       db: db(),
       config: testDb.config,

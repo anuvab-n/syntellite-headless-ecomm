@@ -21,6 +21,7 @@ export {
   CheckoutCartEmpty,
   CheckoutCartNotAvailable,
   CheckoutLinesUnavailable,
+  OrderNotCancellable,
   type OrdersService,
   type OrderView,
   type CheckoutCart,
@@ -28,6 +29,7 @@ export {
   type CheckoutPromotion,
   type CheckoutPromotions,
   type CheckoutIdempotency,
+  type OrderPayments,
 } from './orders.service.js';
 export {
   createOrdersRepository,

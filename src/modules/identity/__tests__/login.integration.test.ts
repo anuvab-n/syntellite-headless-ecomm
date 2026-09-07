@@ -19,6 +19,7 @@ import { createIdentityRoutes } from '../identity.routes.js';
 import { createIdentityService } from '../identity.service.js';
 import { hashPassword } from '../password.js';
 import { createRefreshSessionRepository } from '../refresh-session.repository.js';
+import { createPasswordResetRepository } from '../password-reset.repository.js';
 import { hashRefreshToken } from '../refresh-token.js';
 import { createTokenService } from '../tokens.js';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
@@ -56,11 +57,13 @@ describe('POST /api/v1/auth/login (integration)', () => {
   function build(overrides: { failLastLogin?: boolean; forceCollisions?: number } = {}) {
     const repository = createIdentityRepository({ db: db() });
     const sessions = createRefreshSessionRepository({ db: db() });
+    const passwordResets = createPasswordResetRepository({ db: db() });
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
 
     const identity = createIdentityService({
       repository,
       sessions,
+      passwordResets,
       tokens,
       db: db(),
       config: testDb.config,

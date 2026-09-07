@@ -1,6 +1,7 @@
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, count, desc, eq } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
+import { order } from '../../db/schema/orders.js';
 import { payment, paymentEvent } from '../../db/schema/payments.js';
 import { executor } from '../../db/transaction.js';
 import { newId } from '../../shared/id.js';
@@ -366,6 +367,66 @@ export function createPaymentsRepository(deps: { db: Database }) {
         )
         .returning({ id: payment.id });
       return updated.length === 1;
+    },
+
+    /**
+     * This customer's payments, newest first, with the order number each belongs to.
+     *
+     * ## Why this method may name `order`
+     *
+     * The customer surface addresses a payment by its ORDER NUMBER — the payment's own id is
+     * never published — so a list has to carry it. The alternative, a port into the orders
+     * module to translate ids in a second round trip, would move the store predicate out of
+     * this query and make an N+1 out of a page of rows. `orders.repository.ts` takes the same
+     * narrow licence for `address` and documents it the same way: a repository may name another
+     * table when the only thing it decides is a value this query already needs.
+     *
+     * Nothing here writes `order`, and the join is INNER because `fk_payment_order_store`
+     * guarantees the row exists.
+     */
+    async listForUser(params: {
+      userId: string;
+      storeId: string;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: readonly (PaymentRecord & { orderNumber: string })[]; total: number }> {
+      const where = and(eq(payment.userId, params.userId), eq(payment.storeId, params.storeId));
+
+      const rows = await executor(db)
+        .select({ ...PAYMENT_COLUMNS, orderNumber: order.orderNumber })
+        .from(payment)
+        .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+        .where(where)
+        .orderBy(desc(payment.createdAt))
+        .limit(params.limit)
+        .offset(params.offset);
+
+      const [counted] = await executor(db).select({ total: count() }).from(payment).where(where);
+
+      return {
+        items: rows.map((row) => ({ ...toPaymentRecord(row), orderNumber: row.orderNumber })),
+        total: counted?.total ?? 0,
+      };
+    },
+
+    /**
+     * The status of an order's payment, or `undefined` when it has none.
+     *
+     * Store-scoped and deliberately NOT user-scoped: `uq_payment_order` is global to the order,
+     * so a user-scoped read could report "none" for a payment that exists. The caller is
+     * deciding whether the order may be cancelled, and a payment it cannot see is exactly the
+     * one that must block it.
+     */
+    async findStatusByOrderId(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<PaymentStatus | undefined> {
+      const [row] = await executor(db)
+        .select({ status: payment.status })
+        .from(payment)
+        .where(and(eq(payment.orderId, params.orderId), eq(payment.storeId, params.storeId)))
+        .limit(1);
+      return row === undefined ? undefined : (row.status as PaymentStatus);
     },
 
     /** The transition timeline for one payment, oldest first. Store-scoped. */

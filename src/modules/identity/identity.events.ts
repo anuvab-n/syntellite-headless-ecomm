@@ -17,6 +17,18 @@ export const USER_EVENTS = {
    * slow would then make signing up slow, and a mail provider being down would make it fail.
    */
   registered: 'user.registered',
+  /**
+   * A customer asked to reset their password, and a token was issued.
+   *
+   * **The SECOND producer, and the first with a real consumer.** The payload carries the reset
+   * token, because the mail the consumer sends has to contain it — see
+   * `requestPasswordReset` on why that trade-off is the right one and what bounds it.
+   *
+   * Unlike `user.registered`, this event is not optional to deliver: a token nobody mails is a
+   * customer who stays locked out. That is why the mailer is registered in the handler registry
+   * rather than deferred like every event before it.
+   */
+  passwordResetRequested: 'user.password_reset_requested',
 } as const;
 
 /**
@@ -28,6 +40,10 @@ export const USER_EVENTS = {
 export const AUTH_AUDIT = {
   passwordChanged: 'auth.password_changed',
   registered: 'auth.registered',
+  /** A reset was REQUESTED. Records that a token was minted, never the token. */
+  passwordResetRequested: 'auth.password_reset_requested',
+  /** A reset COMPLETED. The pair of these two bounds how long the window was open. */
+  passwordReset: 'auth.password_reset',
 } as const;
 
 /** The `resource_type` for identity audit entries. Matches the table name, as elsewhere. */

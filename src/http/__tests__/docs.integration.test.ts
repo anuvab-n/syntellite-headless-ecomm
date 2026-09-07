@@ -205,6 +205,18 @@ describe('API documentation', () => {
     apiRouter.post('/admin/products/:slug/archive', (_req, res) => {
       res.status(200).json({ ok: true });
     });
+    apiRouter.post('/auth/forgot-password', (_req, res) => {
+      res.status(204).send();
+    });
+    apiRouter.post('/auth/reset-password', (_req, res) => {
+      res.status(204).send();
+    });
+    apiRouter.post('/users/me/orders/:orderNumber/cancel', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.get('/users/me/payments', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
     apiRouter.post('/users/me/orders/:orderNumber/payments', (_req, res) => {
       res.status(201).json({ ok: true });
     });
@@ -345,10 +357,12 @@ describe('API documentation', () => {
         '/api/v1/admin/promotions/{code}',
         '/api/v1/admin/skus/{code}',
         '/api/v1/admin/skus/{code}/options',
+        '/api/v1/auth/forgot-password',
         '/api/v1/auth/login',
         '/api/v1/auth/logout',
         '/api/v1/auth/refresh',
         '/api/v1/auth/register',
+        '/api/v1/auth/reset-password',
         '/api/v1/products',
         '/api/v1/products/{slug}',
         '/api/v1/users/me',
@@ -360,9 +374,11 @@ describe('API documentation', () => {
         '/api/v1/users/me/checkout',
         '/api/v1/users/me/orders',
         '/api/v1/users/me/orders/{orderNumber}',
+        '/api/v1/users/me/orders/{orderNumber}/cancel',
         '/api/v1/users/me/orders/{orderNumber}/payment',
         '/api/v1/users/me/orders/{orderNumber}/payments',
         '/api/v1/users/me/password',
+        '/api/v1/users/me/payments',
         '/api/v1/webhooks/razorpay',
         '/health/live',
         '/health/ready',

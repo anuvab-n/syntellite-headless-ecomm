@@ -132,6 +132,15 @@ const ConfigSchema = z
     /* ── Email ─────────────────────────────────────────────────────────── */
     smtpHost: z.string().min(1),
     smtpPort: z.coerce.number().int().positive().default(1025),
+    /** The `From` header on every message. */
+    mailFrom: z.string().min(1).default('no-reply@localhost'),
+    /**
+     * Where a password-reset link points.
+     *
+     * Configuration, never a request field: a client-supplied URL carrying a live reset token
+     * would be an open redirect straight into a phishing flow.
+     */
+    passwordResetUrlBase: z.string().url().default('http://localhost:3000/reset-password'),
 
     /* ── Behaviour ─────────────────────────────────────────────────────── */
     /**
@@ -263,6 +272,8 @@ function readEnvironment(env: NodeJS.ProcessEnv): Record<string, unknown> {
 
     smtpHost: env['SMTP_HOST'],
     smtpPort: env['SMTP_PORT'],
+    mailFrom: env['MAIL_FROM'],
+    passwordResetUrlBase: env['PASSWORD_RESET_URL_BASE'],
 
     defaultCurrency: env['DEFAULT_CURRENCY'],
     defaultStoreSlug: env['DEFAULT_STORE_SLUG'],

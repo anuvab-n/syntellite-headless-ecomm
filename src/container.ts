@@ -13,6 +13,8 @@ import {
   type QueueRoutes,
 } from './db/outbox/index.js';
 import { createApp } from './http/app.js';
+import { createPasswordResetMailHandler } from './mail/password-reset.handler.js';
+import { createSmtpMailer } from './mail/mailer.js';
 import { RATE_LIMIT_BUCKETS } from './http/middleware/rate-limit.js';
 import { requireIdempotency } from './http/middleware/idempotency.js';
 import { createScopeGuards } from './http/middleware/scope.js';
@@ -28,8 +30,10 @@ import {
   createIdentityRepository,
   createIdentityRoutes,
   createIdentityService,
+  createPasswordResetRepository,
   createRefreshSessionRepository,
   createTokenService,
+  USER_EVENTS,
   type IdentityService,
 } from './modules/identity/index.js';
 import {
@@ -354,10 +358,40 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * `runWorkers` is keyed off the role, which is the single decision that separates an API
    * container from a worker container.
    */
+  /**
+   * The mailer, and the handler registry it populates.
+   *
+   * **This is where the "no consumers" era ends.** Every increment up to now passed `{}`, on the
+   * rule that an event with no consumer is a guess at one. `user.password_reset_requested` is
+   * the first event whose consumer is not optional: a reset token nobody mails leaves a
+   * customer locked out, so the producer and the consumer ship together.
+   *
+   * Built here rather than required from an entry point, so `main.ts` and the workers do not
+   * each have to remember to wire it. A caller may still override `handlers` — the integration
+   * tests do, to assert on delivery without SMTP.
+   */
+  const mailer = createSmtpMailer({
+    config: { host: config.smtpHost, port: config.smtpPort, from: config.mailFrom },
+    logger,
+  });
+
+  const builtInHandlers: HandlerRegistry = {
+    [USER_EVENTS.passwordResetRequested]: [
+      createPasswordResetMailHandler({
+        mailer,
+        config: {
+          resetUrlBase: config.passwordResetUrlBase,
+          storeName: config.defaultStoreSlug,
+        },
+        logger,
+      }),
+    ],
+  };
+
   const outbox = createOutboxSubsystem({
     db: db.db,
     logger,
-    handlers: opts.handlers ?? {},
+    handlers: opts.handlers ?? builtInHandlers,
     transport: opts.transport ?? 'queue',
     redisUrl: config.redisQueueUrl,
     runWorkers: opts.role === 'worker',
@@ -518,6 +552,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
   const identity = createIdentityService({
     repository: identityRepository,
     sessions: refreshSessions,
+    passwordResets: createPasswordResetRepository({ db: db.db }),
     tokens,
     // The service opens its own transaction for the login writes, so it needs the primary
     // handle rather than a repository-scoped executor.
@@ -707,6 +742,20 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
           status: input.status,
           ...(input.body === undefined ? {} : { body: input.body as never }),
         }),
+    },
+    /**
+     * The payment state of an order, for the cancellation rule.
+     *
+     * A LATE binding, and it has to be: `payments` is constructed below and needs `orders`
+     * through its own port, so the two services are mutually dependent. The arrow defers the
+     * lookup to call time, which is the only shape that lets both stay ignorant of each other —
+     * an eager reference here would be a `TypeError` at construction and a cycle
+     * `dependency-cruiser` would rightly reject.
+     *
+     * Orders asks for a status string; payments answers one. Neither names the other.
+     */
+    payments: {
+      statusForOrder: (input) => payments.statusForOrder(input),
     },
     db: db.db,
     audit,

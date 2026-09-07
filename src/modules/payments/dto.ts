@@ -61,6 +61,41 @@ export const InitiatePaymentRequestSchema = z.strictObject({
 });
 export type InitiatePaymentRequest = z.infer<typeof InitiatePaymentRequestSchema>;
 
+export const PAYMENT_LIST_DEFAULT_LIMIT = 20;
+export const PAYMENT_LIST_MAX_LIMIT = 100;
+
+/**
+ * Pagination for the customer's payment list.
+ *
+ * Copied in shape from `ListOrdersQuerySchema` rather than invented: a customer paging their
+ * payments and paging their orders should not need two different mental models. `strictObject`,
+ * so an unknown query key is a `400` — a client mistyping `offset` as `ofset` learns immediately
+ * instead of silently reading page one forever.
+ */
+const boundedIntParam = (opts: { min: number; max?: number; default: number }) => {
+  const bounds =
+    opts.max === undefined
+      ? z.number().int().min(opts.min)
+      : z.number().int().min(opts.min).max(opts.max);
+  return z
+    .string()
+    .regex(/^\d+$/, 'must be a whole number')
+    .transform(Number)
+    .pipe(bounds)
+    .optional()
+    .transform((value) => value ?? opts.default);
+};
+
+export const ListPaymentsQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: PAYMENT_LIST_MAX_LIMIT,
+    default: PAYMENT_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+});
+export type ListPaymentsQuery = z.infer<typeof ListPaymentsQuerySchema>;
+
 /* ── Responses ───────────────────────────────────────────────────────────── */
 
 export type PaymentEventResponse = {
@@ -125,6 +160,39 @@ export function toPaymentResponse(view: PaymentView, orderNumber: string): Payme
     createdAt: record.createdAt.toISOString(),
     updatedAt: record.updatedAt.toISOString(),
     history: view.events.map(toEventResponse),
+  };
+}
+
+export type PaginationResponse = {
+  limit: number;
+  offset: number;
+  total: number;
+};
+
+export type PaymentListResponse = {
+  payments: PaymentResponse[];
+  pagination: PaginationResponse;
+};
+
+/**
+ * A page of payments.
+ *
+ * Each row is the SAME `PaymentResponse` the single read returns, with `history` empty — one
+ * response type rather than a leaner list variant, so a client can hand a list row to whatever
+ * renders a payment without a second shape to handle. The order number comes from the join, so
+ * a row is addressable without a second request.
+ */
+export function toPaymentListResponse(page: {
+  items: readonly (PaymentRecord & { orderNumber: string })[];
+  total: number;
+  limit: number;
+  offset: number;
+}): PaymentListResponse {
+  return {
+    payments: page.items.map((record) =>
+      toPaymentResponse({ payment: record, events: [] }, record.orderNumber),
+    ),
+    pagination: { limit: page.limit, offset: page.offset, total: page.total },
   };
 }
 

@@ -3,6 +3,18 @@ import { and, count, desc, eq, inArray, isNull } from 'drizzle-orm';
 import type { Database } from '../../db/client.js';
 import { address } from '../../db/schema/address.js';
 import { order, orderLine, orderStatusHistory } from '../../db/schema/orders.js';
+
+/**
+ * The order lifecycle vocabulary, re-exported so nothing outside this module names the table.
+ * Same pattern as `inventory.repository.ts` with `STOCK_REASONS`.
+ */
+export {
+  ORDER_STATUSES,
+  INITIAL_ORDER_STATUS,
+  CANCELLABLE_ORDER_STATUSES,
+  CANCELLED_ORDER_STATUS,
+  type OrderStatus,
+} from '../../db/schema/orders.js';
 import { executor } from '../../db/transaction.js';
 
 /**
@@ -236,6 +248,65 @@ export function createOrdersRepository(deps: { db: Database }) {
       actorUserId: string | null;
     }): Promise<void> {
       await executor(db).insert(orderStatusHistory).values(values);
+    },
+
+    /**
+     * Lock one of this customer's orders for a status change.
+     *
+     * The serialisation point for cancellation, exactly as the cart row is for checkout: two
+     * concurrent cancellations of one order both take this lock, so the second sees the status
+     * the first wrote rather than the one it read. Scoped by user AND store, so a foreign order
+     * is `undefined` here rather than being refused later.
+     *
+     * `FOR UPDATE` is only expressible on the query builder, never on `db.query.*` — §6's trap.
+     */
+    async lockOwnedOrderByNumber(params: {
+      orderNumber: string;
+      userId: string;
+      storeId: string;
+    }): Promise<OrderRecord | undefined> {
+      const [row] = await executor(db)
+        .select(ORDER_COLUMNS)
+        .from(order)
+        .where(
+          and(
+            eq(order.orderNumber, params.orderNumber),
+            eq(order.userId, params.userId),
+            eq(order.storeId, params.storeId),
+          ),
+        )
+        .limit(1)
+        .for('update');
+      return row;
+    },
+
+    /**
+     * Move an order to a new status.
+     *
+     * The `status = fromStatus` predicate is in the statement, so a writer that somehow got
+     * past the lock still resolves to one winner — and the loser learns it lost from a row count
+     * rather than by overwriting a decision that landed first. Returns false when the row had
+     * already moved.
+     */
+    async updateOrderStatus(params: {
+      orderId: string;
+      storeId: string;
+      fromStatus: string;
+      toStatus: string;
+      at: Date;
+    }): Promise<boolean> {
+      const updated = await executor(db)
+        .update(order)
+        .set({ status: params.toStatus, updatedAt: params.at })
+        .where(
+          and(
+            eq(order.id, params.orderId),
+            eq(order.storeId, params.storeId),
+            eq(order.status, params.fromStatus),
+          ),
+        )
+        .returning({ id: order.id });
+      return updated.length === 1;
     },
 
     /**

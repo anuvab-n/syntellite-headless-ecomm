@@ -65,23 +65,44 @@ import { store } from './store.js';
  */
 
 /**
- * The order lifecycle in this build: exactly one state.
+ * The order lifecycle in this build: two states.
  *
- * `cancelled`, `pending_payment`, `paid`, `payment_failed`, `packed`, `shipped`, `delivered`,
- * `returned` and `refunded` are all absent on purpose. Each would be written by an increment
- * that does not exist, and a status value nothing can produce is worse than a missing one: it
- * looks like a supported state to every reader of the enum.
+ * `placed` on creation, and `cancelled` when the customer withdraws an order nobody has been
+ * charged for. Both are producible, which is the bar this enum is held to.
  *
- * The four state spaces stay separate — `cart.status`, `order.status`, a future payment table,
- * and a future shipment table. Folding payment or fulfilment into this column is the shortcut
- * that makes both impossible to model properly later.
+ * `pending_payment`, `paid`, `payment_failed`, `packed`, `shipped`, `delivered`, `returned` and
+ * `refunded` remain absent on purpose. Each would be written by an increment that does not
+ * exist, and a status value nothing can produce is worse than a missing one: it looks like a
+ * supported state to every reader of the enum.
+ *
+ * **`cancelled` is NOT a payment state, and adding it did not fold one in here.** It records a
+ * decision about the ORDER — the customer no longer wants it. Whether money moved is still
+ * answered entirely by the payment table, and the cancellation rule reads that table through a
+ * port rather than mirroring it into this column. The four state spaces stay separate:
+ * `cart.status`, `order.status`, the payment table, and a future shipment table. Folding
+ * payment or fulfilment into this column is the shortcut that makes both impossible to model
+ * properly later.
  */
-export const ORDER_STATUSES = ['placed'] as const;
+export const ORDER_STATUSES = ['placed', 'cancelled'] as const;
 
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
-/** The one status an order is created in, and — in this increment — the only one it can hold. */
+/** The status an order is created in. */
 export const INITIAL_ORDER_STATUS: OrderStatus = 'placed';
+
+/**
+ * Statuses a customer may cancel from.
+ *
+ * One entry, and it is the whole of the transition table for orders — `placed -> cancelled` is
+ * the only legal move. `cancelled` is terminal and absorbing: there is no un-cancel, because
+ * reinstating an order would need the stock, the prices and the promotion to still be valid,
+ * and none of that is re-checkable after the fact. A customer who changes their mind places a
+ * new order.
+ */
+export const CANCELLABLE_ORDER_STATUSES = ['placed'] as const;
+
+/** The status a cancelled order holds. Named so the service and the CHECK cannot drift. */
+export const CANCELLED_ORDER_STATUS: OrderStatus = 'cancelled';
 
 /** Bounds `order_line.quantity`, mirroring the cart's own ceiling. */
 export const MAX_ORDER_LINE_QUANTITY = 999;
@@ -259,7 +280,7 @@ export const order = pgTable(
       name: 'fk_order_promotion_store',
     }).onDelete('restrict'),
 
-    check('ck_order_status', sql`${t.status} in ('placed')`),
+    check('ck_order_status', sql`${t.status} in ('placed', 'cancelled')`),
 
     /**
      * The money invariants, in the database because the API is not the only writer.
@@ -423,10 +444,10 @@ export const orderStatusHistory = pgTable(
     /** The transition timeline for one order, in order. */
     index('ix_order_status_history_order').on(t.orderId, t.createdAt),
 
-    check('ck_order_status_history_to_status', sql`${t.toStatus} in ('placed')`),
+    check('ck_order_status_history_to_status', sql`${t.toStatus} in ('placed', 'cancelled')`),
     check(
       'ck_order_status_history_from_status',
-      sql`${t.fromStatus} IS NULL OR ${t.fromStatus} in ('placed')`,
+      sql`${t.fromStatus} IS NULL OR ${t.fromStatus} in ('placed', 'cancelled')`,
     ),
     /** A transition to the state it came from is not a transition. */
     check(

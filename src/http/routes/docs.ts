@@ -646,9 +646,9 @@ const ORDER = {
     },
     status: {
       type: 'string',
-      enum: ['placed'],
+      enum: ['placed', 'cancelled'],
       description:
-        'One value in this version. Payment, fulfilment and returns each bring their own states, written by the increment that can actually cause them; a status nothing can produce would look supported to every reader of this enum.',
+        '`placed` on creation, and `cancelled` when the customer withdraws an order nobody has been charged for. **Not a payment state** — the order stays `placed` whether or not it has been paid for, and whether money moved is answered only by the payment. `cancelled` is terminal: there is no un-cancel, because reinstating an order cannot re-check the stock, prices and promotion it was built from. Fulfilment and returns each bring their own states, written by the increment that can actually cause them.',
       example: 'placed',
     },
     currency: {
@@ -1368,6 +1368,269 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/auth/forgot-password': {
+        post: {
+          tags: ['Authentication'],
+          summary: 'Begin a password reset',
+          description: [
+            'Email a single-use reset link to the address given, if it belongs to an account.',
+            '',
+            '### The response never varies',
+            '',
+            '**Always `204`.** An unknown address, a deactivated account and a real one are',
+            'indistinguishable, because any difference here would be an account-existence oracle —',
+            'anyone could test an address list against this endpoint and learn who shops here. The',
+            'response says nothing about whether a mail was queued.',
+            '',
+            'That makes rate limiting the actual defence, and it is applied on two dimensions: per',
+            'IP so the endpoint cannot be swept, and per email so one customer cannot be flooded',
+            'with reset mail by somebody who knows their address.',
+            '',
+            '### The link',
+            '',
+            'Valid for **one hour** and usable **once**. Requesting again invalidates the previous',
+            'link, so only the newest mail works — without that, every request would leave another',
+            'live token in another inbox.',
+            '',
+            'Where the link points is a deployment setting. There is deliberately no `redirectUrl`',
+            'field: a client-supplied URL carrying a live reset token would be an open redirect',
+            'straight into a phishing flow.',
+          ].join('\n'),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['email'],
+                  properties: {
+                    email: { type: 'string', format: 'email', maxLength: 320 },
+                  },
+                },
+                example: { email: 'buyer@example.com' },
+              },
+            },
+          },
+          responses: {
+            '204': {
+              description:
+                'Received. Whether an account exists, and whether a mail was sent, is deliberately not disclosed.',
+            },
+            '429': errorResponse(
+              'Too many attempts from this IP, or too many for this address. Retry-After says when to try again.',
+              'RATE_LIMITED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/auth/reset-password': {
+        post: {
+          tags: ['Authentication'],
+          summary: 'Complete a password reset',
+          description: [
+            'Set a new password using the token from the reset email.',
+            '',
+            '**Every existing session is revoked.** A reset is the recovery path for an account',
+            'whose owner may have lost control of it, so leaving a refresh session alive would',
+            'defeat the point of resetting. The customer signs in again afterwards — no tokens are',
+            'issued here.',
+            '',
+            '### One error for every failure',
+            '',
+            'Unknown, malformed, expired, already used, minted for another store, or belonging to',
+            'an account since deactivated all answer `400 INVALID_RESET_TOKEN` with the same',
+            'message. Distinguishing them would tell somebody with access to an old inbox which',
+            'stale link is worth racing.',
+            '',
+            'A rejected `newPassword` does NOT spend the token, so a customer who trips the',
+            'password policy can simply try again with the same link.',
+          ].join('\n'),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['token', 'newPassword'],
+                  properties: {
+                    token: {
+                      type: 'string',
+                      maxLength: 512,
+                      description:
+                        'From the emailed link. Opaque — its format is not part of this contract.',
+                    },
+                    newPassword: {
+                      type: 'string',
+                      minLength: 10,
+                      maxLength: 128,
+                      description: 'The same policy registration and change-password apply.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '204': { description: 'The password was changed and every session revoked.' },
+            '409': errorResponse(
+              'The password was changed by another request while this one was in flight. Retrying is the right response.',
+              'CONFLICT',
+            ),
+            '429': errorResponse(
+              'Too many attempts from this IP. Retry-After says when to try again.',
+              'RATE_LIMITED',
+            ),
+            ...COMMON_ERRORS,
+            /*
+             * After the spread. `COMMON_ERRORS` documents the 400 as a validation failure, which
+             * is only half of it here: an unusable token is also a 400, and that is the case a
+             * client actually has to handle. Overriding rather than duplicating — a duplicate key
+             * is a `tsc` error, which is how this was caught.
+             */
+            '400': errorResponse(
+              'Either the token is unusable (INVALID_RESET_TOKEN — unknown, malformed, expired, already used, or minted for another store) or the new password fails the policy (VALIDATION_ERROR).',
+              'INVALID_RESET_TOKEN',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/users/me/orders/{orderNumber}/cancel': {
+        post: {
+          tags: ['Orders'],
+          summary: 'Cancel an order',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Withdraw an order nobody has been charged for. **No request body** — the order comes',
+            'from the path, the customer from the token, and the only decision is one the server',
+            'makes about eligibility.',
+            '',
+            '### When it is allowed',
+            '',
+            '| Payment state | Cancel? |',
+            '| ------------- | ------- |',
+            '| none | yes |',
+            '| `failed`, `expired` | yes |',
+            '| `pending` | **no** — a capture may still land |',
+            '| `succeeded` | **no** — refunds are not supported |',
+            '',
+            'Refunds do not exist in this version, so nothing here may create money the system',
+            'cannot return. `pending` is refused for the subtler version of the same reason: an',
+            'online capture can arrive at any moment, and cancelling would race it. The customer',
+            'waits for the payment to fail or expire, then cancels.',
+            '',
+            '`details.reason` distinguishes the cases — `status`, `payment_in_progress`, `paid` —',
+            'so a client can tell "wait and retry" from "contact support" without parsing prose.',
+            '',
+            '### Terminal, and not idempotent',
+            '',
+            'A cancelled order cannot be un-cancelled, and it cannot then be paid for. A second',
+            'cancellation answers `409` rather than replaying `200`: a client told "cancelled"',
+            'twice cannot tell whether it cancelled something or nothing.',
+            '',
+            'No `Idempotency-Key` is required or accepted — the status predicate on the update is',
+            'a natural guard, so a duplicate request cannot cancel twice.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The cancelled order. Only `status` differs from before the call.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['order'],
+                    properties: { order: { $ref: '#/components/schemas/Order' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '404': errorResponse(
+              'No such order. An unknown number, another customer’s order and another store’s order are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            '409': errorResponse(
+              'The order cannot be cancelled. `details.reason` is `status` (already cancelled), `payment_in_progress` (a payment is pending), or `paid` (money was taken and refunds are not supported).',
+              'ORDER_NOT_CANCELLABLE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/users/me/payments': {
+        get: {
+          tags: ['Payments'],
+          summary: 'List the customer’s payments',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'This customer’s own payments, newest first. Each row carries the `orderNumber` it',
+            'belongs to, so a client can drill into one without a second lookup.',
+            '',
+            '`history` is empty on a list row — a page of payments each carrying its full',
+            'transition timeline would be a response whose size grows with activity. Read the',
+            'single payment when the timeline is wanted.',
+            '',
+            'Scoped to the authenticated customer in the query itself, so a page can only ever',
+            'contain rows they own.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of payments.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['payments', 'pagination'],
+                    properties: {
+                      payments: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/Payment' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
       '/api/v1/auth/refresh': {
         post: {
           tags: ['Authentication'],

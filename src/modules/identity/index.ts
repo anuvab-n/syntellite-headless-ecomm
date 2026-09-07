@@ -70,3 +70,12 @@ export {
   type RefreshRequest,
 } from './dto.js';
 export { type UserCredentials, type UserSubject } from './identity.repository.js';
+export {
+  createPasswordResetRepository,
+  type PasswordResetRepository,
+} from './password-reset.repository.js';
+export {
+  PASSWORD_RESET_TTL_MINUTES,
+  passwordResetTokenParameters,
+} from './password-reset-token.js';
+export { USER_EVENTS, USER_AGGREGATE, AUTH_AUDIT, USER_RESOURCE } from './identity.events.js';

@@ -23,9 +23,10 @@ export const ORDER_RESOURCE = 'order';
 /**
  * Audit actions. Dotted, past tense, permanent.
  *
- * One action, because this increment supports one transition. Cancellation, payment and
- * fulfilment each bring their own, written by the increment that can actually cause them.
+ * Two actions, matching the two transitions an order can undergo. Payment and fulfilment each
+ * bring their own, written by the increment that can actually cause them.
  */
 export const ORDER_AUDIT = {
   placed: 'order.placed',
+  cancelled: 'order.cancelled',
 } as const;

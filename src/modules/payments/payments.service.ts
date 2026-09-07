@@ -435,6 +435,44 @@ export function createPaymentsService(deps: {
     },
 
     /**
+     * This customer's own payments, newest first.
+     *
+     * Store- and user-scoped in the query, so the page can only ever contain rows this customer
+     * owns. No history on a list row: a page of payments each carrying its full transition
+     * timeline would be a response whose size grows with activity, and a client that wants the
+     * timeline reads the one payment.
+     */
+    async listForUser(params: {
+      userId: string;
+      storeId: string;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly (PaymentRecord & { orderNumber: string })[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listForUser(params);
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
+     * The status of an order's payment, for a caller deciding whether the order may change.
+     *
+     * Exported on the service because the ORDERS module needs it to answer "may this be
+     * cancelled?", and it must not reach for the payment table itself. The composition root
+     * adapts this onto the port orders declares.
+     */
+    async statusForOrder(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<PaymentStatus | null> {
+      const status = await repository.findStatusByOrderId(params);
+      return status ?? null;
+    },
+
+    /**
      * Process a provider notification.
      *
      * The signature is verified by the adapter before this method sees a single parsed field —
