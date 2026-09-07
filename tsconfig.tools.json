@@ -1,0 +1,10 @@
+{
+  "//": "Root-level tooling and standalone scripts: they live outside the app rootDir but must still be typechecked, so a typo in a migration config or a key-generation script is caught in CI rather than at deploy time.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "allowJs": true
+  },
+  "include": ["drizzle.config.ts", "vitest.config.ts", "eslint.config.js", "scripts/**/*.ts"]
+}

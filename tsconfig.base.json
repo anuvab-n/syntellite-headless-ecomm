@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "moduleDetection": "force",
+
+    /* Strictness. Every one of these is load-bearing; do not relax without an ADR. */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": true,
+    "verbatimModuleSyntax": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
+  }
+}

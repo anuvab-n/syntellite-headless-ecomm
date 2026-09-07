@@ -1,0 +1,10 @@
+{
+  "//": "Typechecks the test suite. Separate from tsconfig.json because tests live both beside the code (src/**/__tests__) and in tests/, so they cannot share the app's rootDir — and because production builds must not compile them.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "allowImportingTsExtensions": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
+}

@@ -1,0 +1,4 @@
+dist
+coverage
+src/db/migrations
+pnpm-lock.yaml

@@ -1,0 +1,14 @@
+-- `request_id` becomes varchar(64), matching `audit_log.request_id` exactly.
+--
+-- It was first declared as `uuid`, which was wrong for a reason no test could see:
+-- `resolveRequestId` ACCEPTS a client-supplied `X-Request-Id` header when it is short enough
+-- and matches the safe pattern, so an id arriving from an upstream proxy need not be a UUID.
+-- A `uuid` column would have rejected those inserts and failed an otherwise valid stock
+-- adjustment. Found by the live smoke test, which also could not join the two columns without
+-- a cast — the second symptom of the same mistake.
+--
+-- A separate migration rather than an edit to the one that created the table: drizzle-kit
+-- keeps a snapshot per migration, and hand-editing an applied migration to say something its
+-- snapshot does not leaves the two disagreeing and produces phantom drift on the next
+-- `db:generate`.
+ALTER TABLE "stock_ledger" ALTER COLUMN "request_id" SET DATA TYPE varchar(64);
