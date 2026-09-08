@@ -42,3 +42,8 @@ export { createPaymentsRoutes } from './payments.routes.js';
 export { createPaymentsWebhookRoutes } from './payments.webhook.routes.js';
 export { canTransition, isTerminal } from './payments.state.js';
 export { PAYMENT_AUDIT, PAYMENT_RESOURCE } from './payments.events.js';
+export {
+  createPaymentExpirySweeper,
+  type PaymentExpirySweeper,
+  type SweepResult,
+} from './payments.sweeper.js';

@@ -181,6 +181,31 @@ export const payment = pgTable(
      */
     failureCode: varchar('failure_code', { length: 64 }),
 
+    /**
+     * When an ONLINE payment stops being payable. NULL for COD, always.
+     *
+     * ## Why a column rather than `created_at + window`
+     *
+     * Deriving eligibility at query time would bake the window into every query, make it
+     * unchangeable for payments already in flight, and leave nothing on the row explaining why
+     * something expired. Stamped once at initiation from `PAYMENT_EXPIRY_MINUTES`, so changing
+     * the configured window affects only payments started afterwards — a customer keeps the
+     * window they were given.
+     *
+     * ## Nullable, and not required for online payments at the database level
+     *
+     * NULL means "never expires", which is exactly right for COD and for the one historical
+     * online payment that predates this column. A `NOT NULL`-for-online biconditional would
+     * have needed a backfill of rows whose window nobody can now reconstruct, and would refuse
+     * a future non-expiring online method. The service is what guarantees a fresh online
+     * payment gets one; `ck_payment_expires_at_only_online` guarantees COD never does.
+     *
+     * Local expiry is AUTHORITATIVE. Nothing is read back from the provider, so a payment can
+     * expire here and still be captured at Razorpay — see the section on late success in
+     * docs/DECISIONS.md. That exposure is accepted, not solved.
+     */
+    expiresAt: tsColumn('expires_at'),
+
     ...timestamps,
   },
   (t) => [
@@ -242,8 +267,42 @@ export const payment = pgTable(
     /** The operator question "what is still pending?", scoped to the tenant. */
     index('ix_payment_store_status').on(t.storeId, t.status),
 
+    /**
+     * The expiry sweeper's ONLY read: due online payments, oldest first.
+     *
+     * **Not store-leading, deliberately.** The sweep is cross-tenant — one leader-elected task
+     * serves every store — so `ix_payment_store_status` cannot serve it: that index leads with
+     * `store_id` and carries no time column, which would degrade the candidate query to a scan
+     * plus a filter. Tenancy is still enforced on every WRITE, from the row the sweeper read.
+     *
+     * Partial on all three predicates the query carries, so it holds only rows that can ever
+     * be due and shrinks as payments reach a terminal state. A store with a million paid
+     * orders contributes nothing to it.
+     */
+    index('ix_payment_expiry_due')
+      .on(t.expiresAt)
+      .where(
+        sql`${t.status} = 'pending' and ${t.expiresAt} is not null and ${t.method} = 'online'`,
+      ),
+
     check('ck_payment_status', sql`${t.status} in ('pending', 'succeeded', 'failed', 'expired')`),
     check('ck_payment_method', sql`${t.method} in ('online', 'cod')`),
+
+    /**
+     * **Expiry is online-only, enforced by the database.**
+     *
+     * The approved scope excludes COD from expiry entirely, and this is what makes an
+     * expiring COD payment unrepresentable rather than merely unwritten. Without it, a future
+     * caller that stamped `expires_at` on a COD payment would silently introduce COD
+     * settlement — the one thing Increment 36 was told not to invent.
+     *
+     * One direction only. It does NOT require `expires_at` on every online payment: see the
+     * column comment for why a biconditional would have needed an unreconstructable backfill.
+     */
+    check(
+      'ck_payment_expires_at_only_online',
+      sql`${t.expiresAt} is null or ${t.method} = 'online'`,
+    ),
     check('ck_payment_provider', sql`${t.provider} is null or ${t.provider} in ('razorpay')`),
 
     /**

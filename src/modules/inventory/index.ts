@@ -13,6 +13,8 @@
 export {
   createInventoryService,
   InsufficientStock,
+  NothingToFulfil,
+  AlreadyFulfilled,
   type InventoryService,
 } from './inventory.service.js';
 export {

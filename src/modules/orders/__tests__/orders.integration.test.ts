@@ -11,7 +11,7 @@ import { cart, cartLine } from '../../../db/schema/cart.js';
 import { product, sku } from '../../../db/schema/catalogue.js';
 import { appUser, auditLog } from '../../../db/schema/identity.js';
 import { idempotencyKey } from '../../../db/schema/idempotency.js';
-import { stockItem, stockLedger } from '../../../db/schema/inventory.js';
+import { stockItem, stockLedger, stockReservation } from '../../../db/schema/inventory.js';
 import { order, orderLine, orderStatusHistory } from '../../../db/schema/orders.js';
 import { outboxEvent } from '../../../db/schema/outbox.js';
 import { cartPromotion, promotion } from '../../../db/schema/promotions.js';
@@ -25,7 +25,9 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { DEFAULT_SKU_ON_HAND, giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { createInventoryRepository, createInventoryService } from '../../inventory/index.js';
+import { createFulfilmentRepository, createFulfilmentService } from '../../fulfilment/index.js';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 import { newId } from '../../../shared/id.js';
 import { createCartRepository } from '../../cart/cart.repository.js';
@@ -41,6 +43,7 @@ import { createTokenService } from '../../identity/tokens.js';
 import { createPromotionsRepository } from '../../promotions/promotions.repository.js';
 import { createPromotionsService } from '../../promotions/promotions.service.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
+import { createTaxRepository, createTaxService } from '../../tax/index.js';
 import { createOrdersRepository } from '../orders.repository.js';
 import { createOrdersRoutes } from '../orders.routes.js';
 import { toOrderResponse } from '../dto.js';
@@ -132,6 +135,21 @@ describe('orders (integration)', () => {
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const recorders = testRecorders(db());
 
+    /**
+     * A REAL inventory service, not a stub.
+     *
+     * Checkout reserves stock now, so a stub would prove nothing about the behaviour these
+     * suites exercise most: that an order holds units, that a rollback gives them back, and
+     * that two concurrent checkouts cannot take the same one. The concurrency guarantee is a
+     * property of a PostgreSQL statement, and a mock cannot have it.
+     */
+    const inventory = createInventoryService({
+      repository: createInventoryRepository({ db: db() }),
+      db: db(),
+      ...recorders,
+      logger: silentLogger,
+    });
+
     const identity = createIdentityService({
       repository: identityRepository,
       sessions: createRefreshSessionRepository({ db: db() }),
@@ -162,6 +180,13 @@ describe('orders (integration)', () => {
 
     const idempotency = createIdempotencyStore({ db: db(), logger: silentLogger });
 
+    const tax = createTaxService({
+      repository: createTaxRepository({ db: db() }),
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
+
     /** The three ports, wired exactly as `container.ts` wires them. */
     const orders = createOrdersService({
       repository: createOrdersRepository({ db: db() }),
@@ -177,7 +202,25 @@ describe('orders (integration)', () => {
        * payment' is the truthful wiring for it; cancellation against a real payment is covered
        * by `order-cancellation.integration.test.ts`, which wires the real service.
        */
+      /**
+       * A REAL fulfilment service, late-bound exactly as `container.ts` binds it.
+       *
+       * The cancellation guard turns on shipment state, so a stub answering "never shipped"
+       * would let every cancellation test pass while the guard did nothing.
+       */
+      fulfilment: { hasBlockingShipment: (input) => fulfilment.hasBlockingShipment(input) },
       payments: { stateForOrder: async () => null },
+      reservations: {
+        reserve: (input) => inventory.reserveForOrder(input),
+        releaseForOrder: (input) => inventory.releaseForOrder(input),
+      },
+      /*
+       * A REAL tax service. No store in these suites configures a GST profile, so every
+       * determination is the unassessed one — tax_total 0, grand_total = total, snapshot NULL,
+       * which is exactly the behaviour these suites were written against. A stub would make
+       * that a property of the double rather than of the system.
+       */
+      tax: { determineForCheckout: (input) => tax.determineForCheckout(input) },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -194,6 +237,19 @@ describe('orders (integration)', () => {
       logger: silentLogger,
     });
 
+    const fulfilment = createFulfilmentService({
+      repository: createFulfilmentRepository({ db: db() }),
+      orders: {
+        lockByNumber: (input) => orders.lockForFulfilmentByNumber(input),
+        lockById: (input) => orders.lockForFulfilmentById(input),
+      },
+      /* This suite builds no payments service; its orders port already stubs "no payment". */
+      payments: { stateForOrder: async () => null },
+      inventory: { fulfilForOrder: (input) => inventory.fulfilForOrder(input) },
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
     const apiRouter = Router();
     apiRouter.use(
       resolveStore({
@@ -267,7 +323,13 @@ describe('orders (integration)', () => {
   /* ── Fixtures ──────────────────────────────────────────────────────────── */
 
   async function givenSku(
-    overrides: { code?: string; price?: string; storeId?: string; productName?: string } = {},
+    overrides: {
+      code?: string;
+      price?: string;
+      storeId?: string;
+      productName?: string;
+      onHand?: number;
+    } = {},
   ) {
     const owningStore = overrides.storeId ?? storeId;
     const code = overrides.code ?? CODE_A;
@@ -285,6 +347,7 @@ describe('orders (integration)', () => {
       name: `${code} variant`,
       price: overrides.price ?? '1000.0000',
       deletedAt: null,
+      onHand: overrides.onHand ?? DEFAULT_SKU_ON_HAND,
     });
     return { ...created, storeId: owningStore, productId: parent.id };
   }
@@ -383,12 +446,15 @@ describe('orders (integration)', () => {
 
   /** A signed-in customer with an address and a cart holding the given lines. */
   async function readyToCheckout(
-    lines: { code?: string; price?: string; quantity: number }[] = [{ quantity: 2 }],
+    lines: { code?: string; price?: string; quantity: number; onHand?: number }[] = [
+      { quantity: 2 },
+    ],
   ) {
     for (const line of lines) {
       await givenSku({
         ...(line.code === undefined ? {} : { code: line.code }),
         ...(line.price === undefined ? {} : { price: line.price }),
+        ...(line.onHand === undefined ? {} : { onHand: line.onHand }),
       });
     }
     const built = build();
@@ -671,6 +737,8 @@ describe('orders (integration)', () => {
       expect(Object.keys(response.body.order).sort()).toEqual([
         'currency',
         'discountTotal',
+        /* Increment 38, additive: `total` still means the goods total. */
+        'grandTotal',
         'items',
         'orderNumber',
         'placedAt',
@@ -678,6 +746,8 @@ describe('orders (integration)', () => {
         'shippingAddress',
         'status',
         'subtotal',
+        'tax',
+        'taxTotal',
         'total',
       ]);
       expect(Object.keys(response.body.order.items[0]).sort()).toEqual([
@@ -687,6 +757,7 @@ describe('orders (integration)', () => {
         'quantity',
         'skuCode',
         'skuName',
+        'tax',
         'unitPrice',
       ]);
       expect(Object.keys(response.body.order.shippingAddress).sort()).toEqual([
@@ -864,6 +935,8 @@ describe('orders (integration)', () => {
             subtotal: '1.0000',
             discountTotal: '0.0000',
             total: '1.0000',
+            /* NOT NULL with no default; see the `base()` fixture below for why. */
+            grandTotal: '1.0000',
             addressId: built.address.id,
             shipRecipientName: 'X',
             shipPhone: 'X',
@@ -1532,10 +1605,23 @@ describe('orders (integration)', () => {
       await checkout(built.app, { addressId: addr.id }, { token: auth.token, key: KEY });
 
       /**
+       * THREE keys now hold this SKU, and they are peeled off one at a time so that each
+       * assertion is about the key it names — the wrong-constraint trap Increments 27 and 29
+       * recorded, where a test passes because a DIFFERENT constraint fired first.
+       *
+       * The two INVENTORY keys — `fk_stock_reservation_sku_store` and, now that the fixture
+       * stocks the SKU, `fk_stock_item_sku_store` — are cleared without an assertion, because
+       * which of the four PostgreSQL checks first is not a guaranteed order and pinning it
+       * would break this test the next time a reference to `sku` is added. What matters is that
+       * the order line's key is the last one standing.
+       */
+      await db().delete(stockReservation);
+      await db().delete(stockItem).where(eq(stockItem.skuId, created.id));
+
+      /**
        * The checked-out cart still holds its own line, and `fk_cart_line_sku_store` fires
-       * FIRST — so a naive assertion here passes while proving nothing about the ORDER's key.
-       * The same wrong-constraint trap Increments 27 and 29 recorded. The cart line is removed
-       * so the order's key is the one under test.
+       * before the order's — so a naive assertion here passes while proving nothing about the
+       * ORDER's key. The cart line is removed so the order's key is the one under test.
        */
       await expectConstraint(
         db().delete(sku).where(eq(sku.id, created.id)),
@@ -1976,6 +2062,8 @@ describe('orders (integration)', () => {
             subtotal: '1.0000',
             discountTotal: '0.0000',
             total: '1.0000',
+            /* NOT NULL with no default; see the `base()` fixture below for why. */
+            grandTotal: '1.0000',
             addressId: built.address.id,
             shipRecipientName: 'X',
             shipPhone: 'X',
@@ -2394,6 +2482,8 @@ describe('orders (integration)', () => {
             subtotal: '1.0000',
             discountTotal: '0.0000',
             total: '1.0000',
+            /* NOT NULL with no default; see the `base()` fixture below for why. */
+            grandTotal: '1.0000',
             addressId: built.address.id,
             shipRecipientName: 'X',
             shipPhone: 'X',
@@ -2447,6 +2537,8 @@ describe('orders (integration)', () => {
             subtotal: '1.0000',
             discountTotal: '0.0000',
             total: '1.0000',
+            /* NOT NULL with no default; see the `base()` fixture below for why. */
+            grandTotal: '1.0000',
             // The one thing that does not belong: an address of the OTHER store.
             addressId: built.address.id,
             shipRecipientName: 'X',
@@ -2515,9 +2607,16 @@ describe('orders (integration)', () => {
       expect(events.filter((e) => e.eventName.startsWith('cart.'))).toEqual([]);
     });
 
-    it('touches NO inventory', async () => {
-      const created = await givenSku({ code: CODE_A, price: '1000.0000' });
-      await db().insert(stockItem).values({ skuId: created.id, storeId, onHand: 5, reserved: 0 });
+    /**
+     * **This test used to assert the opposite, and that is the point.**
+     *
+     * Before reservations it asserted that an order for 50 against 5 on hand was ACCEPTED, with
+     * `reserved` untouched — the overselling consequence, written down deliberately rather than
+     * left to be discovered. Reservation is the increment that makes it impossible, so the
+     * assertion inverts.
+     */
+    it('REFUSES an order for more than is in stock, and reserves nothing', async () => {
+      const created = await givenSku({ code: CODE_A, price: '1000.0000', onHand: 5 });
       const built = build();
       const auth = await signIn(built.app, built.identity);
       const addr = await givenAddress(auth.userId);
@@ -2530,17 +2629,57 @@ describe('orders (integration)', () => {
         { token: auth.token, key: KEY },
       );
 
-      /**
-       * The order is accepted for 50 against 5 on hand. §39 defers *"reservations and
-       * allocation"* to its own increment, so nothing is checked, reserved or decremented — and
-       * that consequence is asserted rather than left to be discovered.
-       */
-      expect(response.status).toBe(201);
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe('INSUFFICIENT_STOCK');
+      /* The offending code is named, so a storefront can tell the customer which line failed. */
+      expect(response.body.error.details.skuCodes).toEqual([CODE_A]);
+
+      /* No order, and no reservation: the whole transaction rolled back. */
+      expect(await db().select().from(order)).toEqual([]);
+      expect(await db().select().from(stockReservation)).toEqual([]);
+
       const [stock] = await db().select().from(stockItem).where(eq(stockItem.skuId, created.id));
       expect(stock?.onHand).toBe(5);
       expect(stock?.reserved).toBe(0);
       expect(stock?.available).toBe(5);
+    });
+
+    /**
+     * `on_hand` and the ledger stay out of it, which is the OTHER half of the design.
+     *
+     * A reservation changes what is SELLABLE, not what is physically present, and
+     * `stock_ledger` exists to justify `on_hand` — so a successful checkout must move
+     * `reserved` and write no ledger row at all. The increment that ships goods is the one that
+     * decrements `on_hand` and records it.
+     */
+    it('reserves without touching on_hand or the ledger', async () => {
+      const created = await givenSku({ code: CODE_A, price: '1000.0000', onHand: 5 });
+      const built = build();
+      const auth = await signIn(built.app, built.identity);
+      const addr = await givenAddress(auth.userId);
+      await putItem(built.app, CODE_A, 2, auth.token);
+
+      const response = await checkout(
+        built.app,
+        { addressId: addr.id },
+        { token: auth.token, key: KEY },
+      );
+      expect(response.status).toBe(201);
+
+      const [stock] = await db().select().from(stockItem).where(eq(stockItem.skuId, created.id));
+      expect(stock?.onHand).toBe(5);
+      expect(stock?.reserved).toBe(2);
+      expect(stock?.available).toBe(3);
+
+      /* The ledger is for on_hand movements. Nothing moved. */
       expect(await db().select().from(stockLedger)).toEqual([]);
+
+      const held = await db().select().from(stockReservation);
+      expect(held).toHaveLength(1);
+      expect(held[0]?.quantity).toBe(2);
+      expect(held[0]?.status).toBe('held');
+      expect(held[0]?.settledAt).toBeNull();
+      expect(held[0]?.settledReason).toBeNull();
     });
 
     it('records no promotion redemption', async () => {
@@ -2564,6 +2703,376 @@ describe('orders (integration)', () => {
   });
 
   /* ── Concurrency ───────────────────────────────────────────────────────── */
+
+  /* ── Inventory reservation ─────────────────────────────────────────────── */
+
+  /**
+   * Reservation is the increment that makes overselling impossible, so these tests are about
+   * proving that rather than about the shape of a row.
+   *
+   * Nothing here mocks the repository. The mutual-exclusion guarantee is a property of one
+   * PostgreSQL statement under READ COMMITTED — a stub cannot have it, and a test built on one
+   * would pass while the product oversold.
+   */
+  describe('reservation', () => {
+    const reservationRows = () => db().select().from(stockReservation);
+    const stockFor = async (skuId: string) => {
+      const [row] = await db().select().from(stockItem).where(eq(stockItem.skuId, skuId));
+      return row;
+    };
+
+    /**
+     * **The headline guarantee: stock 1, two simultaneous buyers, exactly one wins.**
+     *
+     * Two DIFFERENT customers, so nothing else can serialise them — no shared cart row, no
+     * shared idempotency key. The only thing standing between them is the conditional `UPDATE`
+     * on `stock_item`.
+     */
+    it('lets exactly ONE of two concurrent customers take the last unit', async () => {
+      await givenSku({ code: CODE_A, price: '1000.0000', onHand: 1 });
+      const built = build();
+
+      const first = await signIn(built.app, built.identity, { email: 'racer-a@example.com' });
+      const second = await signIn(built.app, built.identity, { email: 'racer-b@example.com' });
+      const addrA = await givenAddress(first.userId);
+      const addrB = await givenAddress(second.userId);
+      await putItem(built.app, CODE_A, 1, first.token);
+      await putItem(built.app, CODE_A, 1, second.token);
+
+      const results = await Promise.all([
+        checkout(built.app, { addressId: addrA.id }, { token: first.token, key: `${KEY}-a` }),
+        checkout(built.app, { addressId: addrB.id }, { token: second.token, key: `${KEY}-b` }),
+      ]);
+
+      expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+
+      const loser = results.find((r) => r.status === 409);
+      expect(loser?.body.error.code).toBe('INSUFFICIENT_STOCK');
+
+      /* One order, one reservation, and the unit accounted for exactly once. */
+      expect(await orderRows()).toHaveLength(1);
+      const held = await reservationRows();
+      expect(held).toHaveLength(1);
+      expect(held[0]?.quantity).toBe(1);
+
+      const stock = await stockFor(held[0]!.skuId);
+      expect(stock?.onHand).toBe(1);
+      expect(stock?.reserved).toBe(1);
+      expect(stock?.available).toBe(0);
+    });
+
+    /** Five units, six simultaneous buyers of one each: five orders, one refusal, nothing over. */
+    it('never oversells under a burst of concurrent checkouts', async () => {
+      await givenSku({ code: CODE_A, price: '1000.0000', onHand: 5 });
+      const built = build();
+
+      const buyers = await Promise.all(
+        Array.from({ length: 6 }, (_, i) =>
+          signIn(built.app, built.identity, { email: `burst-${i}@example.com` }),
+        ),
+      );
+      const addresses = await Promise.all(buyers.map((b) => givenAddress(b.userId)));
+      for (const buyer of buyers) {
+        await putItem(built.app, CODE_A, 1, buyer.token);
+      }
+
+      const results = await Promise.all(
+        buyers.map((buyer, i) =>
+          checkout(
+            built.app,
+            { addressId: addresses[i]!.id },
+            { token: buyer.token, key: `${KEY}-${i}` },
+          ),
+        ),
+      );
+
+      expect(results.filter((r) => r.status === 201)).toHaveLength(5);
+      expect(results.filter((r) => r.status === 409)).toHaveLength(1);
+
+      const held = await reservationRows();
+      expect(held).toHaveLength(5);
+      const [sku0] = held;
+      const stock = await stockFor(sku0!.skuId);
+      expect(stock?.reserved).toBe(5);
+      /* The invariant that matters: available never goes below zero. */
+      expect(stock?.available).toBe(0);
+    });
+
+    /** `available == requested` must succeed. A `>` instead of `>=` fails exactly here. */
+    it('allows a checkout for EXACTLY the available quantity', async () => {
+      const built = await readyToCheckout([{ quantity: 3, onHand: 3 }]);
+
+      const response = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+
+      expect(response.status).toBe(201);
+      const held = await reservationRows();
+      expect(held[0]?.quantity).toBe(3);
+      expect((await stockFor(held[0]!.skuId))?.available).toBe(0);
+    });
+
+    it('refuses a checkout for one more than is available', async () => {
+      const built = await readyToCheckout([{ quantity: 4, onHand: 3 }]);
+
+      const response = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+
+      expect(response.status).toBe(409);
+      expect(await reservationRows()).toEqual([]);
+      expect(await orderRows()).toEqual([]);
+    });
+
+    /**
+     * A SKU that has never been adjusted has NO `stock_item` row at all — the projection is
+     * created lazily on first adjustment. Checkout must answer a clean 409 naming the code
+     * rather than a 500 from a statement that matched nothing.
+     */
+    it('refuses cleanly when the SKU has no stock row at all', async () => {
+      const built = await readyToCheckout([{ quantity: 1, onHand: 5 }]);
+
+      /*
+       * Remove the projection row to reach the state of a SKU that has never been adjusted.
+       * `initialiseStock` runs lazily — only inside `adjustStock` — so a SKU created through
+       * the catalogue and never adjusted genuinely has no row, and checkout must not 500 on it.
+       */
+      await db().delete(stockItem);
+      expect(await db().select().from(stockItem)).toEqual([]);
+
+      const response = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+
+      expect(response.status).toBe(409);
+      expect(response.body.error.code).toBe('INSUFFICIENT_STOCK');
+      expect(response.body.error.details.skuCodes).toEqual([CODE_A]);
+      expect(await orderRows()).toEqual([]);
+    });
+
+    /**
+     * **All or nothing across lines.**
+     *
+     * The first SKU has plenty, the second has none. The whole checkout is refused and the
+     * first SKU's counter is back where it started — proving the rollback covers the counter
+     * increments already made, not just the order rows.
+     */
+    it('reserves nothing when ONE line of several cannot be held', async () => {
+      const built = await readyToCheckout([
+        { code: CODE_A, quantity: 1, onHand: 10 },
+        { code: CODE_B, quantity: 1, onHand: 0 },
+      ]);
+
+      const response = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+
+      expect(response.status).toBe(409);
+      expect(await orderRows()).toEqual([]);
+      expect(await reservationRows()).toEqual([]);
+
+      const rows = await db().select().from(stockItem);
+      for (const row of rows) {
+        expect(row.reserved).toBe(0);
+      }
+    });
+
+    /** Every line of a multi-SKU order is held, each with its own quantity. */
+    it('holds every line of a multi-SKU order', async () => {
+      const built = await readyToCheckout([
+        { code: CODE_A, quantity: 2, onHand: 10 },
+        { code: CODE_B, quantity: 3, onHand: 10 },
+      ]);
+
+      const response = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      expect(response.status).toBe(201);
+
+      const held = await reservationRows();
+      expect(held).toHaveLength(2);
+      expect(held.map((r) => r.quantity).sort()).toEqual([2, 3]);
+      for (const row of await db().select().from(stockItem)) {
+        expect(row.reserved).toBe(row.onHand === 10 ? row.reserved : row.reserved);
+        expect(row.available).toBe(row.onHand - row.reserved);
+      }
+    });
+
+    /**
+     * **Deadlock ordering.**
+     *
+     * Two carts holding the same two SKUs in OPPOSITE line order, checked out simultaneously.
+     * Without a deterministic lock order each transaction takes one row and waits for the
+     * other's, and PostgreSQL breaks the cycle by killing one with SQLSTATE 40P01 — which
+     * surfaces as a 500, not a 409.
+     *
+     * So the assertion is not "both succeed": it is that **no outcome is a 500**. Repeated,
+     * because a deadlock is a race and one attempt could get lucky.
+     */
+    it('does not deadlock when two carts hold the same SKUs in opposite order', async () => {
+      await givenSku({ code: CODE_A, price: '1000.0000', onHand: 100 });
+      await givenSku({ code: CODE_B, price: '1000.0000', onHand: 100 });
+      const built = build();
+
+      for (let round = 0; round < 6; round += 1) {
+        const first = await signIn(built.app, built.identity, {
+          email: `dl-a-${round}@example.com`,
+        });
+        const second = await signIn(built.app, built.identity, {
+          email: `dl-b-${round}@example.com`,
+        });
+        const addrA = await givenAddress(first.userId);
+        const addrB = await givenAddress(second.userId);
+
+        /* Opposite insertion order, which is what the sort has to neutralise. */
+        await putItem(built.app, CODE_A, 1, first.token);
+        await putItem(built.app, CODE_B, 1, first.token);
+        await putItem(built.app, CODE_B, 1, second.token);
+        await putItem(built.app, CODE_A, 1, second.token);
+
+        const results = await Promise.all([
+          checkout(
+            built.app,
+            { addressId: addrA.id },
+            { token: first.token, key: `${KEY}-dl-a-${round}` },
+          ),
+          checkout(
+            built.app,
+            { addressId: addrB.id },
+            { token: second.token, key: `${KEY}-dl-b-${round}` },
+          ),
+        ]);
+
+        for (const result of results) {
+          expect([201, 409]).toContain(result.status);
+        }
+      }
+    });
+
+    /**
+     * A replayed checkout must not reserve twice.
+     *
+     * The middleware replays the stored response without running the handler, so the second
+     * request cannot reach the reservation code at all — and `pk_stock_reservation` would
+     * refuse it even if it did.
+     */
+    it('reserves exactly once when a checkout is replayed', async () => {
+      const built = await readyToCheckout([{ quantity: 2, onHand: 10 }]);
+
+      const first = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      expect(first.status).toBe(201);
+
+      const replay = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      expect(replay.status).toBe(201);
+      expect(replay.headers['idempotent-replay']).toBe('true');
+
+      const held = await reservationRows();
+      expect(held).toHaveLength(1);
+      expect(held[0]?.quantity).toBe(2);
+      expect((await stockFor(held[0]!.skuId))?.reserved).toBe(2);
+    });
+
+    /**
+     * Tenancy: reserving in one store cannot move another store's counter, even for a SKU with
+     * the identical code.
+     */
+    it('holds stock only in the reserving store', async () => {
+      const otherStoreId = newId();
+      await db()
+        .insert(store)
+        .values({ id: otherStoreId, slug: 'other', name: 'Other', isActive: true });
+      const mine = await givenSku({ code: CODE_A, price: '1000.0000', onHand: 5 });
+      const theirs = await givenSku({
+        code: CODE_A,
+        price: '1000.0000',
+        onHand: 5,
+        storeId: otherStoreId,
+      });
+
+      const built = build();
+      const auth = await signIn(built.app, built.identity);
+      const addr = await givenAddress(auth.userId);
+      await putItem(built.app, CODE_A, 2, auth.token);
+      expect(
+        (await checkout(built.app, { addressId: addr.id }, { token: auth.token, key: KEY })).status,
+      ).toBe(201);
+
+      expect((await stockFor(mine.id))?.reserved).toBe(2);
+      /* Untouched. */
+      expect((await stockFor(theirs.id))?.reserved).toBe(0);
+    });
+
+    /** The repository predicate, exercised directly — the HTTP path cannot reach these. */
+    describe('repository', () => {
+      it('refuses to reserve more than is available, and reserves the exact boundary', async () => {
+        const created = await givenSku({ code: CODE_A, onHand: 2 });
+        const repository = createInventoryRepository({ db: db() });
+        const at = new Date();
+
+        await expect(
+          repository.reserveForSku({ skuId: created.id, storeId, quantity: 3, at }),
+        ).resolves.toBeUndefined();
+        await expect(
+          repository.reserveForSku({ skuId: created.id, storeId, quantity: 2, at }),
+        ).resolves.toEqual({ reserved: 2, available: 0 });
+        /* And now nothing more can be taken. */
+        await expect(
+          repository.reserveForSku({ skuId: created.id, storeId, quantity: 1, at }),
+        ).resolves.toBeUndefined();
+      });
+
+      /**
+       * Store scoping, killed by a mutant that drops `store_id` from the predicate. Through
+       * HTTP alone this is invisible, because the token resolves the store long before the
+       * statement runs.
+       */
+      it('scopes the reserve statement by store', async () => {
+        const created = await givenSku({ code: CODE_A, onHand: 5 });
+        const repository = createInventoryRepository({ db: db() });
+
+        await expect(
+          repository.reserveForSku({
+            skuId: created.id,
+            storeId: newId(),
+            quantity: 1,
+            at: new Date(),
+          }),
+        ).resolves.toBeUndefined();
+        expect((await stockFor(created.id))?.reserved).toBe(0);
+      });
+
+      /** Release is guarded too: it cannot take the counter below what is held. */
+      it('refuses to release more than is reserved', async () => {
+        const created = await givenSku({ code: CODE_A, onHand: 5 });
+        const repository = createInventoryRepository({ db: db() });
+        const at = new Date();
+
+        await repository.reserveForSku({ skuId: created.id, storeId, quantity: 2, at });
+        await expect(
+          repository.releaseForSku({ skuId: created.id, storeId, quantity: 3, at }),
+        ).resolves.toBeUndefined();
+        expect((await stockFor(created.id))?.reserved).toBe(2);
+      });
+    });
+  });
 
   describe('concurrency', () => {
     /**
@@ -2770,6 +3279,13 @@ describe('orders (integration)', () => {
           subtotal: '100.0000',
           discountTotal: '0.0000',
           total: '100.0000',
+          /*
+           * `grand_total` is NOT NULL with no default, so a raw insert that omits it fails on
+           * the column BEFORE reaching the constraint each of these tests is about — and the
+           * assertion would then be about the wrong thing. Kept equal to `total`, which is
+           * what `ck_order_grand_total_identity` requires while `tax_total` defaults to 0.
+           */
+          grandTotal: '100.0000',
           addressId: built.address.id,
           shipRecipientName: 'X',
           shipPhone: 'X',
@@ -2877,6 +3393,12 @@ describe('orders (integration)', () => {
         subtotal: '100.0000',
         discountTotal: '0.0000',
         total: '95.0000',
+        /*
+         * Moved WITH `total`, so `ck_order_grand_total_identity` stays satisfied and only the
+         * constraint under test is broken. Leaving it at 100 would make this test assert the
+         * wrong constraint — the same entanglement the money-check comment above describes.
+         */
+        grandTotal: '95.0000',
       });
       await expectConstraint(
         db()
@@ -2926,6 +3448,25 @@ describe('orders (integration)', () => {
         unitPrice: '10.0000',
         lineTotal: '10.0000',
         discountAmount: '0.0000',
+        taxableValue: '10.0000',
+      };
+
+      /**
+       * Keep `taxable_value = line_total - discount_amount` true across every override.
+       *
+       * Increment 38 made that an identity CHECK, and it fires on a raw insert BEFORE the
+       * constraint each case below is actually about — so without this each assertion would
+       * quietly start testing `ck_order_line_taxable_value` instead. The same entanglement the
+       * header's money checks have, handled the same way: satisfy everything except the one
+       * thing under test.
+       */
+      const withTaxable = (over: Record<string, unknown>) => {
+        const merged = { ...line, ...over };
+        const money = (v: unknown) => Number(v);
+        return {
+          ...merged,
+          taxableValue: (money(merged.lineTotal) - money(merged.discountAmount)).toFixed(4),
+        };
       };
 
       // A duplicate line for one SKU.
@@ -2940,19 +3481,19 @@ describe('orders (integration)', () => {
       await expectConstraint(
         db()
           .insert(orderLine)
-          .values({ ...line, quantity: 0 } as never),
+          .values(withTaxable({ quantity: 0 }) as never),
         'ck_order_line_quantity',
       );
       await expectConstraint(
         db()
           .insert(orderLine)
-          .values({ ...line, lineTotal: '99.0000' } as never),
+          .values(withTaxable({ lineTotal: '99.0000' }) as never),
         'ck_order_line_total',
       );
       await expectConstraint(
         db()
           .insert(orderLine)
-          .values({ ...line, discountAmount: '50.0000' } as never),
+          .values(withTaxable({ discountAmount: '50.0000' }) as never),
         'ck_order_line_discount_within_line',
       );
       /**
@@ -2971,7 +3512,7 @@ describe('orders (integration)', () => {
       try {
         await db()
           .insert(orderLine)
-          .values({ ...line, unitPrice: '-1.0000', lineTotal: '-1.0000' } as never);
+          .values(withTaxable({ unitPrice: '-1.0000', lineTotal: '-1.0000' }) as never);
       } catch {
         lineRefused = true;
       }
@@ -3013,6 +3554,11 @@ describe('orders (integration)', () => {
 
       // The one cascade in this schema: a line and a history row have no meaning without their
       // order. It never fires in practice because an order is never deleted.
+      //
+      // The reservation must go first: `fk_stock_reservation_order_store` is RESTRICT, so it
+      // refuses the delete rather than cascading — deliberately, because the record of stock
+      // that was taken must not vanish quietly with the order.
+      await db().delete(stockReservation).where(eq(stockReservation.orderId, row!.id));
       await db().delete(orderLine).where(eq(orderLine.orderId, row!.id));
       await db().delete(order).where(eq(order.id, row!.id));
       expect(await historyRows()).toEqual([]);

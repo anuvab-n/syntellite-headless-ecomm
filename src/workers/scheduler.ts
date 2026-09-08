@@ -37,15 +37,6 @@ type ScheduledTask = {
   run: () => Promise<void>;
 };
 
-/**
- * The registry. Empty at Phase 0, and that is the honest state.
- *
- * Phase 2 adds the reservation-expiry sweeper here; Phase 4 the payment reconciliation
- * poller; Phase 6 abandoned-cart detection. Each is a business job and belongs to its phase,
- * not to this one.
- */
-const TASKS: readonly ScheduledTask[] = [];
-
 /** How often to attempt election, and to check whether a task is due. */
 const TICK_INTERVAL_MS = 5_000;
 
@@ -57,6 +48,38 @@ const LEADERSHIP_TTL_MS = 30_000;
 
 const container = buildContainer({ role: 'scheduler' });
 const { logger } = container;
+
+/**
+ * The registry. **One task, added by Increment 36.**
+ *
+ * Declared AFTER the container because a task needs it — the previous position, above
+ * construction, was only possible while the list was empty.
+ *
+ * Phase 4 adds the payment reconciliation poller here; Phase 6 abandoned-cart detection. Each
+ * is a business job and belongs to its phase, not to this one.
+ */
+const TASKS: readonly ScheduledTask[] = [
+  {
+    /**
+     * Expire abandoned online payments and release the stock they were holding.
+     *
+     * Every minute by configuration, and that cadence is not the window: `expires_at` decides
+     * when a payment is due, so this only bounds how long stock stays held PAST its window —
+     * worst case, the window plus one interval. Shortening it expires nothing sooner.
+     *
+     * Safe under the surrounding machinery for three independent reasons: leadership is
+     * re-checked before this task runs, `running` prevents a slow pass overlapping itself, and
+     * the sweeper itself never throws — so a failure cannot stop the tick loop. Even without
+     * leadership, correctness holds: the payment row lock plus the `status = 'pending'` CAS mean
+     * a second sweeper produces ignored results rather than double-releasing stock.
+     */
+    name: 'payment-expiry-sweep',
+    intervalMs: container.config.paymentExpirySweepIntervalMs,
+    run: async () => {
+      await container.paymentExpirySweeper.sweep();
+    },
+  },
+];
 
 const lock = createLeaderLock({
   redis: container.locks,

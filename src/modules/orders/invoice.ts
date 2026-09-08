@@ -1,4 +1,4 @@
-import { format, fromDb, isCurrency, type Currency } from '../../shared/money.js';
+import { format, fromDb, isCurrency, sum, toDb, type Currency } from '../../shared/money.js';
 import { InvariantViolation } from '../../shared/errors.js';
 import { COMPANY_LOGO_DATA_URI } from './invoice-logo.js';
 import type { OrderLineRecord, OrderRecord } from './orders.repository.js';
@@ -40,15 +40,29 @@ import type { OrderLineRecord, OrderRecord } from './orders.repository.js';
  *
  * ## What this document is NOT
  *
- * **Not a GST tax invoice.** There is no tax module: `order` has no tax columns, no HSN/SAC, no
- * place of supply, and the store has no GSTIN on it. A document claiming to be a tax invoice
- * without those is worse than no document, so this one says plainly what it is and shows the
- * goods total only.
+ * **Still NOT a statutory GST tax invoice, even now that tax is computed.**
  *
- * It also carries **no invoice number of its own**. A tax-compliant series is sequential,
- * gapless and scoped to a financial year, and choosing that scheme is a decision with legal
- * consequences. The order number is used as the document reference instead, which is already
- * unique per store and already immutable.
+ * Increment 38 gave the order a real determination — rates, per-line CGST/SGST/IGST, HSN codes,
+ * place of supply, both parties' GSTIN — and this document now SHOWS them, because withholding
+ * figures the customer has actually been charged would make it misleading in the other
+ * direction. What it does not do is claim compliance.
+ *
+ * Three things a statutory invoice needs that this still has none of, and each is Increment 39:
+ *
+ *  1. **An invoice number.** A tax-compliant series is sequential, gapless and scoped to a
+ *     financial year; choosing that scheme is a decision with legal consequences. The order
+ *     number is used as the document reference instead — unique per store and immutable, but
+ *     not a series.
+ *  2. **An HSN-wise and rate-wise summary**, and the several other prescribed particulars.
+ *  3. **IRN and QR**, where e-invoicing applies. Deferred by approved decision 18.
+ *
+ * So the disclaimer stays, reworded to say what is true NOW rather than deleted. A document
+ * that quietly stopped disclaiming the moment it grew a tax row would be the worst possible
+ * outcome of this increment, and a test asserts the wording survives.
+ *
+ * An order placed before this increment, or in a store with no GST profile, carries no
+ * determination at all: it renders exactly as it did before, with no tax rows and no GSTIN.
+ * That is not the same as showing zero — see `ck_order_tax_snapshot`.
  */
 
 /** The issuing company. */
@@ -150,6 +164,34 @@ function requireCurrency(value: string): Currency {
   return value;
 }
 
+/** The storage-scale spelling of nothing, for the "did this component apply?" test. */
+const ZERO_AT_STORAGE_SCALE = '0.0000';
+
+/**
+ * Total one tax component across the lines.
+ *
+ * Through `shared/money.ts`, like every other figure on this document — the invoice is a
+ * display surface, but summing four columns of `NUMERIC(19,4)` is still arithmetic and the
+ * `no-money-arithmetic` rule makes doing it any other way a build failure.
+ *
+ * Summed from the LINES rather than read from a header column, deliberately: there is no
+ * `order.cgst_total`, and adding one would be a second figure that could disagree with the
+ * lines it came from. §43 made exactly this call for `discount_total` — derive the header from
+ * the parts, so the two cannot drift.
+ */
+function sumLineAmounts(
+  lines: readonly OrderLineRecord[],
+  field: 'cgstAmount' | 'sgstAmount' | 'igstAmount' | 'cessAmount',
+  currency: Currency,
+): string {
+  return toDb(
+    sum(
+      lines.map((line) => fromDb(line[field], currency)),
+      currency,
+    ),
+  );
+}
+
 /** `2026-09-07` → `7 September 2026`. UTC, matching every other instant in this system. */
 function longDate(at: Date): string {
   return new Intl.DateTimeFormat('en-IN', {
@@ -196,7 +238,9 @@ export function renderInvoice(input: InvoiceInput): string {
             <td>
               <div class="item">${esc(line.productName)}</div>
               <div class="muted">${esc(line.skuName)}</div>
-              <div class="sku">${esc(line.skuCode)}</div>
+              <div class="sku">${esc(line.skuCode)}${
+                line.hsnCode === null ? '' : ` · HSN ${esc(line.hsnCode)}`
+              }</div>
             </td>
             <td class="num">${String(line.quantity)}</td>
             <td class="num">${money(line.unitPrice)}</td>
@@ -214,6 +258,90 @@ export function renderInvoice(input: InvoiceInput): string {
               <th>Discount <span class="muted">(${esc(order.promotionCode)})</span></th>
               <td class="num off">− ${money(order.discountTotal)}</td>
             </tr>`;
+
+  /**
+   * The tax block, or nothing at all.
+   *
+   * Rendered ONLY when the order carries a determination. An order that was never assessed —
+   * placed before Increment 38, or in a store with no GST profile — gets no tax row, no GSTIN
+   * line and no supply type, which is honest: it was not taxed, as opposed to taxed at nil.
+   * `ck_order_tax_snapshot` guarantees the fields below are present together, so one test
+   * settles it.
+   *
+   * Components are shown SEPARATELY rather than as one "Tax" line, because CGST and SGST are
+   * two different taxes payable to two different governments and a merged figure is not a
+   * breakdown anybody can reconcile.
+   */
+  const assessed = order.taxAt !== null && order.supplyType !== null;
+
+  const taxRows = !assessed
+    ? ''
+    : (
+        [
+          ['CGST', sumLineAmounts(lines, 'cgstAmount', currency)],
+          ['SGST', sumLineAmounts(lines, 'sgstAmount', currency)],
+          ['IGST', sumLineAmounts(lines, 'igstAmount', currency)],
+          ['Cess', sumLineAmounts(lines, 'cessAmount', currency)],
+        ] as const
+      )
+        /*
+         * A component that did not apply is omitted, not shown as zero: an intra-state supply
+         * has no IGST at all, and printing "IGST 0.00" invites the reader to wonder why.
+         */
+        .filter(([, amount]) => amount !== ZERO_AT_STORAGE_SCALE)
+        .map(
+          ([label, amount]) => `            <tr>
+              <th>${esc(label)}</th>
+              <td class="num">${money(amount)}</td>
+            </tr>`,
+        )
+        .join('\n');
+
+  const grandRow = !assessed
+    ? ''
+    : `            <tr class="grand">
+              <th>Amount payable</th>
+              <td class="num">${money(order.grandTotal)}</td>
+            </tr>`;
+
+  /**
+   * The GST parties and the place of supply.
+   *
+   * Every value comes from the ORDER's snapshot, never from the live store or the customer's
+   * current registration — that is the whole point of snapshotting them, and reading either
+   * here would restate a historical invoice the next time one changed.
+   *
+   * `COMPANY` above is still the letterhead and is deliberately NOT presented as the seller of
+   * record: approved decision 2 makes the STORE the seller, and this block is what names it.
+   * Reconciling the letterhead with the seller identity belongs to Increment 39, alongside the
+   * invoice series.
+   */
+  const gstBlock =
+    !assessed || order.sellerGstin === null || order.sellerLegalName === null
+      ? ''
+      : `
+        <div>
+          <h2>GST</h2>
+          <div class="row"><span class="muted">Seller GSTIN</span><span class="num">${esc(
+            order.sellerGstin,
+          )}</span></div>
+          <div class="row"><span class="muted">Seller</span><span>${esc(
+            order.sellerLegalName,
+          )}</span></div>
+          <div class="row"><span class="muted">Place of supply</span><span>${esc(
+            order.placeOfSupplyState ?? '',
+          )}</span></div>
+          <div class="row"><span class="muted">Supply type</span><span>${esc(
+            order.supplyType === 'intra_state' ? 'Intra-state' : 'Inter-state',
+          )}</span></div>${
+            order.customerGstin === null
+              ? ''
+              : `
+          <div class="row"><span class="muted">Buyer GSTIN</span><span class="num">${esc(
+            order.customerGstin,
+          )}</span></div>`
+          }
+        </div>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -428,7 +556,7 @@ export function renderInvoice(input: InvoiceInput): string {
             payment.status ?? 'not started',
           )}${payment.method === null ? '' : ` · ${esc(payment.method)}`}</span></div>
           <div class="row"><span class="muted">Currency</span><span>${esc(order.currency)}</span></div>
-        </div>
+        </div>${gstBlock}
       </section>
 
       <table>
@@ -454,10 +582,12 @@ ${rows}
               <td class="num">${money(order.subtotal)}</td>
             </tr>
 ${promotionRow}
-            <tr class="grand">
-              <th>Total</th>
+            <tr${assessed ? '' : ' class="grand"'}>
+              <th>${assessed ? 'Taxable value' : 'Total'}</th>
               <td class="num">${money(order.total)}</td>
             </tr>
+${taxRows}
+${grandRow}
           </tbody>
         </table>
       </div>
@@ -471,8 +601,11 @@ ${promotionRow}
         </div>
         <div style="max-width: 46ch">
           <div class="disclaimer">
-            This document shows the goods total only. It is not a GST tax invoice: no tax has
-            been calculated or charged, and no GSTIN, HSN/SAC code or place of supply is stated.
+            ${
+              assessed
+                ? 'This document is NOT a statutory GST tax invoice. The tax shown was calculated and charged, but the document carries no sequential invoice number, no HSN-wise summary, and no IRN or QR code.'
+                : 'This document shows the goods total only. It is not a GST tax invoice: no tax has been calculated or charged, and no GSTIN, HSN/SAC code or place of supply is stated.'
+            }
             Amounts are in ${esc(order.currency)}.
           </div>
         </div>

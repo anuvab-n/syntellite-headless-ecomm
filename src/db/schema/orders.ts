@@ -16,6 +16,7 @@ import {
   currencyColumn,
   moneyColumn,
   primaryId,
+  rateColumn,
   storeIdColumn,
   timestamps,
   tsColumn,
@@ -51,10 +52,14 @@ import { store } from './store.js';
  * ## What is deliberately absent
  *
  * No payment columns — no gateway, no authorisation, no capture, no payment status. No shipping
- * columns — no carrier, no cost, no tracking. No tax columns — no rate, no HSN/SAC, no
- * CGST/SGST/IGST, no place of supply, no GSTIN. No invoice number or series. No return or
- * refund state. Each belongs to its own increment, and each would encode a business rule this
+ * columns — no carrier, no cost, no tracking. No invoice number or series. No return or refund
+ * state. Each belongs to its own increment, and each would encode a business rule this
  * increment has not been given.
+ *
+ * **Tax arrived in Increment 38** and is the exception that proves the rule: it was added
+ * ADDITIVELY, as `tax_total` / `grand_total` beside an untouched `total`, plus a determination
+ * snapshot that copies every mutable input rather than referencing it. There is still no
+ * invoice number, no series, no IRN and no credit note.
  *
  * No inventory interaction of any kind: §39 defers _"reservations and allocation (the increment
  * that will need `FOR UPDATE`, and the one that first writes `reserved`)"_, so placing an order
@@ -170,6 +175,113 @@ export const order = pgTable(
     subtotal: moneyColumn('subtotal').notNull(),
     discountTotal: moneyColumn('discount_total').notNull(),
     total: moneyColumn('total').notNull(),
+
+    /**
+     * GST, added by Increment 38 **additively**. `total` was not touched.
+     *
+     *   `tax_total`   = Σ `order_line.tax_total`
+     *   `grand_total` = `total` + `tax_total`   ← what the customer actually pays
+     *
+     * The comment above promised exactly this shape — *"When GST arrives it adds `tax_total`
+     * and `grand_total`; it must not redefine `total`"* — and `ck_order_total_identity` is
+     * still in force beside `ck_order_grand_total_identity`, so neither meaning can drift.
+     *
+     * **`grand_total` is now the payable amount**, and `payment.amount` is copied from it
+     * rather than from `total`. For an untaxed order the two are equal, which is why that
+     * change is invisible to every order placed before this increment.
+     *
+     * Both NOT NULL. Pre-GST orders were backfilled `tax_total = 0` and `grand_total = total`,
+     * which is not an assumption — no tax was calculated or charged on any of them, and the
+     * arithmetic is true. What those orders do NOT get is the determination snapshot below.
+     */
+    taxTotal: moneyColumn('tax_total').notNull().default('0'),
+    grandTotal: moneyColumn('grand_total').notNull(),
+
+    /**
+     * **The tax determination snapshot. Every column NULL together, or every column present.**
+     *
+     * NULL across the group means *no tax determination was made for this order* — either it
+     * predates Increment 38, or its store has no GST profile configured. That is genuinely
+     * different from a determination that produced zero, which arrives as a full snapshot with
+     * zero rates, and the two must stay distinguishable: one says "not assessed", the other
+     * says "assessed at nil". Collapsing them would make an unassessed order look exempt.
+     *
+     * `ck_order_tax_snapshot` enforces the all-or-nothing, exactly as
+     * `ck_order_promotion_snapshot` does for the promotion group.
+     *
+     * ## Why every one of these is COPIED
+     *
+     * Approved decision 14: *"Historical invoices/orders must not re-read mutable tax master
+     * data."* Every source below is mutable — a store can change its GSTIN, a customer can
+     * correct their registration, a merchant can move premises. §40's rule applies to all of
+     * them: *"the moment a past invoice reads a live address, a customer fixing a typo
+     * rewrites history."* There is deliberately no foreign key to `tax_class` or `tax_rate`
+     * anywhere on an order.
+     */
+
+    /**
+     * The AUTHORITATIVE TAX INSTANT: the moment the determination was made, and the instant
+     * the effective-dated rate was selected against.
+     *
+     * Its own column rather than reusing `placed_at`, for the reason `placed_at` itself is not
+     * `created_at`: they coincide today because tax is determined during checkout, and a
+     * future increment that moves the determination — to dispatch, say — must be able to say
+     * so without restating what "placed" means.
+     *
+     * Approved decision 16 fixes this for COD too: tax becomes authoritative here, at
+     * checkout, and does NOT wait for a payment that by design never succeeds.
+     */
+    taxAt: tsColumn('tax_at'),
+
+    /** `intra_state` (CGST+SGST) or `inter_state` (IGST) — approved decision 10. */
+    supplyType: varchar('supply_type', { length: 20 }),
+
+    /**
+     * Where the supply was made, and WHICH RULE decided that.
+     *
+     * The basis column is approved decision 9 made structural: *"Do not hide statutory
+     * exceptions inside a generic state comparison."* One value exists today
+     * (`delivery_destination`), so every historical order records the rule it was decided
+     * under and a future exception becomes a new value rather than an invisible behaviour
+     * change.
+     *
+     * Stored as the NORMALISED state string actually used in the comparison, not the raw
+     * `ship_state` — so re-reading the order shows exactly what was compared. There is no
+     * state code, because §43 declined to invent that catalogue and this increment was told
+     * not to invent one either.
+     */
+    placeOfSupplyState: varchar('place_of_supply_state', { length: 120 }),
+    placeOfSupplyBasis: varchar('place_of_supply_basis', { length: 40 }),
+
+    /** The seller of record at the moment of supply — approved decision 2. */
+    sellerGstin: varchar('seller_gstin', { length: 15 }),
+    sellerLegalName: varchar('seller_legal_name', { length: 300 }),
+
+    /**
+     * The origin / dispatch address, snapshotted in full.
+     *
+     * A reference would not do, for precisely the reason §40 measured on the delivery address:
+     * the snapshot is what survives the merchant editing the live row. `origin_state` is the
+     * seller half of the supply-type comparison and is the field that most needs freezing.
+     */
+    originLine1: varchar('origin_line1', { length: 300 }),
+    originLine2: varchar('origin_line2', { length: 300 }),
+    originCity: varchar('origin_city', { length: 120 }),
+    originState: varchar('origin_state', { length: 120 }),
+    originPostalCode: varchar('origin_postal_code', { length: 16 }),
+    originCountryCode: varchar('origin_country_code', { length: 2 }),
+
+    /**
+     * B2B or B2C, and the customer's GSTIN when there is one — approved decision 8.
+     *
+     * `customer_gstin` is NULL for B2C and NOT NULL for B2B, which
+     * `ck_order_customer_tax_category` enforces rather than leaves to convention: a B2B order
+     * with no registration number on it is an invoice that cannot be claimed as input credit,
+     * and a B2C order carrying one is a determination that contradicts its own category.
+     */
+    customerTaxCategory: varchar('customer_tax_category', { length: 10 }),
+    customerGstin: varchar('customer_gstin', { length: 15 }),
+    customerLegalName: varchar('customer_legal_name', { length: 300 }),
 
     /**
      * The promotion that actually discounted this order, snapshotted.
@@ -313,6 +425,79 @@ export const order = pgTable(
       'ck_order_discount_needs_promotion',
       sql`${t.discountTotal} = 0 OR ${t.promotionId} IS NOT NULL`,
     ),
+
+    /* ── GST, Increment 38 ───────────────────────────────────────────────── */
+
+    /**
+     * **The new identity, stated beside the old one rather than replacing it.**
+     *
+     * `ck_order_total_identity` above still says `total = subtotal - discount_total`. This
+     * says `grand_total = total + tax_total`. Both hold on every row, which is what makes
+     * `total` permanently the goods total and `grand_total` permanently the payable one — a
+     * row where the two disagree is an order that cannot be invoiced, and it would be found by
+     * an accountant rather than by a test.
+     */
+    check('ck_order_grand_total_identity', sql`${t.grandTotal} = ${t.total} + ${t.taxTotal}`),
+
+    /** Tax is never a credit. Same sentence `ck_order_money_non_negative` was written for. */
+    check('ck_order_tax_total_non_negative', sql`${t.taxTotal} >= 0`),
+
+    /**
+     * Tax with no determination behind it has no explanation — the exact shape of
+     * `ck_order_discount_needs_promotion`, and it is what stops a stray `UPDATE` putting an
+     * amount on an order that cannot say how it was arrived at.
+     */
+    check('ck_order_tax_needs_determination', sql`${t.taxTotal} = 0 OR ${t.taxAt} IS NOT NULL`),
+
+    /**
+     * The determination snapshot is all-or-nothing.
+     *
+     * `customer_gstin` and `customer_legal_name` are deliberately NOT in this group — a B2C
+     * determination is complete without them, and `ck_order_customer_tax_category` below is
+     * what governs their presence.
+     */
+    check(
+      'ck_order_tax_snapshot',
+      sql`(${t.taxAt} IS NULL AND ${t.supplyType} IS NULL AND ${t.placeOfSupplyState} IS NULL
+           AND ${t.placeOfSupplyBasis} IS NULL AND ${t.sellerGstin} IS NULL
+           AND ${t.sellerLegalName} IS NULL AND ${t.originLine1} IS NULL
+           AND ${t.originCity} IS NULL AND ${t.originState} IS NULL
+           AND ${t.originPostalCode} IS NULL AND ${t.originCountryCode} IS NULL
+           AND ${t.customerTaxCategory} IS NULL)
+          OR (${t.taxAt} IS NOT NULL AND ${t.supplyType} IS NOT NULL
+           AND ${t.placeOfSupplyState} IS NOT NULL AND ${t.placeOfSupplyBasis} IS NOT NULL
+           AND ${t.sellerGstin} IS NOT NULL AND ${t.sellerLegalName} IS NOT NULL
+           AND ${t.originLine1} IS NOT NULL AND ${t.originCity} IS NOT NULL
+           AND ${t.originState} IS NOT NULL AND ${t.originPostalCode} IS NOT NULL
+           AND ${t.originCountryCode} IS NOT NULL AND ${t.customerTaxCategory} IS NOT NULL)`,
+    ),
+
+    check(
+      'ck_order_supply_type',
+      sql`${t.supplyType} IS NULL OR ${t.supplyType} in ('intra_state', 'inter_state')`,
+    ),
+
+    check(
+      'ck_order_place_of_supply_basis',
+      sql`${t.placeOfSupplyBasis} IS NULL OR ${t.placeOfSupplyBasis} in ('delivery_destination')`,
+    ),
+
+    /**
+     * B2B carries a GSTIN; B2C carries none. Approved decision 8's rule, in the database.
+     *
+     * Written as three explicit cases rather than as an equality between two `IS NOT NULL`
+     * tests, because the unassessed case (both NULL) must also be legal and a two-way
+     * equivalence would quietly permit `b2c` with a GSTIN attached.
+     */
+    check(
+      'ck_order_customer_tax_category',
+      sql`(${t.customerTaxCategory} IS NULL AND ${t.customerGstin} IS NULL
+           AND ${t.customerLegalName} IS NULL)
+          OR (${t.customerTaxCategory} = 'b2c' AND ${t.customerGstin} IS NULL
+           AND ${t.customerLegalName} IS NULL)
+          OR (${t.customerTaxCategory} = 'b2b' AND ${t.customerGstin} IS NOT NULL
+           AND ${t.customerLegalName} IS NOT NULL)`,
+    ),
   ],
 );
 
@@ -346,6 +531,64 @@ export const orderLine = pgTable(
     unitPrice: moneyColumn('unit_price').notNull(),
     lineTotal: moneyColumn('line_total').notNull(),
     discountAmount: moneyColumn('discount_amount').notNull().default('0'),
+
+    /**
+     * **The taxable value: `line_total - discount_amount`.**
+     *
+     * §42 decided the ordering — *"a cart-level discount must be allocated across order lines
+     * before tax is computed"* — and §43 promised the basis would be derivable per line *"with
+     * no re-allocation against a cart that no longer exists"*. Approved decision 12 restates
+     * both. This column is that basis, MATERIALISED rather than derived at read time.
+     *
+     * Stored rather than computed because it is the figure the tax was actually applied to,
+     * and a reader must be able to see it without repeating the subtraction and hoping they
+     * repeat it the same way. `ck_order_line_taxable_value` pins it to the identity, so it can
+     * never disagree with the two columns it comes from.
+     *
+     * NOT NULL, and backfilled for pre-GST rows: the identity is arithmetic and was already
+     * true of every existing line, so the backfill states a fact rather than inventing one.
+     */
+    taxableValue: moneyColumn('taxable_value').notNull().default('0'),
+
+    /**
+     * The classification snapshot — approved decision 6: *"HSN/SAC must be snapshotted on the
+     * order line. Historical orders must not depend on the current SKU master data."*
+     *
+     * Text, not a foreign key to `tax_class`. A class can be renamed and a SKU can be
+     * reclassified; either would silently restate a historical invoice through a join. Both
+     * the code and the name are copied for the same reason `order_line` copies `sku_code` AND
+     * `sku_name` — an audit needs the identifier and the human-readable meaning it had then.
+     *
+     * NULL together when the order carried no tax determination.
+     */
+    hsnCode: varchar('hsn_code', { length: 16 }),
+    taxClassCode: codeColumn('tax_class_code'),
+    taxClassName: varchar('tax_class_name', { length: 300 }),
+
+    /**
+     * The resolved rates and the amounts they produced. **Both, not one.**
+     *
+     * Storing only the amounts would make a line impossible to explain; storing only the rates
+     * would make it recomputable and therefore vulnerable to a future change in how rounding
+     * works. Approved Phase 3 asks for both, and `ck_order_line_tax_total` ties the amounts
+     * together so a stored total can never disagree with its own components.
+     *
+     * All eight NOT NULL, defaulting to zero, and backfilled as zero: no tax was calculated on
+     * a pre-GST line, and zero is the arithmetic truth. Whether the order was ASSESSED at all
+     * is answered on the header by `tax_at`, which is where that distinction belongs — a
+     * nullable component here would make every consumer handle two spellings of nothing.
+     */
+    cgstRate: rateColumn('cgst_rate').notNull().default('0'),
+    cgstAmount: moneyColumn('cgst_amount').notNull().default('0'),
+    sgstRate: rateColumn('sgst_rate').notNull().default('0'),
+    sgstAmount: moneyColumn('sgst_amount').notNull().default('0'),
+    igstRate: rateColumn('igst_rate').notNull().default('0'),
+    igstAmount: moneyColumn('igst_amount').notNull().default('0'),
+    cessRate: rateColumn('cess_rate').notNull().default('0'),
+    cessAmount: moneyColumn('cess_amount').notNull().default('0'),
+
+    /** Σ of the four amounts above. The figure that sums into `order.tax_total`. */
+    taxTotal: moneyColumn('tax_total').notNull().default('0'),
 
     ...timestamps,
   },
@@ -390,6 +633,64 @@ export const orderLine = pgTable(
     /** The line arithmetic, so a stored total can never disagree with its own inputs. */
     check('ck_order_line_total', sql`${t.lineTotal} = ${t.unitPrice} * ${t.quantity}`),
     check('ck_order_line_discount_within_line', sql`${t.discountAmount} <= ${t.lineTotal}`),
+
+    /* ── GST, Increment 38 ───────────────────────────────────────────────── */
+
+    /** The taxable basis, as an identity. See the column comment. */
+    check(
+      'ck_order_line_taxable_value',
+      sql`${t.taxableValue} = ${t.lineTotal} - ${t.discountAmount}`,
+    ),
+
+    check(
+      'ck_order_line_tax_non_negative',
+      sql`${t.cgstRate} >= 0 AND ${t.cgstAmount} >= 0
+          AND ${t.sgstRate} >= 0 AND ${t.sgstAmount} >= 0
+          AND ${t.igstRate} >= 0 AND ${t.igstAmount} >= 0
+          AND ${t.cessRate} >= 0 AND ${t.cessAmount} >= 0
+          AND ${t.taxTotal} >= 0`,
+    ),
+
+    /** The line's own arithmetic, so a stored total cannot disagree with its components. */
+    check(
+      'ck_order_line_tax_total',
+      sql`${t.taxTotal} = ${t.cgstAmount} + ${t.sgstAmount} + ${t.igstAmount} + ${t.cessAmount}`,
+    ),
+
+    /**
+     * **A line is intra-state or inter-state, never both.**
+     *
+     * Approved decision 10 makes the two mutually exclusive: CGST+SGST for a supply within the
+     * state, IGST across it. A row carrying all three is not a rounding error — it is a
+     * determination that contradicts itself, and it would be discovered on a return rather
+     * than here. Rates as well as amounts, so a zero-rated inter-state line still cannot carry
+     * an intra-state rate.
+     *
+     * Cess is deliberately outside the test: it accompanies either arrangement.
+     */
+    check(
+      'ck_order_line_tax_split',
+      sql`(${t.igstRate} = 0 AND ${t.igstAmount} = 0)
+          OR (${t.cgstRate} = 0 AND ${t.cgstAmount} = 0
+              AND ${t.sgstRate} = 0 AND ${t.sgstAmount} = 0)`,
+    ),
+
+    /**
+     * The classification snapshot is all-or-nothing, matching `ck_sku_tax_classification` on
+     * the master row it was copied from.
+     */
+    check(
+      'ck_order_line_tax_classification',
+      sql`(${t.hsnCode} IS NULL AND ${t.taxClassCode} IS NULL AND ${t.taxClassName} IS NULL)
+          OR (${t.hsnCode} IS NOT NULL AND ${t.taxClassCode} IS NOT NULL
+              AND ${t.taxClassName} IS NOT NULL)`,
+    ),
+
+    /** Tax on a line that names no classification cannot be explained on an invoice. */
+    check(
+      'ck_order_line_tax_needs_classification',
+      sql`${t.taxTotal} = 0 OR ${t.taxClassCode} IS NOT NULL`,
+    ),
   ],
 );
 

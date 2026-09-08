@@ -40,7 +40,53 @@ describe('invoice document', () => {
     shipPostalCode: '560001',
     shipCountryCode: 'IN',
     placedAt: new Date('2026-09-07T10:30:00.000Z'),
+
+    /**
+     * **Deliberately UNASSESSED.** Every tax snapshot field is null and both totals are zero-
+     * equivalent, which is what an order placed before Increment 38 — or in a store with no GST
+     * profile — actually looks like.
+     *
+     * That makes this fixture the regression guard for the property that mattered most in that
+     * increment: an untaxed order must render exactly as it did before. `TAXED_ORDER` below is
+     * the other half.
+     */
+    taxTotal: '0.0000',
+    grandTotal: '2247.7500',
+    taxAt: null,
+    supplyType: null,
+    placeOfSupplyState: null,
+    placeOfSupplyBasis: null,
+    sellerGstin: null,
+    sellerLegalName: null,
+    originLine1: null,
+    originLine2: null,
+    originCity: null,
+    originState: null,
+    originPostalCode: null,
+    originCountryCode: null,
+    customerTaxCategory: null,
+    customerGstin: null,
+    customerLegalName: null,
   };
+
+  /** The untaxed line shape: a materialised taxable value, and nothing else. */
+  const untaxed = (lineTotal: string, discountAmount: string, taxableValue: string) => ({
+    taxableValue,
+    hsnCode: null,
+    taxClassCode: null,
+    taxClassName: null,
+    cgstRate: '0',
+    cgstAmount: '0.0000',
+    sgstRate: '0',
+    sgstAmount: '0.0000',
+    igstRate: '0',
+    igstAmount: '0.0000',
+    cessRate: '0',
+    cessAmount: '0.0000',
+    taxTotal: '0.0000',
+    lineTotal,
+    discountAmount,
+  });
 
   const LINES: readonly OrderLineRecord[] = [
     {
@@ -49,8 +95,7 @@ describe('invoice document', () => {
       productName: 'Classic Cotton T-Shirt',
       quantity: 2,
       unitPrice: '799.0000',
-      lineTotal: '1598.0000',
-      discountAmount: '159.8000',
+      ...untaxed('1598.0000', '159.8000', '1438.2000'),
     },
     {
       skuCode: 'TS-L-WHT',
@@ -58,8 +103,7 @@ describe('invoice document', () => {
       productName: 'Classic Cotton T-Shirt',
       quantity: 1,
       unitPrice: '899.5000',
-      lineTotal: '899.5000',
-      discountAmount: '89.9500',
+      ...untaxed('899.5000', '89.9500', '809.5500'),
     },
   ];
 

@@ -1,5 +1,6 @@
 import type { Database } from '../../src/db/client.js';
 import { sku } from '../../src/db/schema/catalogue.js';
+import { stockItem } from '../../src/db/schema/inventory.js';
 import { newId } from '../../src/shared/id.js';
 
 /**
@@ -9,6 +10,14 @@ import { newId } from '../../src/shared/id.js';
  * hardcoded '10.0000' would silently stop asserting anything if this default changed.
  */
 export const DEFAULT_SKU_PRICE = '10.0000';
+
+/**
+ * Units `giveSku` stocks when a fixture does not name a quantity.
+ *
+ * Above `MAX_ORDER_LINE_QUANTITY` (999) on purpose, so no suite can accidentally exhaust it and
+ * every stock-dependent assertion in a stock-agnostic test is trivially satisfied.
+ */
+export const DEFAULT_SKU_ON_HAND = 1_000;
 
 /**
  * Give a product one SKU, mirroring the Increment 24 backfill.
@@ -34,6 +43,16 @@ export async function giveSku(
     price?: string;
     isActive?: boolean;
     deletedAt?: Date | null;
+    /**
+     * Units on hand. **Opt-in**: omit it and NO `stock_item` row is created, which is the state
+     * of a SKU that has never been adjusted.
+     *
+     * Opt-in rather than defaulted, because the inventory suite owns the projection's lifecycle
+     * and inserts its own rows — a default here collided with `stock_item_pkey` and broke 64 of
+     * its tests. Suites that CHECK OUT pass a quantity, because checkout now reserves; every
+     * other suite is unaffected, exactly as before.
+     */
+    onHand?: number;
   } = {},
 ): Promise<{ id: string; code: string; price: string }> {
   const values = {
@@ -49,5 +68,29 @@ export async function giveSku(
   };
 
   await db.insert(sku).values(values);
+
+  /**
+   * Stock, only when asked for, because checkout now RESERVES it.
+   *
+   * Before reservations a SKU needed no `stock_item` row to be bought. Now an unstocked SKU
+   * cannot be checked out at all, so the suites that place orders name a quantity here — and
+   * the ones that do not (catalogue, cart, inventory) keep their previous fixture exactly,
+   * which matters because the inventory suite is ABOUT this row's lifecycle and creates its own.
+   *
+   * `onConflictDoNothing` so a fixture that stocks a SKU the inventory service later
+   * initialises is still idempotent.
+   */
+  if (overrides.onHand !== undefined) {
+    await db
+      .insert(stockItem)
+      .values({
+        skuId: values.id,
+        storeId: product.storeId,
+        onHand: overrides.onHand,
+        reserved: 0,
+      })
+      .onConflictDoNothing({ target: stockItem.skuId });
+  }
+
   return { id: values.id, code: values.code, price: values.price };
 }

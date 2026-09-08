@@ -2,9 +2,14 @@ import { randomInt } from 'node:crypto';
 
 import type { Database } from '../../db/client.js';
 import { uniqueViolationConstraint } from '../../db/errors.js';
-import { withTransaction } from '../../db/transaction.js';
+import { isInTransaction, withTransaction } from '../../db/transaction.js';
 import type { AuditActor, AuditTrail } from '../../shared/audit.js';
-import { BusinessRuleViolation, Conflict, NotFound } from '../../shared/errors.js';
+import {
+  BusinessRuleViolation,
+  Conflict,
+  InvariantViolation,
+  NotFound,
+} from '../../shared/errors.js';
 import { newId } from '../../shared/id.js';
 import type { Logger } from '../../shared/logger.js';
 import {
@@ -33,15 +38,23 @@ import {
  * ## What this does NOT do
  *
  * No payment: no gateway call, no authorisation, no capture, no webhook, no COD. No shipping: no
- * rate, no carrier, no shipment, no tracking. No tax: no rate, no HSN/SAC, no CGST/SGST/IGST, no
- * place of supply, no GSTIN. No invoice number. No return or refund. Each belongs to its own
- * increment and each would encode a business rule this one has not been given.
+ * rate, no carrier, no shipment, no tracking. No invoice number. No return or refund. Each
+ * belongs to its own increment and each would encode a business rule this one has not been given.
  *
- * **No inventory interaction of any kind.** §39 defers *"reservations and allocation (the
- * increment that will need `FOR UPDATE`, and the one that first writes `reserved`)"*, so placing
- * an order checks no stock, reserves nothing, decrements nothing and writes no ledger row. The
- * consequence is stated rather than hidden: an order can be placed for stock that is not there,
- * and the allocation increment is what will make that impossible.
+ * **Tax: computed by the tax module, written by this one, and never calculated here.** Increment
+ * 38 added the `CheckoutTax` port. Checkout hands over line money it has already computed and the
+ * destination state it has already snapshotted, and writes the determination back verbatim onto
+ * the order and its lines. There is no rate, no percentage and no tax arithmetic anywhere in this
+ * file — the one place tax is computed is `modules/tax/tax.calculator.ts`.
+ *
+ * **Inventory: reservation only.** Checkout now HOLDS stock through the `OrderReservations` port
+ * — `stock_item.reserved` goes up and a `stock_reservation` row is written in this same
+ * transaction — and cancellation gives it back. Overselling is no longer possible.
+ *
+ * What still does not happen here: `on_hand` never moves, and no `stock_ledger` row is written.
+ * A reservation changes what is SELLABLE, not what is physically present, and the ledger exists
+ * to justify `on_hand`. The increment that ships goods decrements both together and writes the
+ * ledger row for it — see `db/schema/inventory.ts` for the full argument.
  *
  * **No promotion redemption.** §42 defers usage recording, and there are no limit columns to
  * enforce. Ordering with a coupon consumes nothing.
@@ -171,6 +184,139 @@ export type OrderPayments = {
   }): Promise<{ status: string; method: string } | null>;
 };
 
+/**
+ * **Fulfilment, as orders needs it — declared HERE, implemented by fulfilment.**
+ *
+ * One question, and it is the only thing cancellation needs to know about shipping: have the
+ * goods left? `true` once a shipment is `shipped` or `delivered`, because undoing that means a
+ * return and returns are out of scope.
+ *
+ * A `pending` shipment answers `false`, deliberately: nothing has moved, so the customer may
+ * still cancel. The pending shipment is then left behind as an operational fact that can never
+ * ship, because the ship path refuses a cancelled order.
+ *
+ * Read without a lock, and safe: cancellation already holds the ORDER lock, and every path
+ * that changes a shipment takes that same order lock first, so a shipment cannot change state
+ * while cancellation holds it.
+ */
+export type OrderFulfilment = {
+  hasBlockingShipment(input: { orderId: string; storeId: string }): Promise<boolean>;
+};
+/**
+ * **Inventory reservation, as orders needs it — declared HERE, implemented by inventory.**
+ *
+ * `no-cross-module-imports` forbids `modules/orders` from importing `modules/inventory`, so the
+ * consumer declares the port and `container.ts` adapts the inventory service onto it — the same
+ * pattern `OrderPayments` below uses. Structurally typed, so neither module names the other.
+ *
+ * Both operations MUST be called inside the caller's transaction. Reserving outside it would
+ * hold stock for an order a rollback then discarded; releasing outside it would give stock back
+ * for a cancellation that did not commit. The inventory service asserts this itself rather than
+ * trusting a caller to remember, exactly as `lockCartForCheckout` does.
+ *
+ * `reserve` throws on insufficient stock rather than returning a result, because there is no
+ * partial outcome to report: one line that cannot be held refuses the whole checkout, matching
+ * the existing rule for one unpurchasable line.
+ */
+export type OrderReservations = {
+  reserve(input: {
+    orderId: string;
+    storeId: string;
+    lines: readonly { skuId: string; skuCode: string; quantity: number }[];
+  }): Promise<void>;
+  releaseForOrder(input: {
+    orderId: string;
+    storeId: string;
+    reason: 'order_cancelled';
+  }): Promise<void>;
+};
+
+/**
+ * One line's computed tax, as checkout receives it back. Structurally the tax module's
+ * `TaxedLine`, and every field is a decimal string at storage scale.
+ */
+export type CheckoutLineTax = {
+  readonly skuId: string;
+  readonly taxableValue: string;
+  readonly hsnCode: string | null;
+  readonly taxClassCode: string | null;
+  readonly taxClassName: string | null;
+  readonly cgstRate: string;
+  readonly cgstAmount: string;
+  readonly sgstRate: string;
+  readonly sgstAmount: string;
+  readonly igstRate: string;
+  readonly igstAmount: string;
+  readonly cessRate: string;
+  readonly cessAmount: string;
+  readonly taxTotal: string;
+};
+
+/** The whole determination. `assessed: false` carries no snapshot — see the tax module. */
+export type CheckoutTaxDetermination =
+  | {
+      readonly assessed: false;
+      readonly lines: readonly CheckoutLineTax[];
+      readonly taxTotal: string;
+      readonly grandTotal: string;
+    }
+  | {
+      readonly assessed: true;
+      readonly lines: readonly CheckoutLineTax[];
+      readonly taxTotal: string;
+      readonly grandTotal: string;
+      readonly taxAt: Date;
+      readonly supplyType: string;
+      readonly placeOfSupplyState: string;
+      readonly placeOfSupplyBasis: string;
+      readonly sellerGstin: string;
+      readonly sellerLegalName: string;
+      readonly originLine1: string;
+      readonly originLine2: string;
+      readonly originCity: string;
+      readonly originState: string;
+      readonly originPostalCode: string;
+      readonly originCountryCode: string;
+      readonly customerTaxCategory: string;
+      readonly customerGstin: string | null;
+      readonly customerLegalName: string | null;
+    };
+
+/**
+ * **Tax, as orders needs it — declared HERE, implemented by the tax module.**
+ *
+ * `no-cross-module-imports` forbids `modules/orders` from importing `modules/tax` and forbids
+ * the reverse just as firmly, so the CONSUMER declares the port and `container.ts` adapts the
+ * tax service onto it — the same pattern `CheckoutPromotions` and `OrderReservations` use.
+ * Structurally typed, so neither module names the other.
+ *
+ * **One operation, and orders cannot influence its answer.** There is no way through this port
+ * to read a rate, choose a tax class, set a supply type, or supply an amount. Orders hands
+ * over the line money it has already computed and the destination state it has already
+ * snapshotted, and receives a determination it writes verbatim. It never does tax arithmetic.
+ *
+ * Must be called INSIDE the checkout transaction: the seller profile, the customer identity
+ * and the classifications must be read in the same snapshot as the order they are written
+ * onto. The tax service asserts that itself rather than trusting a caller to remember, exactly
+ * as `lockCartForCheckout` and `reserve` do.
+ */
+export type CheckoutTax = {
+  determineForCheckout(input: {
+    storeId: string;
+    userId: string;
+    storeCurrency: string;
+    total: string;
+    destinationState: string;
+    lines: readonly {
+      skuId: string;
+      skuCode: string;
+      lineTotal: string;
+      discountAmount: string;
+    }[];
+    at: Date;
+  }): Promise<CheckoutTaxDetermination>;
+};
+
 /* ── Errors ──────────────────────────────────────────────────────────────── */
 
 /**
@@ -281,11 +427,26 @@ export function createOrdersService(deps: {
   promotions: CheckoutPromotions;
   idempotency: CheckoutIdempotency;
   payments: OrderPayments;
+  reservations: OrderReservations;
+  fulfilment: OrderFulfilment;
+  tax: CheckoutTax;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
 }) {
-  const { repository, cart, promotions, idempotency, payments, db, audit, logger } = deps;
+  const {
+    repository,
+    cart,
+    promotions,
+    idempotency,
+    payments,
+    reservations,
+    fulfilment,
+    tax,
+    db,
+    audit,
+    logger,
+  } = deps;
 
   /**
    * A store configured with a currency this build does not know is an OPERATOR error, so it
@@ -481,8 +642,90 @@ export function createOrdersService(deps: {
           ),
         );
 
-        /* 13. The payable goods total, before any future tax. */
+        /* 13. The payable GOODS total. Unchanged in meaning, permanently. */
         const total = toDb(subtract(fromDb(subtotal, currency), fromDb(discountTotal, currency)));
+
+        /**
+         * 13b–13f. **GST, and this is the only position it could occupy.**
+         *
+         * AFTER the discount has been allocated, because approved decision 12 and §42 both fix
+         * the ordering: *"a cart-level discount must be allocated across order lines before tax
+         * is computed"*, and the per-line basis is `line_total - discount_amount`. Computing
+         * tax on an undiscounted line would over-charge every discounted order.
+         *
+         * BEFORE the cart transition and the order insert, because the header must be written
+         * with `tax_total` and `grand_total` already known — `ck_order_grand_total_identity`
+         * refuses a row where they disagree, so there is no "insert now, tax later" option.
+         *
+         * INSIDE this transaction, so the seller profile, the customer's registration and the
+         * SKU classifications are read in the same snapshot as the order they are written onto.
+         *
+         * The tax instant is `at` — the same instant the order is stamped `placed_at` with —
+         * which is what makes the effective-dated rate selection reproducible for ever.
+         *
+         * **Orders does no tax arithmetic.** Every figure below arrives computed and is written
+         * verbatim. A `TaxNotDeterminable` (422) from an unclassified or unrated line rolls this
+         * whole transaction back: no order, no lines, no cart transition, no reservation.
+         */
+        const determination = await tax.determineForCheckout({
+          storeId: params.storeId,
+          userId: params.userId,
+          storeCurrency: params.storeCurrency,
+          total,
+          /* The DESTINATION, from the address already snapshotted above — never from a client. */
+          destinationState: owned.state,
+          lines: priced.map((p, index) => ({
+            skuId: p.line.skuId,
+            skuCode: p.line.skuCode,
+            lineTotal: p.lineTotal,
+            discountAmount: allocated[index] ?? toDb(zero(currency)),
+          })),
+          at,
+        });
+
+        const taxByskuId = new Map(determination.lines.map((line) => [line.skuId, line]));
+
+        /**
+         * The determination snapshot, or thirteen nulls.
+         *
+         * Built as one object so the all-or-nothing shape `ck_order_tax_snapshot` enforces is
+         * visible here too: there is no path that writes some of these and not others.
+         */
+        const taxSnapshot = determination.assessed
+          ? {
+              taxAt: determination.taxAt,
+              supplyType: determination.supplyType,
+              placeOfSupplyState: determination.placeOfSupplyState,
+              placeOfSupplyBasis: determination.placeOfSupplyBasis,
+              sellerGstin: determination.sellerGstin,
+              sellerLegalName: determination.sellerLegalName,
+              originLine1: determination.originLine1,
+              originLine2: determination.originLine2,
+              originCity: determination.originCity,
+              originState: determination.originState,
+              originPostalCode: determination.originPostalCode,
+              originCountryCode: determination.originCountryCode,
+              customerTaxCategory: determination.customerTaxCategory,
+              customerGstin: determination.customerGstin,
+              customerLegalName: determination.customerLegalName,
+            }
+          : {
+              taxAt: null,
+              supplyType: null,
+              placeOfSupplyState: null,
+              placeOfSupplyBasis: null,
+              sellerGstin: null,
+              sellerLegalName: null,
+              originLine1: null,
+              originLine2: null,
+              originCity: null,
+              originState: null,
+              originPostalCode: null,
+              originCountryCode: null,
+              customerTaxCategory: null,
+              customerGstin: null,
+              customerLegalName: null,
+            };
 
         /* 14. Transition the cart. Zero rows means another request won the race. */
         const moved = await cart.markCheckedOut({
@@ -522,6 +765,9 @@ export function createOrdersService(deps: {
                 subtotal,
                 discountTotal,
                 total,
+                taxTotal: determination.taxTotal,
+                grandTotal: determination.grandTotal,
+                ...taxSnapshot,
                 promotionId: promotion?.promotionId ?? null,
                 promotionCode: promotion?.code ?? null,
                 promotionName: promotion?.name ?? null,
@@ -544,19 +790,78 @@ export function createOrdersService(deps: {
 
         /* 16. The lines, every display value copied. */
         await repository.insertOrderLines(
-          priced.map((p, index) => ({
-            orderId,
-            skuId: p.line.skuId,
-            storeId: params.storeId,
-            skuCode: p.line.skuCode,
-            skuName: p.line.skuName,
-            productName: p.line.productName,
-            quantity: p.line.quantity,
-            unitPrice: p.unitPrice,
-            lineTotal: p.lineTotal,
-            discountAmount: allocated[index] ?? toDb(zero(currency)),
-          })),
+          priced.map((p, index) => {
+            const discountAmount = allocated[index] ?? toDb(zero(currency));
+            /*
+             * Every SKU in `priced` was passed to the determination and comes back, so the
+             * fallback is unreachable. It exists because `Map.get` is typed as possibly
+             * undefined and asserting would trade a compile-time guarantee for a runtime throw
+             * inside the checkout transaction — and the fallback it falls back TO is the
+             * untaxed shape, which `ck_order_line_tax_total` accepts.
+             */
+            const lineTax = taxByskuId.get(p.line.skuId);
+            return {
+              orderId,
+              skuId: p.line.skuId,
+              storeId: params.storeId,
+              skuCode: p.line.skuCode,
+              skuName: p.line.skuName,
+              productName: p.line.productName,
+              quantity: p.line.quantity,
+              unitPrice: p.unitPrice,
+              lineTotal: p.lineTotal,
+              discountAmount,
+              taxableValue:
+                lineTax?.taxableValue ??
+                toDb(subtract(fromDb(p.lineTotal, currency), fromDb(discountAmount, currency))),
+              hsnCode: lineTax?.hsnCode ?? null,
+              taxClassCode: lineTax?.taxClassCode ?? null,
+              taxClassName: lineTax?.taxClassName ?? null,
+              cgstRate: lineTax?.cgstRate ?? '0',
+              cgstAmount: lineTax?.cgstAmount ?? toDb(zero(currency)),
+              sgstRate: lineTax?.sgstRate ?? '0',
+              sgstAmount: lineTax?.sgstAmount ?? toDb(zero(currency)),
+              igstRate: lineTax?.igstRate ?? '0',
+              igstAmount: lineTax?.igstAmount ?? toDb(zero(currency)),
+              cessRate: lineTax?.cessRate ?? '0',
+              cessAmount: lineTax?.cessAmount ?? toDb(zero(currency)),
+              taxTotal: lineTax?.taxTotal ?? toDb(zero(currency)),
+            };
+          }),
         );
+
+        /**
+         * 16b. **Hold the stock. The step that makes overselling impossible.**
+         *
+         * Here, and not earlier, for three reasons:
+         *
+         *  - **After the order header exists**, because `fk_stock_reservation_order_store`
+         *    references `order(id, store_id)`. That is what fixes this position rather than a
+         *    preference.
+         *  - **Outside the step-15 savepoint**, so an order-number collision retries only the
+         *    header insert. Reserving inside it would re-run on every retry.
+         *  - **After `markCheckedOut`**, so a losing concurrent checkout cannot take stock it is
+         *    then going to roll back.
+         *
+         * The cost is that insufficient stock rolls back a header and lines already written.
+         * That is the right trade: it is one transaction, and the alternative — an advisory
+         * availability check before step 15 — returns an answer that is stale the instant it
+         * arrives, which is the reasoning §39 used to refuse availability checks in the first
+         * place.
+         *
+         * Throws `ReservationInsufficientStock` (a 409) naming the SKU codes, which rolls this
+         * whole transaction back: the counter increments, the order, the lines and the cart
+         * transition all disappear together.
+         */
+        await reservations.reserve({
+          orderId,
+          storeId: params.storeId,
+          lines: priced.map((p) => ({
+            skuId: p.line.skuId,
+            skuCode: p.line.skuCode,
+            quantity: p.line.quantity,
+          })),
+        });
 
         /* 17. The first history row: created IN this state, so `from_status` is NULL. */
         await repository.insertStatusHistory({
@@ -691,6 +996,30 @@ export function createOrdersService(deps: {
           );
         }
 
+        /**
+         * **A shipped order cannot be cancelled.**
+         *
+         * Checked under the ORDER lock this transaction already holds, which is what makes it
+         * race-free: every path that ships takes the same lock first, so a shipment cannot
+         * reach `shipped` between this read and the status CAS below.
+         *
+         * Before the payment check because it is the more final answer — a shipped order stays
+         * shipped, where an unpaid one may become payable — and because a customer whose goods
+         * are already in transit should be told that rather than told about their payment.
+         *
+         * A `pending` shipment does NOT block. Nothing has moved, and refusing would trap a
+         * customer whose order a staff member had merely started picking.
+         */
+        if (await fulfilment.hasBlockingShipment({ orderId: header.id, storeId: params.storeId })) {
+          logger.info(
+            { storeId: params.storeId, orderNumber: params.orderNumber },
+            'order_cancel_rejected_shipped',
+          );
+          throw new OrderNotCancellable(
+            'shipped',
+            'This order has already shipped and cannot be cancelled. Returns are not supported yet.',
+          );
+        }
         const paymentState = await payments.stateForOrder({
           orderId: header.id,
           storeId: params.storeId,
@@ -742,6 +1071,28 @@ export function createOrdersService(deps: {
           );
           throw new OrderNotCancellable('status', 'This order was already cancelled.');
         }
+
+        /**
+         * **Give the stock back — after the status CAS, never before.**
+         *
+         * Position is the correctness argument: the CAS above is what proves THIS request is
+         * the one that cancelled the order. Releasing before it would give stock back on a
+         * request that then lost the race and threw.
+         *
+         * Exactly-once is guaranteed twice over. The order CAS refuses a second cancellation,
+         * and independently the release itself is a CAS on `status = 'held'`, so a second pass
+         * settles nothing and decrements nothing. That second guard is what makes this safe
+         * even if a future code path reaches cancellation another way.
+         *
+         * A `committed` reservation is never touched, because it is not `held`. So a payment
+         * that succeeded cannot have its stock released by a cancellation racing in — and the
+         * cancellation would have been refused with `ORDER_PAID` anyway.
+         */
+        await reservations.releaseForOrder({
+          orderId: header.id,
+          storeId: params.storeId,
+          reason: 'order_cancelled',
+        });
 
         /** Append-only, exactly as checkout writes the creation row. §3 #8. */
         await repository.insertStatusHistory({
@@ -810,6 +1161,54 @@ export function createOrdersService(deps: {
       return invoiceFor(await repository.findOwnedOrderByNumber(params), params.storeId);
     },
 
+    /**
+     * Find and lock one order for STAFF fulfilment, by number. Store-scoped.
+     *
+     * Exposed so the fulfilment module can hold the ORDER lock first — the head of the global
+     * lock order — without importing this module. It declares `FulfilmentOrders.lockByNumber`
+     * and the composition root adapts this onto it.
+     */
+    async lockForFulfilmentByNumber(params: { orderNumber: string; storeId: string }) {
+      if (!isInTransaction()) {
+        throw new InvariantViolation(
+          'lockForFulfilmentByNumber must be called inside the caller transaction; a row lock ' +
+            'does not outlive one, and the fulfilment lock order depends on holding it',
+        );
+      }
+      const row = await repository.lockOrderByNumberForStore(params);
+      return row ?? null;
+    },
+
+    /** The same lock, by id, for the ship and deliver paths. */
+    async lockForFulfilmentById(params: { orderId: string; storeId: string }) {
+      if (!isInTransaction()) {
+        throw new InvariantViolation(
+          'lockForFulfilmentById must be called inside the caller transaction',
+        );
+      }
+      const row = await repository.lockOrderByIdForStore(params);
+      return row ?? null;
+    },
+    /**
+     * Take one order's row lock for the expiry sweeper. Store-scoped, not user-scoped.
+     *
+     * Exists so the payments module can establish the `order -> payment` lock order without
+     * importing this module: it declares `PaymentOrders.lockForExpiry` and the composition root
+     * adapts this onto it. Returns a boolean because the caller needs to know only whether the
+     * lock was taken — it makes no decision from the order itself.
+     *
+     * Must be called inside the caller's transaction; a row lock does not outlive one.
+     */
+    async lockOrderForExpiry(params: { orderId: string; storeId: string }): Promise<boolean> {
+      if (!isInTransaction()) {
+        throw new InvariantViolation(
+          'lockOrderForExpiry must be called inside the caller transaction; a row lock does ' +
+            'not outlive one, and the expiry lock order depends on holding it',
+        );
+      }
+      const row = await repository.lockOrderById(params);
+      return row !== undefined;
+    },
     /**
      * ANY order in the store, with the payment state the invoice needs. Staff only.
      *

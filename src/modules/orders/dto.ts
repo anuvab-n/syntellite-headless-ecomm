@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
 
+import type { OrderLineRecord } from './orders.repository.js';
 import type { OrderView } from './orders.service.js';
 
 /**
@@ -125,6 +126,49 @@ export type OrderItemResponse = {
   unitPrice: string;
   lineTotal: string;
   discountAmount: string;
+  /**
+   * The line's tax, or `null` when the order carried no determination.
+   *
+   * A nested object rather than nine flat fields, so "this line was not assessed" is one null
+   * rather than nine zeros a client has to interpret. `taxableValue` lives inside it for the
+   * same reason: it is only meaningful alongside the rates that were applied to it.
+   */
+  tax: OrderItemTaxResponse | null;
+};
+
+/** One line's GST breakdown, exactly as it was snapshotted. Nothing is recomputed on read. */
+export type OrderItemTaxResponse = {
+  taxableValue: string;
+  hsnCode: string;
+  taxClassCode: string;
+  taxClassName: string;
+  cgstRate: string;
+  cgstAmount: string;
+  sgstRate: string;
+  sgstAmount: string;
+  igstRate: string;
+  igstAmount: string;
+  cessRate: string;
+  cessAmount: string;
+  taxTotal: string;
+};
+
+/**
+ * The order-level GST determination, or `null` when none was made.
+ *
+ * **Deliberately narrow.** The customer sees what was charged and where the supply was made —
+ * the facts on their own invoice. The seller's origin ADDRESS is snapshotted on the order but
+ * is not published here: a customer needs to know the supply's place, not the merchant's
+ * premises, and every field on a response is a field that has to keep being true.
+ */
+export type OrderTaxResponse = {
+  supplyType: string;
+  placeOfSupply: string;
+  sellerGstin: string;
+  sellerLegalName: string;
+  customerTaxCategory: string;
+  customerGstin: string | null;
+  taxedAt: string;
 };
 
 /** The delivery address as it was at checkout. `label` is not part of a delivery record. */
@@ -167,13 +211,59 @@ export type OrderResponse = {
   subtotal: string;
   /** Σ `discountAmount` across the lines. Exactly, by construction. */
   discountTotal: string;
-  /** `subtotal - discountTotal`. */
+  /** `subtotal - discountTotal`. The GOODS total, permanently. */
   total: string;
+  /** Σ line tax. Zero when no determination was made. */
+  taxTotal: string;
+  /** `total + taxTotal` — **the payable amount, and what a payment charges**. */
+  grandTotal: string;
+  /** The determination, or null when this order was never assessed for tax. */
+  tax: OrderTaxResponse | null;
   placedAt: string;
   promotion: OrderPromotionResponse | null;
   shippingAddress: OrderAddressResponse;
   items: OrderItemResponse[];
 };
+
+/**
+ * One line, with its tax block built explicitly rather than by spreading the record.
+ *
+ * The all-or-nothing test mirrors `ck_order_line_tax_classification`, so a line that was never
+ * assessed reports `tax: null` rather than a block of zeros that reads as "assessed at nil".
+ * Built by an explicit mapper for the same reason `toCustomerShipmentResponse` is: a column
+ * added to `order_line` later must not reach a customer response by default.
+ */
+export function toOrderItemResponse(line: OrderLineRecord): OrderItemResponse {
+  const classified =
+    line.hsnCode !== null && line.taxClassCode !== null && line.taxClassName !== null;
+
+  return {
+    skuCode: line.skuCode,
+    skuName: line.skuName,
+    productName: line.productName,
+    quantity: line.quantity,
+    unitPrice: line.unitPrice,
+    lineTotal: line.lineTotal,
+    discountAmount: line.discountAmount,
+    tax: classified
+      ? {
+          taxableValue: line.taxableValue,
+          hsnCode: line.hsnCode,
+          taxClassCode: line.taxClassCode,
+          taxClassName: line.taxClassName,
+          cgstRate: line.cgstRate,
+          cgstAmount: line.cgstAmount,
+          sgstRate: line.sgstRate,
+          sgstAmount: line.sgstAmount,
+          igstRate: line.igstRate,
+          igstAmount: line.igstAmount,
+          cessRate: line.cessRate,
+          cessAmount: line.cessAmount,
+          taxTotal: line.taxTotal,
+        }
+      : null,
+  };
+}
 
 export function toOrderResponse(view: OrderView): OrderResponse {
   const { order, lines } = view;
@@ -185,6 +275,30 @@ export function toOrderResponse(view: OrderView): OrderResponse {
     subtotal: order.subtotal,
     discountTotal: order.discountTotal,
     total: order.total,
+    taxTotal: order.taxTotal,
+    grandTotal: order.grandTotal,
+    /*
+     * All-or-nothing, matching `ck_order_tax_snapshot`. Every field is tested rather than
+     * just `taxAt`, because that is what convinces TypeScript the object below has no nulls —
+     * asserting the constraint would trade a compile-time guarantee for a runtime one.
+     */
+    tax:
+      order.taxAt === null ||
+      order.supplyType === null ||
+      order.placeOfSupplyState === null ||
+      order.sellerGstin === null ||
+      order.sellerLegalName === null ||
+      order.customerTaxCategory === null
+        ? null
+        : {
+            supplyType: order.supplyType,
+            placeOfSupply: order.placeOfSupplyState,
+            sellerGstin: order.sellerGstin,
+            sellerLegalName: order.sellerLegalName,
+            customerTaxCategory: order.customerTaxCategory,
+            customerGstin: order.customerGstin,
+            taxedAt: order.taxAt.toISOString(),
+          },
     placedAt: order.placedAt.toISOString(),
     /**
      * All-or-nothing, matching `ck_order_promotion_snapshot`. Reading the code without the name
@@ -205,15 +319,7 @@ export function toOrderResponse(view: OrderView): OrderResponse {
       postalCode: order.shipPostalCode,
       countryCode: order.shipCountryCode,
     },
-    items: lines.map((line) => ({
-      skuCode: line.skuCode,
-      skuName: line.skuName,
-      productName: line.productName,
-      quantity: line.quantity,
-      unitPrice: line.unitPrice,
-      lineTotal: line.lineTotal,
-      discountAmount: line.discountAmount,
-    })),
+    items: lines.map(toOrderItemResponse),
   };
 }
 

@@ -417,6 +417,7 @@ const ORDER_LINE = {
     'unitPrice',
     'lineTotal',
     'discountAmount',
+    'tax',
   ],
   properties: {
     skuCode: {
@@ -450,8 +451,13 @@ const ORDER_LINE = {
     discountAmount: {
       type: 'string',
       description:
-        "This line's allocated share of the order's cart-level discount, distributed by the largest-remainder method so the parts sum exactly to discountTotal. So a line's net value is (lineTotal - discountAmount), which is the figure a future tax calculation needs and can derive without re-allocating anything.",
+        "This line's allocated share of the order's cart-level discount, distributed by the largest-remainder method so the parts sum exactly to discountTotal. So a line's net value is (lineTotal - discountAmount) — which IS the taxable value, computed before tax and reported below.",
       example: '299.8000',
+    },
+    tax: {
+      description:
+        'The line\u2019s GST breakdown, or null when the order carried no determination. Never a block of zeros standing in for "not assessed".',
+      oneOf: [{ $ref: '#/components/schemas/OrderLineTax' }, { type: 'null' }],
     },
   },
 } as const;
@@ -621,6 +627,274 @@ const PAYMENT_HANDOFF = {
     'Present only on the 201 that created an `online` payment. Absent for COD, which has nothing to hand off.',
 } as const;
 
+/**
+ * One line's GST breakdown, exactly as it was snapshotted at checkout.
+ *
+ * Mirrors `OrderItemTaxResponse`. Every figure is a decimal STRING and none of it is
+ * recomputed on read — a rate change, a reclassification or a renamed tax class cannot alter
+ * any value here.
+ */
+const ORDER_LINE_TAX = {
+  type: 'object',
+  required: [
+    'taxableValue',
+    'hsnCode',
+    'taxClassCode',
+    'taxClassName',
+    'cgstRate',
+    'cgstAmount',
+    'sgstRate',
+    'sgstAmount',
+    'igstRate',
+    'igstAmount',
+    'cessRate',
+    'cessAmount',
+    'taxTotal',
+  ],
+  properties: {
+    taxableValue: {
+      type: 'string',
+      description:
+        'lineTotal minus discountAmount — the value the rates below were applied to. The discount is allocated BEFORE tax, so this needs no re-allocation and cannot disagree with the header. Never a JSON number.',
+      example: '2698.2000',
+    },
+    hsnCode: {
+      type: 'string',
+      maxLength: 16,
+      description:
+        'The HSN or SAC code AS IT WAS at checkout. A snapshot: reclassifying the SKU afterwards does not change it.',
+      example: '6205',
+    },
+    taxClassCode: {
+      type: 'string',
+      maxLength: 64,
+      description: 'The tax class code at checkout. Text, not a reference — see hsnCode.',
+      example: 'GST-STD',
+    },
+    taxClassName: { type: 'string', maxLength: 300, example: 'Standard rate' },
+    cgstRate: {
+      type: 'string',
+      description:
+        'The CGST percentage applied, as a decimal string. Zero for an inter-state supply, where IGST applies instead — a line never carries both.',
+      example: '9.000000',
+    },
+    cgstAmount: { type: 'string', description: 'Never a JSON number.', example: '242.84' },
+    sgstRate: { type: 'string', example: '9.000000' },
+    sgstAmount: { type: 'string', example: '242.84' },
+    igstRate: {
+      type: 'string',
+      description: 'The IGST percentage. Zero for an intra-state supply.',
+      example: '0.000000',
+    },
+    igstAmount: { type: 'string', example: '0.00' },
+    cessRate: {
+      type: 'string',
+      description: 'Cess, where the class attracts one. Accompanies either supply type.',
+      example: '0.000000',
+    },
+    cessAmount: { type: 'string', example: '0.00' },
+    taxTotal: {
+      type: 'string',
+      description:
+        'The sum of the four amounts above, exactly — enforced in the database, so a stored total can never disagree with its own components.',
+      example: '485.68',
+    },
+  },
+} as const;
+
+/**
+ * The order-level GST determination. Mirrors `OrderTaxResponse`.
+ *
+ * Deliberately narrow: what was charged and where the supply was made. The seller's origin
+ * ADDRESS is snapshotted on the order but is not published — a customer needs the supply's
+ * place, not the merchant's premises.
+ */
+const ORDER_TAX = {
+  type: 'object',
+  required: [
+    'supplyType',
+    'placeOfSupply',
+    'sellerGstin',
+    'sellerLegalName',
+    'customerTaxCategory',
+    'customerGstin',
+    'taxedAt',
+  ],
+  properties: {
+    supplyType: {
+      type: 'string',
+      enum: ['intra_state', 'inter_state'],
+      description:
+        'intra_state carries CGST + SGST; inter_state carries IGST. Decided by comparing the seller origin state with the place of supply. There is deliberately no export, sez or exempt value — each is a statutory classification with its own determination rules, and a value nothing can produce looks supported to every reader.',
+      example: 'intra_state',
+    },
+    placeOfSupply: {
+      type: 'string',
+      maxLength: 120,
+      description:
+        'The state where the supply was made, normalised (trimmed, whitespace collapsed, lower-cased) — stored exactly as it was compared, so a determination can be explained after the fact. Based on the delivery destination for the ordinary domestic goods flow.',
+      example: 'karnataka',
+    },
+    sellerGstin: {
+      type: 'string',
+      maxLength: 15,
+      description:
+        "The STORE's GSTIN at the moment of supply — the store is the seller of record, not the platform. A snapshot: the merchant re-registering does not restate a past order.",
+      example: '29ABCDE1234F1Z5',
+    },
+    sellerLegalName: { type: 'string', maxLength: 300, example: 'Example Retail Private Limited' },
+    customerTaxCategory: {
+      type: 'string',
+      enum: ['b2b', 'b2c'],
+      description:
+        'b2b when a valid customer GSTIN was supplied for the transaction, b2c otherwise. No third value: no unregistered, government or composition category is inferred.',
+      example: 'b2c',
+    },
+    customerGstin: {
+      description:
+        "The customer's GSTIN as it was at checkout, or null for b2c. Editing or removing the registration afterwards does not change a past order.",
+      oneOf: [{ type: 'string', maxLength: 15 }, { type: 'null' }],
+    },
+    taxedAt: {
+      type: 'string',
+      format: 'date-time',
+      description:
+        'The authoritative tax instant: the moment the determination was made and the instant the effective-dated rate was selected against. For COD this is checkout, and does NOT wait for a payment that by design never succeeds.',
+    },
+  },
+} as const;
+
+/** A tax class. Mirrors `TaxClassResponse`. No id: a class is addressed by code. */
+const TAX_CLASS = {
+  type: 'object',
+  required: ['code', 'name', 'isActive', 'createdAt', 'updatedAt'],
+  properties: {
+    code: {
+      type: 'string',
+      maxLength: 64,
+      description:
+        "The merchant's own classification code, case-SENSITIVE. Immutable after creation: every order line that used the class carries it as a snapshot, so renaming would leave historical invoices naming a code the admin surface no longer has.",
+      example: 'GST-STD',
+    },
+    name: { type: 'string', maxLength: 300, example: 'Standard rate' },
+    isActive: {
+      type: 'boolean',
+      description:
+        'Whether new checkouts may resolve this class. Deactivating does not touch a historical order, but it makes every SKU pointing here UNSELLABLE in a store with a GST profile — checkout refuses the line rather than assessing it at zero.',
+      example: true,
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
+/** One effective-dated rate set. Mirrors `TaxRateResponse`. */
+const TAX_RATE = {
+  type: 'object',
+  required: [
+    'cgstRate',
+    'sgstRate',
+    'igstRate',
+    'cessRate',
+    'effectiveFrom',
+    'effectiveTo',
+    'createdAt',
+  ],
+  properties: {
+    cgstRate: {
+      type: 'string',
+      description: 'A percentage, as a decimal string.',
+      example: '9.000000',
+    },
+    sgstRate: { type: 'string', example: '9.000000' },
+    igstRate: { type: 'string', example: '18.000000' },
+    cessRate: { type: 'string', example: '0.000000' },
+    effectiveFrom: {
+      type: 'string',
+      format: 'date-time',
+      description: 'Inclusive. Compared against the order\u2019s tax instant, never against now().',
+    },
+    effectiveTo: {
+      description:
+        'EXCLUSIVE, or null for open-ended. Half-open, so a rate ending at midnight does not also apply at midnight. At most one open-ended window may exist per class.',
+      oneOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }],
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
+/**
+ * The seller's GST identity and origin address. Mirrors `StoreTaxProfileResponse`.
+ *
+ * **Staff only.** These are the seller's registration details; they appear on no public store
+ * payload.
+ */
+const STORE_TAX_PROFILE = {
+  type: 'object',
+  required: ['configured', 'legalName', 'gstin', 'pan', 'origin'],
+  properties: {
+    configured: {
+      type: 'boolean',
+      description:
+        '**Whether this store charges GST.** Computed, not stored. True once the profile is filled in — and once it is true, every checkout is assessed and a line that cannot resolve an active tax class and a rate in force is refused with 422 rather than silently untaxed.',
+      example: true,
+    },
+    legalName: { oneOf: [{ type: 'string', maxLength: 300 }, { type: 'null' }] },
+    gstin: { oneOf: [{ type: 'string', maxLength: 15 }, { type: 'null' }] },
+    pan: {
+      description:
+        'Optional even when the rest of the profile is configured: a GSTIN already embeds the PAN.',
+      oneOf: [{ type: 'string', maxLength: 10 }, { type: 'null' }],
+    },
+    origin: {
+      type: 'object',
+      description:
+        'The GST origin / dispatch address. ONE per store; multi-warehouse origin is deferred. Every field is null together with the identity above, or every field is present — half a profile is unrepresentable.',
+      required: ['line1', 'line2', 'city', 'state', 'postalCode', 'countryCode'],
+      properties: {
+        line1: { oneOf: [{ type: 'string', maxLength: 300 }, { type: 'null' }] },
+        line2: { type: 'string', maxLength: 300, description: 'Empty string when absent.' },
+        city: { oneOf: [{ type: 'string', maxLength: 120 }, { type: 'null' }] },
+        state: {
+          description:
+            'The SELLER half of the CGST/SGST-versus-IGST comparison. Free text: a GST state-code catalogue is statutory master data this build does not invent.',
+          oneOf: [{ type: 'string', maxLength: 120 }, { type: 'null' }],
+        },
+        postalCode: { oneOf: [{ type: 'string', maxLength: 16 }, { type: 'null' }] },
+        countryCode: { oneOf: [{ type: 'string', minLength: 2, maxLength: 2 }, { type: 'null' }] },
+      },
+    },
+  },
+} as const;
+
+/** A customer's own GST registration. Mirrors `CustomerTaxIdentityResponse`. */
+const CUSTOMER_TAX_IDENTITY = {
+  type: 'object',
+  required: ['gstin', 'legalName', 'updatedAt'],
+  properties: {
+    gstin: { type: 'string', maxLength: 15, example: '29ABCDE1234F1Z5' },
+    legalName: {
+      type: 'string',
+      maxLength: 300,
+      description:
+        'The registered legal name the GSTIN belongs to. A business, not the account holder — snapshotting the wrong one onto an invoice is the kind of error nobody notices until an audit.',
+      example: 'Buyer Enterprises LLP',
+    },
+    updatedAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
+/** A SKU's tax classification. Mirrors `SkuTaxResponse`. */
+const SKU_TAX = {
+  type: 'object',
+  required: ['skuCode', 'taxClassCode', 'hsnCode'],
+  properties: {
+    skuCode: { type: 'string', maxLength: 64, example: 'SHIRT-BLUE-M' },
+    taxClassCode: { oneOf: [{ type: 'string', maxLength: 64 }, { type: 'null' }] },
+    hsnCode: { oneOf: [{ type: 'string', maxLength: 16 }, { type: 'null' }] },
+  },
+} as const;
+
 /** An order. Mirrors `OrderResponse` in `modules/orders/dto.ts`. */
 const ORDER = {
   type: 'object',
@@ -631,6 +905,9 @@ const ORDER = {
     'subtotal',
     'discountTotal',
     'total',
+    'taxTotal',
+    'grandTotal',
+    'tax',
     'placedAt',
     'promotion',
     'shippingAddress',
@@ -673,8 +950,25 @@ const ORDER = {
     total: {
       type: 'string',
       description:
-        '**subtotal minus discountTotal: the payable GOODS total, before any tax.** This meaning is fixed. When GST arrives it will add taxTotal and grandTotal alongside; it must NOT redefine total. Never a JSON number.',
+        '**subtotal minus discountTotal: the GOODS total, before tax.** This meaning is fixed and Increment 38 did not change it — GST was added as taxTotal and grandTotal ALONGSIDE. **This is no longer the amount charged**; grandTotal is. Never a JSON number.',
       example: '2698.2000',
+    },
+    taxTotal: {
+      type: 'string',
+      description:
+        'The sum of every line taxTotal. **0.0000 both when tax was assessed at nil and when it was never assessed at all** — the tax object below is what distinguishes the two. Never a JSON number.',
+      example: '485.68',
+    },
+    grandTotal: {
+      type: 'string',
+      description:
+        '**total + taxTotal: THE PAYABLE AMOUNT, and what a payment charges.** Equal to total for an order carrying no tax determination, which is why the change is invisible to orders placed before GST existed. Enforced as an identity in the database. Never a JSON number.',
+      example: '3183.88',
+    },
+    tax: {
+      description:
+        '**The GST determination, or null when this order was never assessed** — placed before GST existed, or in a store with no tax profile configured. Null is NOT the same as a determination that produced zero: one says "not assessed", the other says "assessed at nil", and they stay distinguishable for ever.',
+      oneOf: [{ $ref: '#/components/schemas/OrderTax' }, { type: 'null' }],
     },
     placedAt: {
       type: 'string',
@@ -1095,6 +1389,35 @@ const PRODUCT_LIFECYCLE_ERRORS = {
   ),
 } as const;
 
+/**
+ * A shipment as STAFF see it: the customer fields plus the `id` needed to act on it.
+ *
+ * Shared because six operations return the same shape, and a copy per operation is six places
+ * for the response to drift from what the mapper actually produces.
+ */
+const STAFF_SHIPMENT = {
+  type: 'object',
+  required: [
+    'id',
+    'status',
+    'carrier',
+    'trackingNumber',
+    'trackingUrl',
+    'shippedAt',
+    'deliveredAt',
+    'createdAt',
+  ],
+  properties: {
+    id: { type: 'string', format: 'uuid' },
+    status: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+    carrier: { type: 'string', nullable: true, maxLength: 120 },
+    trackingNumber: { type: 'string', nullable: true, maxLength: 120 },
+    trackingUrl: { type: 'string', nullable: true, maxLength: 500 },
+    shippedAt: { type: 'string', format: 'date-time', nullable: true },
+    deliveredAt: { type: 'string', format: 'date-time', nullable: true },
+    createdAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
 export function buildOpenApiSpec(config: Config): Record<string, unknown> {
   return {
     openapi: '3.0.3',
@@ -1162,9 +1485,28 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         description:
           'Stock levels and the append-only ledger of every change. Staff only; there is no public inventory surface.',
       },
+      {
+        name: 'Tax',
+        description:
+          'GST configuration and tax identity. The staff routes configure what customers are charged; the three customer routes reach only the caller own registration.',
+      },
       { name: 'Health', description: 'Liveness and readiness probes. Not store-scoped.' },
     ],
     components: {
+      responses: {
+        StaffShipment: {
+          description: 'The shipment, as staff see it.',
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['shipment'],
+                properties: { shipment: STAFF_SHIPMENT },
+              },
+            },
+          },
+        },
+      },
       schemas: {
         ErrorEnvelope: ERROR_ENVELOPE,
         User: USER,
@@ -1185,8 +1527,23 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         SkuOption: SKU_OPTION,
         Option: OPTION,
         OptionValue: OPTION_VALUE,
+        StaffShipment: STAFF_SHIPMENT,
+        StaffShipmentList: {
+          type: 'object',
+          required: ['shipments'],
+          properties: {
+            shipments: { type: 'array', maxItems: 1, items: STAFF_SHIPMENT },
+          },
+        },
         StockItem: STOCK_ITEM,
         StockAdjustment: STOCK_ADJUSTMENT,
+        OrderTax: ORDER_TAX,
+        OrderLineTax: ORDER_LINE_TAX,
+        TaxClass: TAX_CLASS,
+        TaxRate: TAX_RATE,
+        StoreTaxProfile: STORE_TAX_PROFILE,
+        CustomerTaxIdentity: CUSTOMER_TAX_IDENTITY,
+        SkuTax: SKU_TAX,
         Pagination: PAGINATION,
       },
       securitySchemes: {
@@ -1659,6 +2016,1120 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
           },
         },
       },
+      '/api/v1/admin/store/tax-profile': {
+        get: {
+          tags: ['Tax'],
+          summary: 'Read the seller GST profile',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The store\u2019s own GST identity and origin address, plus a computed `configured` flag.',
+            '',
+            '**Staff only, and deliberately absent from every public store payload.** These are the',
+            'seller\u2019s registration details: they belong on an invoice and in the admin surface, not',
+            'on a response every visitor receives.',
+            '',
+            '`configured` is the single most consequential field in this module — see the PUT.',
+          ].join(' '),
+          responses: {
+            '200': {
+              description: 'The profile. Every field is null when GST has not been configured.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxProfile'],
+                    properties: { taxProfile: { $ref: '#/components/schemas/StoreTaxProfile' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Derived from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+        put: {
+          tags: ['Tax'],
+          summary: 'Configure the seller GST profile',
+          security: [{ bearerAuth: [] }],
+          description: [
+            '**This is the GST switch.** Once a profile exists, every checkout in this store is',
+            'assessed, and a line whose SKU cannot resolve an active tax class and a rate in force',
+            'is refused with `422 TAX_NOT_DETERMINABLE` rather than silently untaxed. A store with',
+            'no profile assesses nothing and its orders carry no tax determination at all.',
+            '',
+            '**A full replace, not a patch.** Identity and origin are all-or-nothing in the',
+            'database, so a partial write could fail a constraint the caller could not have',
+            'predicted from the field they touched. Sending the whole object makes the outcome',
+            'obvious from the request, and makes "configure GST" one auditable act.',
+            '',
+            '`gstin` and `pan` are validated for SHAPE only — no checksum. Implementing the check',
+            'digit would be engineering inventing a validation rule, and a wrong implementation',
+            'rejects a legitimate registration.',
+            '',
+            '`originState` is the seller half of the CGST/SGST-versus-IGST comparison. It is free',
+            'text and is compared against the delivery state after normalising case and',
+            'whitespace; a GST state-code catalogue is statutory master data this build does not',
+            'invent, so two different SPELLINGS of one state will compare unequal.',
+          ].join(' '),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: [
+                    'legalName',
+                    'gstin',
+                    'originLine1',
+                    'originCity',
+                    'originState',
+                    'originPostalCode',
+                    'originCountryCode',
+                  ],
+                  properties: {
+                    legalName: { type: 'string', minLength: 1, maxLength: 300 },
+                    gstin: {
+                      type: 'string',
+                      minLength: 15,
+                      maxLength: 15,
+                      description: 'Upper-cased before validation.',
+                      example: '29ABCDE1234F1Z5',
+                    },
+                    pan: {
+                      description: 'Optional: a GSTIN already embeds the PAN.',
+                      oneOf: [{ type: 'string', minLength: 10, maxLength: 10 }, { type: 'null' }],
+                    },
+                    originLine1: { type: 'string', minLength: 1, maxLength: 300 },
+                    originLine2: { type: 'string', maxLength: 300 },
+                    originCity: { type: 'string', minLength: 1, maxLength: 120 },
+                    originState: { type: 'string', minLength: 1, maxLength: 120 },
+                    originPostalCode: { type: 'string', minLength: 1, maxLength: 16 },
+                    originCountryCode: { type: 'string', minLength: 2, maxLength: 2 },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The stored profile.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxProfile'],
+                    properties: { taxProfile: { $ref: '#/components/schemas/StoreTaxProfile' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+      '/api/v1/admin/tax-classes': {
+        post: {
+          tags: ['Tax'],
+          summary: 'Create a tax class',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A classification a SKU points at and rates hang off. It holds NO percentage:',
+            'rates are effective-dated and a class is not, so putting one here would mean losing',
+            'the old value on every change and with it the ability to reprice a historical order.',
+            '',
+            'The `code` is immutable after creation, because every order line that uses the class',
+            'snapshots it.',
+          ].join(' '),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['code', 'name'],
+                  properties: {
+                    code: {
+                      type: 'string',
+                      minLength: 1,
+                      maxLength: 64,
+                      description:
+                        'Case-SENSITIVE. Letters, digits, dots, underscores, slashes and hyphens; no whitespace, so it survives a URL path unencoded.',
+                      example: 'GST-STD',
+                    },
+                    name: { type: 'string', minLength: 1, maxLength: 300 },
+                    isActive: { type: 'boolean', description: 'Defaults to true.' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The created class.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxClass'],
+                    properties: { taxClass: { $ref: '#/components/schemas/TaxClass' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '409': errorResponse(
+              'A tax class in this store already uses this code, compared case-sensitively.',
+              'TAX_CLASS_ALREADY_EXISTS',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+        get: {
+          tags: ['Tax'],
+          summary: 'List tax classes',
+          security: [{ bearerAuth: [] }],
+          description:
+            'A page of this store\u2019s tax classes, ordered by code. Inactive classes are included: a merchant must be able to see the classification they retired, not least because historical orders still name it.',
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of classes.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxClasses', 'pagination'],
+                    properties: {
+                      taxClasses: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/TaxClass' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+      '/api/v1/admin/tax-classes/{code}': {
+        patch: {
+          tags: ['Tax'],
+          summary: 'Rename or deactivate a tax class',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Name and active state only. **The code cannot be changed** — historical order lines',
+            'carry it as a snapshot, so renaming would leave past invoices naming a code the admin',
+            'surface no longer has.',
+            '',
+            '**Deactivating is not free.** Every SKU pointing at this class becomes unsellable in a',
+            'store with a GST profile: checkout refuses the line with 422 rather than assessing it',
+            'at zero. That is deliberate — silently untaxing a line is an accounting error nobody',
+            'notices until a return is filed.',
+          ].join(' '),
+          parameters: [
+            {
+              name: 'code',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', minLength: 1, maxLength: 64 },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  description: 'At least one field must be supplied.',
+                  properties: {
+                    name: { type: 'string', minLength: 1, maxLength: 300 },
+                    isActive: { type: 'boolean' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The updated class.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxClass'],
+                    properties: { taxClass: { $ref: '#/components/schemas/TaxClass' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such tax class in this store. An unknown code and another store\u2019s class are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+      '/api/v1/admin/tax-classes/{code}/rates': {
+        post: {
+          tags: ['Tax'],
+          summary: 'Add an effective-dated rate',
+          security: [{ bearerAuth: [] }],
+          description: [
+            '**Rates are configuration, never code.** There is no default, no seed and no constant',
+            'anywhere in this system naming a GST percentage; a class has no rate until one is',
+            'configured here, and a checkout that cannot find one is refused.',
+            '',
+            'The window is half-open: `effectiveFrom` is inclusive, `effectiveTo` is exclusive, and',
+            'null means open-ended. Overlapping windows for one class are refused — the class row',
+            'is locked before the check, so two staff configuring rates at once serialise rather',
+            'than both writing.',
+            '',
+            '**No relationship between the four components is validated.** The conventional',
+            'arrangement is that IGST equals CGST plus SGST; asserting it would make this API the',
+            'authority on a rule the finance function owns.',
+            '',
+            'There is deliberately **no update and no delete**. A rate that was in force is what a',
+            'historical order was assessed under; superseding it with a new dated window is the',
+            'honest correction.',
+          ].join(' '),
+          parameters: [
+            {
+              name: 'code',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', minLength: 1, maxLength: 64 },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['cgstRate', 'sgstRate', 'igstRate', 'effectiveFrom'],
+                  properties: {
+                    cgstRate: {
+                      type: 'string',
+                      description:
+                        'A percentage as a decimal STRING, at most 6 decimal places, 0 to 100. Zero is accepted: a zero-rate class records that a determination was made at nil.',
+                      example: '9',
+                    },
+                    sgstRate: { type: 'string', example: '9' },
+                    igstRate: { type: 'string', example: '18' },
+                    cessRate: { type: 'string', description: 'Defaults to 0.', example: '0' },
+                    effectiveFrom: {
+                      type: 'string',
+                      format: 'date-time',
+                      description:
+                        'Required, with no default: defaulting it to "now" would make the most consequential field on the row an accident of when the request arrived.',
+                    },
+                    effectiveTo: {
+                      description: 'Exclusive, or null / absent for open-ended.',
+                      oneOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The created rate.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxRate'],
+                    properties: { taxRate: { $ref: '#/components/schemas/TaxRate' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such tax class in this store.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The window overlaps a rate already configured for this class. The conflicting window is named in details.',
+              'TAX_RATE_OVERLAP',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+        get: {
+          tags: ['Tax'],
+          summary: 'List a class rates',
+          security: [{ bearerAuth: [] }],
+          description:
+            'Every rate configured for the class, newest window first. Superseded windows are included — they are what historical orders were assessed under.',
+          parameters: [
+            {
+              name: 'code',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', minLength: 1, maxLength: 64 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The class and its rates.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxClass', 'taxRates'],
+                    properties: {
+                      taxClass: { $ref: '#/components/schemas/TaxClass' },
+                      taxRates: { type: 'array', items: { $ref: '#/components/schemas/TaxRate' } },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such tax class in this store.', 'NOT_FOUND'),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+      '/api/v1/admin/skus/{code}/tax': {
+        put: {
+          tags: ['Tax'],
+          summary: 'Classify a SKU',
+          security: [{ bearerAuth: [] }],
+          description: [
+            '**The SKU is the tax-classification unit**, and two SKUs of one product may carry',
+            'different HSN codes and different classes. There is deliberately no product-level',
+            'fallback: a SKU inheriting a classification that may be wrong for it is under- or',
+            'over-charged tax on every sale.',
+            '',
+            'Both fields move together, or both are null to clear — a class with no HSN cannot',
+            'produce a compliant invoice line, and an HSN with no class has no rate to apply.',
+            '',
+            '**An unclassified SKU is not untaxed.** In a store with a GST profile, checkout refuses',
+            'it with `422 TAX_NOT_DETERMINABLE`.',
+            '',
+            'A route of its own rather than fields on the SKU PATCH: classification is tax master',
+            'data with a different authority and a different reviewer from a SKU name and price.',
+          ].join(' '),
+          parameters: [
+            {
+              name: 'code',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', minLength: 1, maxLength: 64 },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['taxClassCode', 'hsnCode'],
+                  properties: {
+                    taxClassCode: {
+                      oneOf: [{ type: 'string', minLength: 1, maxLength: 64 }, { type: 'null' }],
+                    },
+                    hsnCode: {
+                      description:
+                        'Two to eight digits. Deliberately not a fixed digit count: the number required depends on a turnover threshold this build does not invent. There is no catalogue check, because there is no catalogue.',
+                      oneOf: [{ type: 'string', minLength: 2, maxLength: 8 }, { type: 'null' }],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The SKU classification.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['skuTax'],
+                    properties: { skuTax: { $ref: '#/components/schemas/SkuTax' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such SKU in this store, a deleted SKU, or an unknown tax class. All indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+      '/api/v1/users/me/tax-identity': {
+        get: {
+          tags: ['Tax'],
+          summary: 'Read your GST registration',
+          security: [{ bearerAuth: [] }],
+          description:
+            'The caller\u2019s own GST registration. A 404 when they have not set one: "you have not set one" is the absence of a resource, and every other single-resource read in this API answers absence the same way.',
+          responses: {
+            '200': {
+              description: 'The registration.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxIdentity'],
+                    properties: {
+                      taxIdentity: { $ref: '#/components/schemas/CustomerTaxIdentity' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '404': errorResponse('The caller has no GST registration on file.', 'NOT_FOUND'),
+            ...COMMON_ERRORS,
+          },
+        },
+        put: {
+          tags: ['Tax'],
+          summary: 'Set your GST registration',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Create or replace, so the endpoint is idempotent and there is no already-exists',
+            'conflict to handle.',
+            '',
+            '**Supplying one makes your next order B2B**, and the GSTIN is snapshotted onto it. It',
+            'does NOT retroactively change an order already placed: those carry their own snapshot.',
+            '',
+            'Two fields, and that is the whole of it. No place of business, no verification state,',
+            'no second registration — each would be a feature with no consumer.',
+            '',
+            'The GSTIN is validated for SHAPE only; there is no checksum and no registry lookup.',
+          ].join(' '),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['gstin', 'legalName'],
+                  properties: {
+                    gstin: {
+                      type: 'string',
+                      minLength: 15,
+                      maxLength: 15,
+                      description: 'Upper-cased before validation.',
+                      example: '29ABCDE1234F1Z5',
+                    },
+                    legalName: {
+                      type: 'string',
+                      minLength: 1,
+                      maxLength: 300,
+                      description:
+                        'The registered legal name the GSTIN belongs to — a business, not the account holder.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The stored registration.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['taxIdentity'],
+                    properties: {
+                      taxIdentity: { $ref: '#/components/schemas/CustomerTaxIdentity' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            ...COMMON_ERRORS,
+          },
+        },
+        delete: {
+          tags: ['Tax'],
+          summary: 'Remove your GST registration',
+          security: [{ bearerAuth: [] }],
+          description:
+            'A hard delete, and correct: every order that used the GSTIN carries its own copy, so nothing an audit needs is lost. Your next order is B2C.',
+          responses: {
+            '204': { description: 'Removed.' },
+            '401': errorResponse('Not authenticated.', 'AUTHENTICATION_REQUIRED'),
+            '404': errorResponse('There was no registration to remove.', 'NOT_FOUND'),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+      '/api/v1/users/me/orders/{orderNumber}/shipments': {
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'Track a shipment',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Where the customer’s parcel is. An **empty array** is a normal answer — the order',
+            'exists and has not shipped yet — and it is a different answer from `404`, which',
+            'means the order is unknown, another customer’s, or another store’s.',
+            '',
+            'At most one shipment per order, so the array holds zero or one entry. Split',
+            'deliveries are not supported; see the staff create endpoint.',
+            '',
+            '### What is deliberately not here',
+            '',
+            'No shipment id, no order id, no internal note and nothing about inventory. A customer',
+            'gets exactly the facts needed to find their parcel: the state, who is carrying it,',
+            'the consignment number, and the two timestamps.',
+            '',
+            '`carrier` and `trackingNumber` are **nullable**, and often null: a shipment is raised',
+            'when picking starts and the courier is frequently chosen later.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The order’s shipments. Empty until it ships.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['shipments'],
+                    properties: {
+                      shipments: {
+                        type: 'array',
+                        maxItems: 1,
+                        items: {
+                          type: 'object',
+                          required: [
+                            'status',
+                            'carrier',
+                            'trackingNumber',
+                            'trackingUrl',
+                            'shippedAt',
+                            'deliveredAt',
+                          ],
+                          properties: {
+                            status: {
+                              type: 'string',
+                              enum: ['pending', 'shipped', 'delivered'],
+                              description:
+                                '`pending` — raised, not yet despatched. `shipped` — goods have left. `delivered` — arrival recorded.',
+                            },
+                            carrier: { type: 'string', nullable: true, maxLength: 120 },
+                            trackingNumber: { type: 'string', nullable: true, maxLength: 120 },
+                            trackingUrl: {
+                              type: 'string',
+                              nullable: true,
+                              maxLength: 500,
+                              description: 'Always `http` or `https`; other schemes are refused.',
+                            },
+                            shippedAt: { type: 'string', format: 'date-time', nullable: true },
+                            deliveredAt: { type: 'string', format: 'date-time', nullable: true },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '404': errorResponse(
+              'No such order. An unknown number, another customer’s order and another store’s order are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/fulfilment': {
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'Orders awaiting fulfilment (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The work queue: orders in this store that still need shipping, oldest first.',
+            '',
+            '**This is not an admin order list.** The predicate is exactly "work to do" — the',
+            'order is not cancelled, and it has either no shipment or one still `pending`. There',
+            'is no customer search, no status filter, no date range and no free text, and an',
+            'unknown query parameter is a `400` rather than being ignored. Widening it would make',
+            'this the general-purpose admin order surface this API deliberately does not have.',
+            '',
+            '### Keyset pagination, not offset',
+            '',
+            'A queue is worked from the front while rows leave it, so `OFFSET` would skip orders',
+            'as earlier ones are shipped — in a fulfilment queue that means an order nobody ever',
+            'sees. Pass the `nextCursor` from the previous page; `null` means the last page. The',
+            'cursor is opaque and its format may change.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'cursor',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', maxLength: 200 },
+              description: 'The `nextCursor` from a previous page. Opaque.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of orders needing fulfilment.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders', 'nextCursor'],
+                    properties: {
+                      orders: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          required: [
+                            'orderNumber',
+                            'placedAt',
+                            'recipientName',
+                            'city',
+                            'postalCode',
+                            'shipmentStatus',
+                          ],
+                          properties: {
+                            orderNumber: { type: 'string' },
+                            placedAt: { type: 'string', format: 'date-time' },
+                            recipientName: { type: 'string' },
+                            city: { type: 'string' },
+                            postalCode: { type: 'string' },
+                            shipmentStatus: {
+                              type: 'string',
+                              nullable: true,
+                              enum: ['pending'],
+                              description: '`null` when no shipment has been raised yet.',
+                            },
+                          },
+                        },
+                      },
+                      nextCursor: { type: 'string', nullable: true },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid or expired.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Derived from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}/shipments': {
+        post: {
+          tags: ['Fulfilment'],
+          summary: 'Raise a shipment (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Creates the order’s shipment in `pending`. **It does not despatch it** — `/ship`',
+            'does, and it is a separate call because moving stock is irreversible and should not',
+            'be a side effect of a request whose body is tracking metadata.',
+            '',
+            '### One shipment per order',
+            '',
+            'Enforced by a unique constraint, which is also the duplicate-click guard: two staff',
+            'pressing Create produce one shipment and one `409`. That is why this endpoint takes',
+            '**no `Idempotency-Key`** — a constraint does the work a header would only approximate.',
+            '',
+            'Partial fulfilment is not supported: one shipment covers the whole order.',
+            '',
+            '### The payment prerequisite',
+            '',
+            '| Payment | May raise a shipment |',
+            '| --- | --- |',
+            '| online, `succeeded` | yes |',
+            '| online, `pending` / `failed` / `expired` | no — `422` |',
+            '| **cash on delivery, `pending`** | **yes** |',
+            '| none | no — `422` |',
+            '',
+            'The COD row is an approved business rule: a COD payment never reaches a terminal',
+            'state, so requiring `succeeded` would make COD unsellable. **It does not mean the',
+            'payment is settled** — nothing about the payment changes, and the money has not',
+            'arrived.',
+            '',
+            '### Server-controlled fields',
+            '',
+            '`status`, `shippedAt` and `deliveredAt` are not accepted, and neither is any',
+            'identifier: the order comes from the path and the store from the token. The body is',
+            'a strict object, so each is a `400` naming the field rather than being ignored.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    carrier: { type: 'string', minLength: 1, maxLength: 120 },
+                    trackingNumber: { type: 'string', minLength: 1, maxLength: 120 },
+                    trackingUrl: {
+                      type: 'string',
+                      format: 'uri',
+                      maxLength: 500,
+                      description:
+                        'Must be `http` or `https`. Other schemes are refused — this value is rendered as a link.',
+                    },
+                  },
+                },
+                examples: {
+                  courierKnown: {
+                    summary: 'Courier already chosen',
+                    value: { carrier: 'Bluedart', trackingNumber: 'BD123456789' },
+                  },
+                  courierUnknown: { summary: 'Picking has started', value: {} },
+                },
+              },
+            },
+          },
+          responses: {
+            '201': { $ref: '#/components/responses/StaffShipment' },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such order in this store.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The order already has a shipment (SHIPMENT_ALREADY_EXISTS), or this tracking number is already recorded for this carrier.',
+              'SHIPMENT_ALREADY_EXISTS',
+            ),
+            '422': errorResponse(
+              'The order cannot be fulfilled. `details.reason` is `order_cancelled`, `payment_not_succeeded`, `no_payment` or `cod_not_pending`.',
+              'ORDER_NOT_FULFILLABLE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'One order’s shipments (staff)',
+          security: [{ bearerAuth: [] }],
+          description:
+            'The staff view of an order’s shipments — the customer fields plus the shipment `id` needed to act on it, and `createdAt`.',
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The order’s shipments.',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/StaffShipmentList' } },
+              },
+            },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such order in this store.', 'NOT_FOUND'),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/shipments/{id}/ship': {
+        post: {
+          tags: ['Fulfilment'],
+          summary: 'Despatch a shipment (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            '**The goods leave, and the stock moves.** This is the only operation in the API that',
+            'decreases physical inventory.',
+            '',
+            'In one transaction: the order’s complete reservation becomes `fulfilled`,',
+            '`stock_item.on_hand` and `reserved` each fall by the shipped quantity — so',
+            '`available` is UNCHANGED, because the units stopped being sellable when they were',
+            'reserved — and one inventory-ledger row is written per SKU with reason `shipment`.',
+            'If any part of that fails, the whole thing rolls back and the shipment stays',
+            '`pending`: **a shipment is never `shipped` with the stock movement incomplete.**',
+            '',
+            'An action endpoint rather than `PATCH {status}`, so an illegal transition is',
+            'unrepresentable rather than merely rejected.',
+            '',
+            'Idempotent by construction: a row lock plus a compare-and-swap mean a second call is',
+            'a `409` with no second stock movement, no second ledger row and no re-stamped',
+            'timestamp. No `Idempotency-Key` is needed or accepted.',
+            '',
+            'The payment prerequisite is the same table as the create endpoint, including the',
+            'approved unpaid-COD path.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    note: {
+                      type: 'string',
+                      minLength: 1,
+                      maxLength: 500,
+                      description:
+                        'Internal remark, recorded on the transition. Never shown to the customer.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': { $ref: '#/components/responses/StaffShipment' },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such shipment in this store.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The shipment cannot make this transition — it has already shipped. `details.from` and `details.to` name the attempted move. Also returned when the order holds no reservation to fulfil, or it was already released or fulfilled.',
+              'SHIPMENT_NOT_TRANSITIONABLE',
+            ),
+            '422': errorResponse(
+              'The order cannot be fulfilled. `details.reason` explains which prerequisite failed.',
+              'ORDER_NOT_FULFILLABLE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/shipments/{id}/deliver': {
+        post: {
+          tags: ['Fulfilment'],
+          summary: 'Record delivery (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Records that the parcel arrived. **No stock moves** — the units left the building at',
+            '`/ship`, and inventory has nothing further to say about them.',
+            '',
+            'Only a `shipped` shipment can be delivered; `pending` is a `409`. A second call is',
+            'also a `409`, and **`deliveredAt` is never overwritten**.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    note: { type: 'string', minLength: 1, maxLength: 500 },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': { $ref: '#/components/responses/StaffShipment' },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such shipment in this store.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The shipment is not `shipped`, or it is already `delivered`.',
+              'SHIPMENT_NOT_TRANSITIONABLE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/shipments/{id}': {
+        patch: {
+          tags: ['Fulfilment'],
+          summary: 'Correct tracking details (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Fixes the carrier, consignment number or tracking link. **It cannot change state** —',
+            'there is no `status` field in the schema, which is why the transitions are separate',
+            'action endpoints.',
+            '',
+            'Three-way semantics: omit a field to leave it alone, send `null` to clear it, send a',
+            'value to set it. At least one field is required — a PATCH that changes nothing is a',
+            '`400`.',
+            '',
+            'Permitted in any state, `delivered` included: a wrong tracking number stays wrong and',
+            'the customer is still looking at it. Audited, because the field is customer-visible.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  minProperties: 1,
+                  properties: {
+                    carrier: { type: 'string', nullable: true, minLength: 1, maxLength: 120 },
+                    trackingNumber: {
+                      type: 'string',
+                      nullable: true,
+                      minLength: 1,
+                      maxLength: 120,
+                    },
+                    trackingUrl: {
+                      type: 'string',
+                      format: 'uri',
+                      nullable: true,
+                      maxLength: 500,
+                      description: 'Must be `http` or `https`.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': { $ref: '#/components/responses/StaffShipment' },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse(
+              'The caller does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse('No such shipment in this store.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'This tracking number is already recorded for this carrier in this store.',
+              'CONFLICT',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/users/me/orders/{orderNumber}/cancel': {
         post: {
           tags: ['Orders'],
@@ -2899,9 +4370,16 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '',
             '### What checkout does NOT do',
             '',
-            '**No stock is read, reserved or decremented**, and no inventory ledger row is',
-            'written \u2014 so an order may be placed for stock that is not there until stock',
-            'allocation ships. **Checkout itself takes no payment**: it neither charges nor',
+            '**Stock IS reserved**, in the same transaction that creates the order: the SKU\u2019s',
+            '`reserved` count rises and its `available` falls, so two customers cannot buy the',
+            'same last unit. If any line cannot be held, the WHOLE checkout is refused with a',
+            '`409` naming the codes \u2014 there is no partial order and no partial reservation.',
+            '',
+            'What is still untouched is `on_hand` and the inventory ledger. A reservation changes',
+            'what is SELLABLE, not what is physically present, so nothing here decrements stock',
+            'or writes a ledger row \u2014 the increment that ships goods does both together.',
+            '',
+            '**Checkout itself takes no payment**: it neither charges nor',
             'contacts a gateway, and the order is `placed` whether or not it is ever paid for.',
             'Paying is a separate, explicit step — see `POST',
             '/users/me/orders/{orderNumber}/payments` — and it never changes `order.status`.',
@@ -2959,7 +4437,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             ),
             '409': {
               description:
-                'Either the cart is no longer available for checkout (CHECKOUT_CART_NOT_AVAILABLE \u2014 there is no active cart, or a concurrent checkout already took it), or a request with this Idempotency-Key is still in flight (IDEMPOTENCY_CONFLICT). Both are safe to retry.',
+                'One of three conflicts with existing state. INSUFFICIENT_STOCK \u2014 a line could not be reserved, with details.skuCodes naming which; the whole order is refused and nothing is held. CHECKOUT_CART_NOT_AVAILABLE \u2014 there is no active cart, or a concurrent checkout already took it. IDEMPOTENCY_CONFLICT \u2014 a request with this Idempotency-Key is still in flight. All three are safe to retry, though INSUFFICIENT_STOCK will keep failing until the stock exists.',
               content: {
                 'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
               },

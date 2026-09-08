@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq } from 'drizzle-orm';
+import { and, asc, count, desc, eq, isNotNull, lte } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { order } from '../../db/schema/orders.js';
@@ -186,6 +186,14 @@ export function createPaymentsRepository(deps: { db: Database }) {
       amountMinor: number;
       actorUserId: string;
       eventType: string;
+      /**
+       * When this payment stops being payable, or `null` for one that never does.
+       *
+       * Computed by the SERVICE from validated configuration and passed in, never derived
+       * here: the repository writes what it is given and owns no business rule. COD is always
+       * `null`, which `ck_payment_expires_at_only_online` also enforces.
+       */
+      expiresAt: Date | null;
     }): Promise<PaymentRecord> {
       const [row] = await executor(db)
         .insert(payment)
@@ -205,6 +213,7 @@ export function createPaymentsRepository(deps: { db: Database }) {
           currency: params.currency,
           amount: params.amount,
           amountMinor: params.amountMinor,
+          expiresAt: params.expiresAt,
         })
         .returning(PAYMENT_COLUMNS);
 
@@ -417,6 +426,72 @@ export function createPaymentsRepository(deps: { db: Database }) {
      * deciding whether the order may be cancelled, and a payment it cannot see is exactly the
      * one that must block it.
      */
+    /* ── Expiry (Increment 36) ────────────────────────────────────────────── */
+
+    /**
+     * Due online payments, oldest window first. **The sweeper's only read.**
+     *
+     * Ids only, deliberately: the row is re-read under a `FOR UPDATE` lock inside each
+     * candidate's own transaction, so anything selected here is a HINT that may already be
+     * stale by the time it is processed. Returning whole rows would invite a caller to trust
+     * an unlocked read and decide from it.
+     *
+     * **Not store-scoped, and that is the one place in this codebase where that is correct.**
+     * The sweeper is a single leader-elected task serving every tenant; scoping it by store
+     * would mean either a task per store or a store loop, and neither exists. Tenancy is
+     * enforced on every WRITE instead, from the `store_id` on the locked row — never from
+     * anything a caller supplied. `ix_payment_expiry_due` is partial on exactly these three
+     * predicates.
+     *
+     * `now` is a parameter rather than `now()` in SQL so a test can seed a due payment and
+     * sweep at a chosen instant without touching the clock — the repository's established
+     * pattern, and the reason there are no fake timers anywhere in it.
+     */
+    async listExpiryDue(params: {
+      now: Date;
+      limit: number;
+    }): Promise<{ paymentId: string; storeId: string; orderId: string }[]> {
+      return executor(db)
+        .select({
+          paymentId: payment.id,
+          storeId: payment.storeId,
+          orderId: payment.orderId,
+        })
+        .from(payment)
+        .where(
+          and(
+            eq(payment.status, 'pending'),
+            eq(payment.method, 'online'),
+            isNotNull(payment.expiresAt),
+            lte(payment.expiresAt, params.now),
+          ),
+        )
+        .orderBy(payment.expiresAt)
+        .limit(params.limit);
+    },
+
+    /**
+     * Lock one payment by id, store-scoped. The second lock in the expiry lock order.
+     *
+     * `FOR UPDATE` because the decision that follows spans statements — read the status,
+     * insert an event, apply the transition, release reservations — and a webhook must not
+     * interleave with any of it. The webhook path takes this same row lock through
+     * `lockByProviderRef`, which is what makes expiry and capture serialise against each
+     * other rather than merely usually not colliding.
+     */
+    async lockById(params: {
+      paymentId: string;
+      storeId: string;
+    }): Promise<PaymentRecord | undefined> {
+      const [row] = await executor(db)
+        .select(PAYMENT_COLUMNS)
+        .from(payment)
+        .where(and(eq(payment.id, params.paymentId), eq(payment.storeId, params.storeId)))
+        .limit(1)
+        .for('update');
+      return row === undefined ? undefined : toPaymentRecord(row);
+    },
+
     async findStateByOrderId(params: {
       orderId: string;
       storeId: string;

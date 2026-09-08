@@ -123,3 +123,30 @@ export const codeColumn = (name: string, length = 64) => varchar(name, { length 
 
 /** A URL slug. Uniqueness is always scoped to the store, never global. */
 export const slugColumn = (name = 'slug') => varchar(name, { length: 255 });
+
+/* ── Tax identity shapes ─────────────────────────────────────────────────── */
+
+/**
+ * GSTIN shape: 15 characters — two digits, a ten-character PAN, an entity character, a
+ * literal `Z`, and a check character.
+ *
+ * **Shape only, and deliberately no checksum.** The layout is a documented format and
+ * Increment 38's approved decision 8 requires strict shape validation, so it is asserted. The
+ * check-digit ALGORITHM is a different thing: implementing it would be engineering inventing a
+ * validation rule, and a wrong implementation rejects a legitimate registration — a worse
+ * failure than accepting a well-shaped invalid one, which the tax authority rejects anyway.
+ *
+ * Lives HERE rather than in `tax.ts` because `store.ts` needs it too, and `tax.ts` already
+ * imports `store.ts` for its tenancy reference — putting it there would be an import cycle
+ * between two schema files, which `dependency-cruiser` rightly forbids.
+ */
+export const GSTIN_PATTERN = '^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$';
+
+/** PAN shape: five letters, four digits, one letter. Shape only, for the same reason. */
+export const PAN_PATTERN = '^[A-Z]{5}[0-9]{4}[A-Z]$';
+
+/** Exact length of a GSTIN, so a column width and the pattern above cannot drift apart. */
+export const GSTIN_LENGTH = 15;
+
+/** Exact length of a PAN, for the same reason. */
+export const PAN_LENGTH = 10;

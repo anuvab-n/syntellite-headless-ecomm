@@ -73,12 +73,26 @@ import {
   type InventoryService,
 } from './modules/inventory/index.js';
 import {
+  createFulfilmentRepository,
+  createFulfilmentRoutes,
+  createFulfilmentService,
+  type FulfilmentService,
+} from './modules/fulfilment/index.js';
+import {
   createPaymentsRepository,
   createPaymentsRoutes,
   createPaymentsService,
   createPaymentsWebhookRoutes,
+  createPaymentExpirySweeper,
+  type PaymentExpirySweeper,
   type PaymentsService,
 } from './modules/payments/index.js';
+import {
+  createTaxRepository,
+  createTaxRoutes,
+  createTaxService,
+  type TaxService,
+} from './modules/tax/index.js';
 import { createDefaultStoreResolver, createStoreRepository } from './modules/stores/index.js';
 import { createRazorpayGateway, createUnconfiguredGateway } from './razorpay/gateway.js';
 import type { HandlerRegistry } from './db/outbox/publisher.js';
@@ -247,6 +261,26 @@ export type AppContainer = {
    * going through HTTP.
    */
   payments: PaymentsService;
+  /**
+   * The payment expiry sweeper. One pass per call; the scheduler owns cadence and leadership.
+   *
+   * Exposed on the container because the SCHEDULER entry point needs it, and only that. It is
+   * safe to build in every role — constructing it starts nothing.
+   */
+  paymentExpirySweeper: PaymentExpirySweeper;
+  /**
+   * Manual fulfilment: raising a shipment, shipping it, recording delivery.
+   *
+   * The fourth state space. It never writes `order.status` and never writes a payment row.
+   */
+  fulfilment: FulfilmentService;
+  /**
+   * GST: tax classes, effective-dated rates, seller and customer tax identity, and the
+   * checkout determination.
+   *
+   * The one place a tax figure is computed. Every other module receives one already resolved.
+   */
+  tax: TaxService;
   /**
    * Authorization guards for privileged routes.
    *
@@ -663,6 +697,28 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
   });
 
   /**
+   * The tax module.
+   *
+   * Takes `audit` for the same reason promotions does, only more so: a rate change alters what
+   * every customer of the store pays, and the seller tax profile is the switch that decides
+   * whether GST is charged at all. It takes no `events` — nothing consumes a tax change, the
+   * handler registry is still empty, and §39's rule holds.
+   *
+   * Constructed BEFORE orders, because orders depends on it through the `CheckoutTax` port it
+   * declares. A direct reference rather than a late binding: tax depends on nothing here, so
+   * there is no cycle to defer.
+   *
+   * It takes the primary handle because `determineForCheckout` runs inside the checkout
+   * transaction and must see that transaction's snapshot.
+   */
+  const tax = createTaxService({
+    repository: createTaxRepository({ db: db.db }),
+    db: db.db,
+    audit,
+    logger,
+  });
+
+  /**
    * The cart module.
    *
    * No `events` and no `audit`, deliberately: nothing consumes a cart change, and a customer
@@ -758,6 +814,46 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     payments: {
       stateForOrder: (input) => payments.stateForOrder(input),
     },
+    /**
+     * Inventory, adapted to the reservation port orders declared.
+     *
+     * Not a late binding: `inventory` is constructed above and depends on nothing here, so
+     * these can be direct references. Only two operations are handed over — checkout holds
+     * stock and cancellation gives it back. Orders cannot read a stock level, cannot adjust
+     * one, and cannot commit a reservation: committing is caused by a payment succeeding, and
+     * that capability belongs to the payments wiring below.
+     */
+    reservations: {
+      reserve: (input) => inventory.reserveForOrder(input),
+      releaseForOrder: (input) => inventory.releaseForOrder(input),
+    },
+    /**
+     * Tax, adapted to the port orders declared.
+     *
+     * Not a late binding: `tax` is constructed above and depends on nothing here.
+     *
+     * **One operation, and it is the narrowest port in this file.** Orders cannot read a rate,
+     * list tax classes, classify a SKU, reach the seller's profile, or set a supply type — none
+     * of those exist on this object. It hands over line money it computed and a destination
+     * state it snapshotted, and receives a determination it writes verbatim. That asymmetry is
+     * the point: the only module that can produce a tax figure is the one that owns the rules.
+     */
+    tax: {
+      determineForCheckout: (input) => tax.determineForCheckout(input),
+    },
+    /**
+     * Whether a shipment blocks cancellation.
+     *
+     * A LATE binding, and it has to be: `fulfilment` is constructed below and needs `orders`
+     * through its own port, so the two are mutually dependent. The arrow defers the lookup to
+     * call time, which is the only shape that lets both stay ignorant of each other — the same
+     * pattern the `payments` binding above uses, and for the same reason.
+     *
+     * Orders asks one question and fulfilment answers it. Neither names the other.
+     */
+    fulfilment: {
+      hasBlockingShipment: (input) => fulfilment.hasBlockingShipment(input),
+    },
     db: db.db,
     audit,
     logger,
@@ -820,13 +916,28 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
             orderNumber: view.order.orderNumber,
             status: view.order.status,
             currency: view.order.currency,
-            total: view.order.total,
+            /*
+             * **`grandTotal`, not `total` — Increment 38.** The goods total is not what a
+             * customer pays once GST applies. The port names the field `payableTotal` so the
+             * two cannot be confused at either end, and `ck_order_grand_total_identity`
+             * guarantees they are equal for an order that carried no determination.
+             */
+            payableTotal: view.order.grandTotal,
           };
         } catch (err) {
           if (err instanceof NotFound) return null;
           throw err;
         }
       },
+      /**
+       * The ORDER row lock, for the expiry sweeper only.
+       *
+       * Store-scoped and not user-scoped, because the sweeper is the system acting on an order
+       * it reached through a payment row — and the store comes from that row, never from input.
+       * This is what lets payments take the order lock BEFORE the payment lock, which is the
+       * whole reason expiry serialises with cancellation.
+       */
+      lockForExpiry: (input) => orders.lockOrderForExpiry(input),
     },
     gateway: paymentGateway,
     /**
@@ -845,8 +956,87 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
           ...(input.body === undefined ? {} : { body: input.body as never }),
         }),
     },
+    /**
+     * Inventory, adapted to the settlement port payments declared.
+     *
+     * Payments gets exactly two verbs and no reserve capability: it can report that an order's
+     * payment reached a terminal state, and inventory decides what that means for the units.
+     * Both are keyed by order id, because a reservation is owned by the ORDER — it exists
+     * before any payment row does.
+     *
+     * There is deliberately no COD wiring anywhere. A COD payment is created `pending` and no
+     * code path in this codebase transitions it, so there is no terminal event to settle
+     * against and inventing one would be inventing COD semantics. See `payments.events.ts` and
+     * the reservation limitation recorded in `docs/DECISIONS.md`.
+     */
+    reservations: {
+      commitForOrder: (input) => inventory.commitForOrder(input),
+      releaseForOrder: (input) => inventory.releaseForOrder(input),
+    },
+    /**
+     * The online expiry window, from validated configuration.
+     *
+     * The VALUE, not the config object: the service should not know the shape of `Config`, the
+     * same reason the mailer receives `resetUrlBase` alone. Zod has already proven it a
+     * positive integer, so the service does no validation of its own.
+     */
+    expiryMinutes: config.paymentExpiryMinutes,
     db: db.db,
     audit,
+    logger,
+  });
+
+  /**
+   * The fulfilment module.
+   *
+   * Constructed after orders, payments and inventory because it needs all three through
+   * ports. There is deliberately no provider adapter and no provider port: fulfilment is
+   * manual, so `carrier` and `tracking_number` are text a staff member types. When a carrier
+   * integration is chosen it arrives as a port plus an adapter beside `razorpay/`, which is
+   * why nothing here is shaped to accommodate one in advance.
+   */
+  const fulfilment = createFulfilmentService({
+    repository: createFulfilmentRepository({ db: db.db }),
+    /**
+     * The ORDER lock, at the head of the global lock order.
+     *
+     * Store-scoped and NOT user-scoped: staff act on any order in their store, and there is
+     * no customer in the request to scope by. The store comes from the staff token.
+     */
+    orders: {
+      lockByNumber: (input) => orders.lockForFulfilmentByNumber(input),
+      lockById: (input) => orders.lockForFulfilmentById(input),
+    },
+    /**
+     * Payment state, for the fulfilment prerequisite. READ ONLY — the port has no write.
+     *
+     * This is what lets a COD order ship with its payment still `pending` without any
+     * payment write happening: fulfilment learns the method and the status, and decides.
+     */
+    payments: {
+      stateForOrder: (input) => payments.stateForOrder(input),
+    },
+    /**
+     * The physical inventory movement. One operation, and it is the irreversible one.
+     */
+    inventory: {
+      fulfilForOrder: (input) => inventory.fulfilForOrder(input),
+    },
+    db: db.db,
+    audit,
+    logger,
+  });
+
+  /**
+   * The payment expiry sweeper.
+   *
+   * Built in every role because construction is inert — it opens nothing, schedules nothing and
+   * starts no timer. Only the scheduler entry point calls `sweep()`, and only while it holds
+   * leadership.
+   */
+  const paymentExpirySweeper = createPaymentExpirySweeper({
+    payments,
+    batchSize: config.paymentExpirySweepBatchSize,
     logger,
   });
 
@@ -912,6 +1102,28 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       // For the ONE staff route in this module: the invoice for any order in the store. The
       // guard is built against identity's authorization loader, which orders must not import,
       // so it arrives pre-built exactly as the catalogue's and promotions' do.
+      requireStaff: scopeGuards.requireScope('staff'),
+      logger,
+    }),
+  );
+  apiRouter.use(
+    createFulfilmentRoutes({
+      fulfilment,
+      // The same capability every other domain router receives, adapted here for the same
+      // reason: fulfilment must not know which module mints tokens.
+      verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
+      // Five of its six routes are staff-only; the customer read uses `auth` alone.
+      requireStaff: scopeGuards.requireScope('staff'),
+      logger,
+    }),
+  );
+  apiRouter.use(
+    createTaxRoutes({
+      tax,
+      // The same capability every other domain router receives, adapted here for the same
+      // reason: tax must not know which module mints tokens.
+      verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
+      // Six of its nine routes are staff-only; the three customer routes use `auth` alone.
       requireStaff: scopeGuards.requireScope('staff'),
       logger,
     }),
@@ -1071,6 +1283,9 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     promotions,
     orders,
     payments,
+    paymentExpirySweeper,
+    fulfilment,
+    tax,
     scopeGuards,
     app,
     warmUp,

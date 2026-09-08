@@ -1,9 +1,19 @@
 import { sql } from 'drizzle-orm';
-import { check, foreignKey, index, integer, pgTable, uuid, varchar } from 'drizzle-orm/pg-core';
+import {
+  check,
+  foreignKey,
+  index,
+  integer,
+  pgTable,
+  primaryKey,
+  uuid,
+  varchar,
+} from 'drizzle-orm/pg-core';
 
 import { primaryId, storeIdColumn, timestamps, tsColumn } from './_shared.js';
 import { sku } from './catalogue.js';
 import { appUser } from './identity.js';
+import { MAX_ORDER_LINE_QUANTITY, order } from './orders.js';
 import { store } from './store.js';
 
 /**
@@ -42,7 +52,21 @@ import { store } from './store.js';
  * which is an accounting determination and not one to bury in a CHECK constraint. An operator
  * records intent in `note`; widening this list later is an ordinary `ALTER`.
  */
-export const STOCK_REASONS = ['manual_increase', 'manual_decrease', 'correction'] as const;
+export const STOCK_REASONS = [
+  'manual_increase',
+  'manual_decrease',
+  'correction',
+  /**
+   * Goods physically left the building. Written by fulfilment (Increment 37), one row per
+   * shipped SKU, always with a negative delta.
+   *
+   * The FIRST non-manual reason, and still a MECHANISM rather than an accounting treatment —
+   * which is why it belongs here while `damage`, `shrinkage` and `write_off` still do not. It
+   * is also the first reason a customer's order can cause, though the actor is always the staff
+   * member who shipped it: `actor_user_id` stays NOT NULL and no system actor was introduced.
+   */
+  'shipment',
+] as const;
 export type StockReason = (typeof STOCK_REASONS)[number];
 
 /**
@@ -272,7 +296,307 @@ export const stockLedger = pgTable(
      */
     check(
       'ck_stock_ledger_reason',
-      sql`${t.reason} in ('manual_increase', 'manual_decrease', 'correction')`,
+      sql`${t.reason} in ('manual_increase', 'manual_decrease', 'correction', 'shipment')`,
     ),
+  ],
+);
+
+/**
+ * Reservation lifecycle values.
+ *
+ * `held` is the only non-terminal state. Both settled states are terminal in this increment:
+ * `released` gave the units back, `committed` sold them. There is no `fulfilled` — the
+ * increment that ships goods adds it, along with the only `on_hand` movement in this design.
+ *
+ * A `varchar` + CHECK rather than a PostgreSQL enum, matching `product.status` and
+ * `stock_ledger.reason`: widening a CHECK is an ordinary `ALTER`, whereas adding an enum value
+ * is not reversible and cannot run in a transaction on older servers.
+ */
+export const RESERVATION_STATUSES = ['held', 'released', 'committed', 'fulfilled'] as const;
+export type ReservationStatus = (typeof RESERVATION_STATUSES)[number];
+
+/** The one non-terminal status. Named so every CAS predicate has a single source. */
+export const RESERVATION_HELD = 'held' satisfies ReservationStatus;
+
+/**
+ * Why a reservation stopped being held — a TECHNICAL vocabulary, like `STOCK_REASONS`.
+ *
+ * Each value names the CODE PATH that settled it, one-to-one, and nothing else. There is no
+ * `damage`, `shrinkage` or `write_off` here for the reason `STOCK_REASONS` omits them too:
+ * those are accounting classifications, and a CHECK constraint is the wrong place to decide
+ * how a loss is posted.
+ *
+ * `payment_expired` is defined but **unreachable**: nothing writes `payment.status = 'expired'`,
+ * because no expiry window has been approved and so no sweeper exists. It is here so that the
+ * increment given a window adds a caller rather than a vocabulary — the same reason `expired`
+ * already sits in `PAYMENT_STATUSES`.
+ */
+export const RESERVATION_SETTLED_REASONS = [
+  'order_cancelled',
+  'payment_succeeded',
+  'payment_failed',
+  'payment_expired',
+  /**
+   * The units shipped. Recorded on the `committed -> fulfilled` move (Increment 37).
+   *
+   * Note this reason names a settlement that is NOT the one `settled_reason` records — see
+   * `fulfilledAt` below. It is here because the column's CHECK requires a value for every
+   * non-held status, and because a reservation that reached `fulfilled` through some other
+   * path would be a bug worth naming.
+   */
+  'shipment_fulfilled',
+  /**
+   * A COD order was fulfilled while its payment was still `pending`.
+   *
+   * **The explicit mechanism the approved COD rule requires.** COD payments never terminalise,
+   * so a COD reservation would sit `held` forever and `held -> fulfilled` is deliberately
+   * illegal. Rather than inventing a payment transition — forbidden — fulfilment performs
+   * `held -> committed` with THIS reason and then `committed -> fulfilled`, both inside the
+   * shipping transaction.
+   *
+   * It is distinct from `payment_succeeded` on purpose: the money has NOT been received, and a
+   * reason that claimed otherwise would misreport an unpaid sale. Nothing about the payment
+   * row changes.
+   */
+  'cod_fulfilment',
+] as const;
+export type ReservationSettledReason = (typeof RESERVATION_SETTLED_REASONS)[number];
+
+/**
+ * Which order holds which units of which SKU. The owner record behind `stock_item.reserved`.
+ *
+ * ## Why this table exists at all
+ *
+ * `stock_item.reserved` is a counter, and a counter cannot answer the two questions this
+ * feature turns on: *whose* units are these, and *has this reservation already been settled?*
+ * Without an owner row, "release exactly once" is unenforceable — a second cancellation would
+ * decrement the counter again with nothing to refuse it. So the counter stays as the fast
+ * projection and each row here is the record justifying part of it, exactly as `stock_ledger`
+ * justifies `on_hand`.
+ *
+ * The relationship is a reconcilable invariant, asserted by a test:
+ *
+ *     SUM(quantity) WHERE status IN ('held', 'committed')  =  stock_item.reserved
+ *
+ * ## `committed` still counts toward `reserved`
+ *
+ * A committed reservation is a SALE AWAITING FULFILMENT. The units are still physically in the
+ * building, so `on_hand` must keep counting them; they are no longer sellable, so `reserved`
+ * must keep counting them too. `available = on_hand - reserved` therefore stays correct
+ * without a single change to its formula or its CHECK constraints.
+ *
+ * The consequence is deliberate and worth stating plainly: **nothing in this increment ever
+ * decreases `on_hand`.** As paid orders accumulate, `available` trends to zero while `on_hand`
+ * stays flat. That is not a leak — it is what "sold but not yet shipped" looks like. The
+ * fulfilment increment decrements both together and writes the `stock_ledger` row for it.
+ *
+ * ## Why `stock_ledger` is untouched
+ *
+ * That table is defined entirely around `on_hand`: `delta`, `on_hand_before`, `on_hand_after`,
+ * `CHECK (on_hand_before + delta = on_hand_after)` and `CHECK (delta <> 0)`. A reservation
+ * moves `reserved`, not `on_hand`, so it cannot be expressed there without either lying with
+ * `delta = 0` — which the CHECK refuses — or adding `reserved_before`/`reserved_after` plus a
+ * movement-kind discriminator, which changes what the ledger MEANS. And `SUM(delta) = on_hand`
+ * is an asserted invariant that would stop holding.
+ *
+ * Because commit does not move `on_hand`, none of that is needed: this table's own
+ * `held_at`/`settled_at`/`settled_reason` are the history, and `stock_ledger.actor_user_id`
+ * keeps its `NOT NULL` — a sweeper-driven release has no user, which is exactly the widening
+ * that column's comment anticipates and this increment does not need.
+ *
+ * ## Concurrency lives in the repository, not here
+ *
+ * The reserve statement is one conditional `UPDATE` on `stock_item` carrying `available >= :qty`;
+ * the CHECK constraints below are BACKSTOPS that turn a bug in that predicate into SQLSTATE
+ * 23514 rather than oversold stock. See `inventory.repository.ts` for the full argument,
+ * including why `SELECT ... FOR UPDATE` is deliberately not used.
+ */
+export const stockReservation = pgTable(
+  'stock_reservation',
+  {
+    /**
+     * The owner. Leading column of the primary key, so "settle this order's reservations" —
+     * the only hot read — is an index scan on the PK.
+     */
+    orderId: uuid('order_id').notNull(),
+
+    /**
+     * The reserved thing. Points at the SKU, **not** at `stock_item`, for the reason
+     * `stock_ledger` does: an immutable record must not depend on a mutable projection's
+     * lifecycle. It is also the row these units were taken from, which is why it is what the
+     * deterministic lock ordering sorts by.
+     */
+    skuId: uuid('sku_id').notNull(),
+
+    /** Tenancy, and half of both composite foreign keys below. */
+    storeId: storeIdColumn(() => store.id),
+
+    /**
+     * Units held. `integer`, matching `stock_item.on_hand` and `order_line.quantity` — whole
+     * units only. This is the amount given back on release and the amount reconciled against
+     * `stock_item.reserved`.
+     */
+    quantity: integer('quantity').notNull(),
+
+    /**
+     * The CAS target that makes release and commit exactly-once.
+     *
+     * Every settlement is `UPDATE ... WHERE status = 'held' RETURNING`, so a second attempt
+     * matches nothing and performs no counter change. Not a boolean: `released` and `committed`
+     * differ in whether `stock_item.reserved` moves, so two settled states are load-bearing
+     * rather than merely descriptive.
+     */
+    status: varchar('status', { length: 20 }).notNull().default(RESERVATION_HELD),
+
+    /**
+     * One of `RESERVATION_SETTLED_REASONS`, and NULL exactly while held.
+     *
+     * Without it, `released` cannot distinguish a cancellation from a payment failure from an
+     * expiry — three different code paths with one outcome. The audit log records the
+     * triggering action, but reading it is a join across time; this is the answer on the row.
+     */
+    settledReason: varchar('settled_reason', { length: 32 }),
+
+    /**
+     * When the units physically shipped. NULL until then. Increment 37.
+     *
+     * **A separate column rather than re-stamping `settled_at`**, because `committed -> fulfilled`
+     * is a second settled-to-settled move and overwriting would destroy the fact that matters
+     * most: WHEN THE SALE WAS COMMITTED. An auditor needs both instants — the moment the units
+     * stopped being sellable, and the moment they left the building — and a single timestamp
+     * can only hold one.
+     *
+     * `settled_at`/`settled_reason` therefore keep their existing meaning: when and why the
+     * reservation left `held`. This records the later, physical event.
+     */
+    fulfilledAt: tsColumn('fulfilled_at'),
+
+    /** When the units were taken. */
+    heldAt: tsColumn('held_at').notNull().defaultNow(),
+
+    /**
+     * When they stopped being held, and NULL exactly while held — the CHECKs below enforce
+     * that pairing in both directions.
+     *
+     * There is deliberately no `updated_at`: this row is written once and settled at most once,
+     * so `updated_at` would be a second, redundant answer to the question `settled_at` already
+     * answers. A settlement also never re-stamps it, because the CAS refuses a second
+     * settlement — the same history-preserving property soft delete relies on.
+     */
+    settledAt: tsColumn('settled_at'),
+  },
+  (t) => [
+    /**
+     * **One reservation per order per SKU, structurally.**
+     *
+     * No surrogate `id`, following `order_line` and `stock_item`, which both key on their
+     * natural composite. It is also a free idempotency backstop: a code path that somehow
+     * reserved twice for one order hits a primary-key violation rather than silently
+     * double-counting units.
+     */
+    primaryKey({ columns: [t.orderId, t.skuId], name: 'pk_stock_reservation' }),
+
+    /**
+     * Tenancy AND parentage in one constraint: the order must exist and its store must be this
+     * store. A cross-store reservation is unrepresentable, not merely rejected in code.
+     *
+     * The target index `uq_order_id_store` already exists — `order_line` uses this exact key —
+     * so this adds no index to `order`.
+     *
+     * `RESTRICT`, not `CASCADE`: an order is never hard-deleted, so a delete that still has
+     * reservations attached is a bug and must fail loudly rather than quietly discarding the
+     * record of stock that was taken.
+     */
+    foreignKey({
+      columns: [t.orderId, t.storeId],
+      foreignColumns: [order.id, order.storeId],
+      name: 'fk_stock_reservation_order_store',
+    }).onDelete('restrict'),
+
+    /**
+     * The same shape against the SKU. Target index `uq_sku_id_store` already exists —
+     * `stock_item` uses it. `RESTRICT` matches every other reference to `sku`: SKUs are
+     * soft-deleted, so a hard delete with live reservations must fail.
+     */
+    foreignKey({
+      columns: [t.skuId, t.storeId],
+      foreignColumns: [sku.id, sku.storeId],
+      name: 'fk_stock_reservation_sku_store',
+    }).onDelete('restrict'),
+
+    /**
+     * Mirrors `ck_order_line_quantity` exactly, ceiling included, so a reservation can never
+     * describe a quantity the order line it came from could not hold.
+     */
+    check(
+      'ck_stock_reservation_quantity',
+      sql`${t.quantity} >= 1 AND ${t.quantity} <= ${sql.raw(String(MAX_ORDER_LINE_QUANTITY))}`,
+    ),
+
+    check(
+      'ck_stock_reservation_status',
+      sql`${t.status} in ('held', 'released', 'committed', 'fulfilled')`,
+    ),
+
+    /**
+     * Held and settled are mutually exclusive, enforced BOTH ways: a held row cannot carry a
+     * settlement timestamp, and a settled row cannot lack one.
+     *
+     * Two separate constraints rather than one conjunction, so a violation names precisely
+     * which half broke. A test asserting a database refusal is required to assert the
+     * constraint NAME, and a combined constraint would make two different bugs
+     * indistinguishable.
+     */
+    check(
+      'ck_stock_reservation_settled_at',
+      sql`(${t.status} = 'held') = (${t.settledAt} is null)`,
+    ),
+
+    check(
+      'ck_stock_reservation_settled_reason',
+      sql`(${t.status} = 'held') = (${t.settledReason} is null)`,
+    ),
+
+    check(
+      'ck_stock_reservation_reason_values',
+      sql`${t.settledReason} is null OR ${t.settledReason} in ('order_cancelled', 'payment_succeeded', 'payment_failed', 'payment_expired', 'shipment_fulfilled', 'cod_fulfilment')`,
+    ),
+
+    /**
+     * `fulfilled_at` is present exactly when the status is `fulfilled`, both directions.
+     *
+     * Same shape as the settled pairing above, and for the same reason: a `fulfilled` row with
+     * no timestamp, or a `committed` row carrying one, are two different bugs and each should
+     * name itself.
+     */
+    check(
+      'ck_stock_reservation_fulfilled_at',
+      sql`(${t.status} = 'fulfilled') = (${t.fulfilledAt} is not null)`,
+    ),
+
+    /** Goods cannot ship before the sale they belong to was settled. */
+    check(
+      'ck_stock_reservation_fulfilled_after_settled',
+      sql`${t.fulfilledAt} is null OR (${t.settledAt} is not null AND ${t.fulfilledAt} >= ${t.settledAt})`,
+    ),
+
+    /** Time only moves forward. A settlement before its hold is an incoherent row. */
+    check(
+      'ck_stock_reservation_settled_after_held',
+      sql`${t.settledAt} is null OR ${t.settledAt} >= ${t.heldAt}`,
+    ),
+
+    /**
+     * The reconciliation read: outstanding units per SKU, for
+     * `SUM(quantity) = stock_item.reserved`.
+     *
+     * Partial, because released rows are history and never participate in that sum — so they
+     * do not belong in the index that answers it. This is the invariant the whole table exists
+     * to keep, and the analogue of `SUM(delta) = on_hand` on the ledger; without the index it
+     * is a full scan. Leads with `store_id` because every predicate in this codebase carries it.
+     */
+    index('ix_stock_reservation_sku_outstanding')
+      .on(t.storeId, t.skuId)
+      .where(sql`${t.status} in ('held', 'committed')`),
   ],
 );

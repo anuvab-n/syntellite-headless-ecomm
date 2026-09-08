@@ -190,6 +190,38 @@ const ConfigSchema = z
     outboxPollIntervalMs: z.coerce.number().int().positive().default(1_000),
     outboxBatchSize: z.coerce.number().int().positive().max(1_000).default(100),
 
+    /* ── Payment expiry (Increment 36) ─────────────────────────────────── */
+
+    /**
+     * How long an ONLINE payment stays payable, in minutes. Approved at 30.
+     *
+     * Stamped onto `payment.expires_at` at initiation and never recomputed, so changing this
+     * affects only payments started afterwards — a payment in flight keeps the window the
+     * customer was given. Positive integer only: a zero or negative window would expire a
+     * payment the instant it was created.
+     *
+     * COD is out of scope by decision — `expires_at` stays NULL there.
+     */
+    paymentExpiryMinutes: z.coerce.number().int().positive().default(30),
+
+    /**
+     * How often the leader-elected sweeper looks for due payments. Approved at 60_000 ms.
+     *
+     * This bounds how long stock stays held past its window: worst case is the window plus one
+     * cadence. It is not the window itself, and making it shorter does not expire anything
+     * sooner than `expires_at` allows.
+     */
+    paymentExpirySweepIntervalMs: z.coerce.number().int().positive().default(60_000),
+
+    /**
+     * How many due payments one sweep pass may claim.
+     *
+     * Bounded because each candidate takes an `order` and a `payment` row lock, and an
+     * unbounded batch on a backlog would contend with live checkouts for as long as it ran.
+     * A backlog larger than this is simply drained over several passes.
+     */
+    paymentExpirySweepBatchSize: z.coerce.number().int().positive().max(1_000).default(100),
+
     /* ── Observability ─────────────────────────────────────────────────── */
     logLevel: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
     logFormat: z.enum(['json', 'pretty']).default('json'),
@@ -284,6 +316,9 @@ function readEnvironment(env: NodeJS.ProcessEnv): Record<string, unknown> {
     reservationTtlMinutes: env['RESERVATION_TTL_MINUTES'],
     outboxPollIntervalMs: env['OUTBOX_POLL_INTERVAL_MS'],
     outboxBatchSize: env['OUTBOX_BATCH_SIZE'],
+    paymentExpiryMinutes: env['PAYMENT_EXPIRY_MINUTES'],
+    paymentExpirySweepIntervalMs: env['PAYMENT_EXPIRY_SWEEP_INTERVAL_MS'],
+    paymentExpirySweepBatchSize: env['PAYMENT_EXPIRY_SWEEP_BATCH_SIZE'],
 
     logLevel: env['LOG_LEVEL'],
     logFormat: env['LOG_FORMAT'],

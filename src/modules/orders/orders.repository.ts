@@ -49,6 +49,34 @@ export type OrderRecord = {
   readonly subtotal: string;
   readonly discountTotal: string;
   readonly total: string;
+
+  /**
+   * GST — Increment 38. `grand_total` is the PAYABLE amount and is what payments charge;
+   * `total` still means the goods total, permanently.
+   *
+   * The determination snapshot is nullable as a GROUP: NULL across it means no tax
+   * determination was made for this order, which is different from one that produced zero.
+   * `ck_order_tax_snapshot` makes a half-populated group unrepresentable, so a caller that
+   * finds `taxAt` non-null may rely on every other field being present too.
+   */
+  readonly taxTotal: string;
+  readonly grandTotal: string;
+  readonly taxAt: Date | null;
+  readonly supplyType: string | null;
+  readonly placeOfSupplyState: string | null;
+  readonly placeOfSupplyBasis: string | null;
+  readonly sellerGstin: string | null;
+  readonly sellerLegalName: string | null;
+  readonly originLine1: string | null;
+  readonly originLine2: string | null;
+  readonly originCity: string | null;
+  readonly originState: string | null;
+  readonly originPostalCode: string | null;
+  readonly originCountryCode: string | null;
+  readonly customerTaxCategory: string | null;
+  readonly customerGstin: string | null;
+  readonly customerLegalName: string | null;
+
   readonly promotionCode: string | null;
   readonly promotionName: string | null;
   readonly shipRecipientName: string;
@@ -72,6 +100,27 @@ export type OrderLineRecord = {
   readonly unitPrice: string;
   readonly lineTotal: string;
   readonly discountAmount: string;
+
+  /**
+   * GST — Increment 38. `taxableValue` is `lineTotal - discountAmount`, materialised.
+   *
+   * Rates and amounts are NOT NULL and zero when no tax applied; the classification snapshot
+   * is null when the line was never assessed. Whether the ORDER was assessed at all is
+   * answered by the header's `taxAt`, which is where that distinction belongs.
+   */
+  readonly taxableValue: string;
+  readonly hsnCode: string | null;
+  readonly taxClassCode: string | null;
+  readonly taxClassName: string | null;
+  readonly cgstRate: string;
+  readonly cgstAmount: string;
+  readonly sgstRate: string;
+  readonly sgstAmount: string;
+  readonly igstRate: string;
+  readonly igstAmount: string;
+  readonly cessRate: string;
+  readonly cessAmount: string;
+  readonly taxTotal: string;
 };
 
 /** The delivery fields checkout copies onto the order. */
@@ -103,6 +152,23 @@ const ORDER_COLUMNS = {
   subtotal: order.subtotal,
   discountTotal: order.discountTotal,
   total: order.total,
+  taxTotal: order.taxTotal,
+  grandTotal: order.grandTotal,
+  taxAt: order.taxAt,
+  supplyType: order.supplyType,
+  placeOfSupplyState: order.placeOfSupplyState,
+  placeOfSupplyBasis: order.placeOfSupplyBasis,
+  sellerGstin: order.sellerGstin,
+  sellerLegalName: order.sellerLegalName,
+  originLine1: order.originLine1,
+  originLine2: order.originLine2,
+  originCity: order.originCity,
+  originState: order.originState,
+  originPostalCode: order.originPostalCode,
+  originCountryCode: order.originCountryCode,
+  customerTaxCategory: order.customerTaxCategory,
+  customerGstin: order.customerGstin,
+  customerLegalName: order.customerLegalName,
   promotionCode: order.promotionCode,
   promotionName: order.promotionName,
   shipRecipientName: order.shipRecipientName,
@@ -184,6 +250,23 @@ export function createOrdersRepository(deps: { db: Database }) {
       subtotal: string;
       discountTotal: string;
       total: string;
+      taxTotal: string;
+      grandTotal: string;
+      taxAt: Date | null;
+      supplyType: string | null;
+      placeOfSupplyState: string | null;
+      placeOfSupplyBasis: string | null;
+      sellerGstin: string | null;
+      sellerLegalName: string | null;
+      originLine1: string | null;
+      originLine2: string | null;
+      originCity: string | null;
+      originState: string | null;
+      originPostalCode: string | null;
+      originCountryCode: string | null;
+      customerTaxCategory: string | null;
+      customerGstin: string | null;
+      customerLegalName: string | null;
       promotionId: string | null;
       promotionCode: string | null;
       promotionName: string | null;
@@ -220,6 +303,19 @@ export function createOrdersRepository(deps: { db: Database }) {
         unitPrice: string;
         lineTotal: string;
         discountAmount: string;
+        taxableValue: string;
+        hsnCode: string | null;
+        taxClassCode: string | null;
+        taxClassName: string | null;
+        cgstRate: string;
+        cgstAmount: string;
+        sgstRate: string;
+        sgstAmount: string;
+        igstRate: string;
+        igstAmount: string;
+        cessRate: string;
+        cessAmount: string;
+        taxTotal: string;
       }[],
     ): Promise<void> {
       if (values.length === 0) {
@@ -354,6 +450,67 @@ export function createOrdersRepository(deps: { db: Database }) {
       return row;
     },
 
+    /**
+     * Lock one order by NUMBER, store-scoped and NOT user-scoped. For staff fulfilment.
+     *
+     * Staff act on any order in their store and there is no customer in the request to scope
+     * by, so `user_id` is deliberately absent — but `store_id` is mandatory and comes from the
+     * staff member's verified token, never from input.
+     *
+     * Finds AND locks in one statement, so a caller cannot read first and lock later — the
+     * read-then-decide shape this codebase refuses. Returns only the three fields fulfilment
+     * needs; handing over the whole row would let another module reason about money.
+     */
+    async lockOrderByNumberForStore(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<{ id: string; orderNumber: string; status: string } | undefined> {
+      const [row] = await executor(db)
+        .select({ id: order.id, orderNumber: order.orderNumber, status: order.status })
+        .from(order)
+        .where(and(eq(order.orderNumber, params.orderNumber), eq(order.storeId, params.storeId)))
+        .limit(1)
+        .for('update');
+      return row;
+    },
+
+    /** The same lock, by id. The ship and deliver paths reach the order through a shipment. */
+    async lockOrderByIdForStore(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<{ id: string; orderNumber: string; status: string } | undefined> {
+      const [row] = await executor(db)
+        .select({ id: order.id, orderNumber: order.orderNumber, status: order.status })
+        .from(order)
+        .where(and(eq(order.id, params.orderId), eq(order.storeId, params.storeId)))
+        .limit(1)
+        .for('update');
+      return row;
+    },
+    /**
+     * Lock one order by id, store-scoped and NOT user-scoped. For the expiry sweeper.
+     *
+     * The customer-facing `lockOwnedOrderByNumber` above carries `user_id` because a customer
+     * may only lock their own order. The sweeper is the system acting on an order it reached
+     * through a payment row, so there is no authenticated user to scope by — but `store_id` is
+     * still mandatory, and it comes from the payment row rather than from any caller input.
+     *
+     * Returns the id only. The sweeper needs the LOCK, not the order: it makes no decision from
+     * the order's contents, and returning the row would invite one.
+     */
+    async lockOrderById(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<{ id: string } | undefined> {
+      const [row] = await executor(db)
+        .select({ id: order.id })
+        .from(order)
+        .where(and(eq(order.id, params.orderId), eq(order.storeId, params.storeId)))
+        .limit(1)
+        .for('update');
+      return row;
+    },
+
     /** The lines of one order, in the sequence they were written. */
     async listOrderLines(params: { orderId: string; storeId: string }): Promise<OrderLineRecord[]> {
       return executor(db)
@@ -365,6 +522,19 @@ export function createOrdersRepository(deps: { db: Database }) {
           unitPrice: orderLine.unitPrice,
           lineTotal: orderLine.lineTotal,
           discountAmount: orderLine.discountAmount,
+          taxableValue: orderLine.taxableValue,
+          hsnCode: orderLine.hsnCode,
+          taxClassCode: orderLine.taxClassCode,
+          taxClassName: orderLine.taxClassName,
+          cgstRate: orderLine.cgstRate,
+          cgstAmount: orderLine.cgstAmount,
+          sgstRate: orderLine.sgstRate,
+          sgstAmount: orderLine.sgstAmount,
+          igstRate: orderLine.igstRate,
+          igstAmount: orderLine.igstAmount,
+          cessRate: orderLine.cessRate,
+          cessAmount: orderLine.cessAmount,
+          taxTotal: orderLine.taxTotal,
         })
         .from(orderLine)
         .where(and(eq(orderLine.orderId, params.orderId), eq(orderLine.storeId, params.storeId)))
@@ -423,6 +593,19 @@ export function createOrdersRepository(deps: { db: Database }) {
           unitPrice: orderLine.unitPrice,
           lineTotal: orderLine.lineTotal,
           discountAmount: orderLine.discountAmount,
+          taxableValue: orderLine.taxableValue,
+          hsnCode: orderLine.hsnCode,
+          taxClassCode: orderLine.taxClassCode,
+          taxClassName: orderLine.taxClassName,
+          cgstRate: orderLine.cgstRate,
+          cgstAmount: orderLine.cgstAmount,
+          sgstRate: orderLine.sgstRate,
+          sgstAmount: orderLine.sgstAmount,
+          igstRate: orderLine.igstRate,
+          igstAmount: orderLine.igstAmount,
+          cessRate: orderLine.cessRate,
+          cessAmount: orderLine.cessAmount,
+          taxTotal: orderLine.taxTotal,
         })
         .from(orderLine)
         .where(

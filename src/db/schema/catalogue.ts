@@ -24,6 +24,7 @@ import {
   tsColumn,
 } from './_shared.js';
 import { store } from './store.js';
+import { taxClass } from './tax.js';
 
 /**
  * The catalogue: products and the SKUs that are actually sold.
@@ -239,6 +240,41 @@ export const sku = pgTable(
      */
     optionSignature: text('option_signature').notNull().default(''),
 
+    /**
+     * **The tax classification. SKU is the classification unit — approved decision 4.**
+     *
+     * §41 deferred this column and recorded the placement it would take: *"`sku.tax_class_id`
+     * nullable, falling back to `product.tax_class_id`"*, with no column added because *"a
+     * `tax_class_id` needs a `tax_class` table to reference"*. Increment 38 built that table,
+     * so the column arrives — but **without the product fallback**, and that is a deliberate
+     * departure from the recorded placement.
+     *
+     * Approved decision 5 settles the question §41 and §42 each raised once and left open:
+     * *"Different SKUs belonging to the same product MAY have different HSN/SAC and tax
+     * classifications."* Once that is true, a product-level fallback is not a convenience but
+     * an ambiguity — a SKU with no class would silently inherit a classification that may be
+     * wrong for it, and a wrong classification is under- or over-charged tax on every sale.
+     * There is exactly one place a SKU's classification can come from, and it is this column.
+     *
+     * Nullable, because classification is master data a merchant supplies and cannot be
+     * invented. An unclassified SKU is not untaxed: once the store has a GST profile,
+     * checkout REFUSES it rather than assessing it at zero. See `tax.service.ts`.
+     */
+    taxClassId: uuid('tax_class_id'),
+
+    /**
+     * The HSN or SAC code, at the same level and for the same reason.
+     *
+     * A string a merchant types, validated for length and non-blankness only. There is no
+     * catalogue, no digit-count rule and no goods-versus-services inference: which code
+     * applies is a classification the finance function makes, and the digit count required
+     * depends on a turnover threshold this project was told not to invent.
+     *
+     * Paired with `tax_class_id` by `ck_sku_tax_classification` below, because a rate with no
+     * HSN and an HSN with no rate are each half a classification.
+     */
+    hsnCode: varchar('hsn_code', { length: 16 }),
+
     ...timestamps,
     ...softDelete,
   },
@@ -273,6 +309,41 @@ export const sku = pgTable(
      * cart total and then an invoice, where it becomes a credit nobody authorised.
      */
     check('ck_sku_price_non_negative', sql`${t.price} >= 0`),
+
+    /**
+     * Tenancy AND parenthood in one constraint: the SKU's tax class must exist, and its store
+     * must be that class's store. A SKU classified against another tenant's tax class — and
+     * therefore taxed at another merchant's configured rate — is unrepresentable rather than
+     * merely refused in application code.
+     *
+     * RESTRICT, matching every other reference in this schema: a class a SKU still points at
+     * cannot be hard-deleted. There is no delete path for a tax class anyway; they are
+     * deactivated.
+     */
+    foreignKey({
+      columns: [t.taxClassId, t.storeId],
+      foreignColumns: [taxClass.id, taxClass.storeId],
+      name: 'fk_sku_tax_class_store',
+    }).onDelete('restrict'),
+
+    /**
+     * The classification is all-or-nothing: both fields, or neither.
+     *
+     * A tax class with no HSN cannot produce a compliant invoice line, and an HSN with no tax
+     * class has no rate to apply — so each alone is a SKU that looks classified and is not.
+     * Same shape as `ck_order_promotion_snapshot`, and for the same reason.
+     */
+    check(
+      'ck_sku_tax_classification',
+      sql`(${t.taxClassId} IS NULL AND ${t.hsnCode} IS NULL)
+          OR (${t.taxClassId} IS NOT NULL AND ${t.hsnCode} IS NOT NULL)`,
+    ),
+
+    /** `NOT NULL` alone would admit `''`, which is an HSN nobody can look up. */
+    check(
+      'ck_sku_hsn_code_not_blank',
+      sql`${t.hsnCode} IS NULL OR length(btrim(${t.hsnCode})) > 0`,
+    ),
 
     /**
      * **The concurrency arbiter for duplicate variant combinations.**

@@ -55,7 +55,17 @@ export type PayableOrder = {
   readonly orderNumber: string;
   readonly status: string;
   readonly currency: string;
-  readonly total: string;
+  /**
+   * **What to charge: the order's `grand_total`, tax included.**
+   *
+   * Increment 38 repointed this from `order.total`. The names differ deliberately —
+   * `order.total` still means the GOODS total and must never be charged once GST applies,
+   * while this field means "the payable amount" and is the only thing this module should ever
+   * know about an order's money. For an order with no tax determination the two are equal, by
+   * `ck_order_grand_total_identity`, which is why the change is invisible to every order
+   * placed before that increment.
+   */
+  readonly payableTotal: string;
 };
 
 /**
@@ -72,6 +82,25 @@ export type PaymentOrders = {
     userId: string;
     storeId: string;
   }): Promise<PayableOrder | null>;
+
+  /**
+   * Take the ORDER's row lock, by id, for expiry. **The first lock in the expiry lock order.**
+   *
+   * Not a customer operation and deliberately not user-scoped: the sweeper acts as the system
+   * on an order it found through a payment row, so there is no authenticated user to scope by.
+   * Store scoping is still mandatory and the implementation carries it.
+   *
+   * `order → payment` is the global lock order this increment establishes, and taking the order
+   * lock first is the ENTIRE reason expiry serialises with cancellation: cancellation already
+   * locks the order first and reads payment status without a lock, so without this an expiring
+   * payment and a cancelling customer would not serialise at all. The webhook takes only the
+   * payment lock and never the order, so no cycle is possible.
+   *
+   * `false` means the order vanished between the candidate read and the lock — impossible
+   * today, since orders are never deleted, but the sweeper treats it as "skip" rather than
+   * asserting, because a sweeper that crashes on surprising data stops sweeping.
+   */
+  lockForExpiry(params: { orderId: string; storeId: string }): Promise<boolean>;
 };
 
 /**
@@ -120,6 +149,34 @@ export type PaymentIdempotency = {
     endpoint: string;
     status: number;
     body?: unknown;
+  }): Promise<void>;
+};
+
+/**
+ * **Inventory settlement, as payments needs it — declared HERE, implemented by inventory.**
+ *
+ * Two operations, and deliberately nothing else. This module cannot reserve, cannot read a
+ * stock level, and cannot name a SKU: it only reports that an order's payment reached a
+ * terminal state, and inventory decides what that means for the units.
+ *
+ * **The reservation belongs to the ORDER, not to the payment.** It is created at checkout,
+ * before any payment row exists, and an order with no payment still holds stock. So both
+ * operations are keyed by `orderId`, and payment state changes are TRIGGERS rather than owners.
+ * That is why nothing here takes a payment id.
+ *
+ * Both must be called inside this service's transaction, so the settlement commits with the
+ * payment transition that caused it. Inventory asserts that itself.
+ *
+ * `reason` excludes `order_cancelled`: this module never cancels an order. `payment_expired` is
+ * now reachable — Increment 36 gave it a caller in `expirePayment` — so both members of the
+ * union are live.
+ */
+export type PaymentReservations = {
+  commitForOrder(input: { orderId: string; storeId: string }): Promise<void>;
+  releaseForOrder(input: {
+    orderId: string;
+    storeId: string;
+    reason: 'payment_failed' | 'payment_expired';
   }): Promise<void>;
 };
 
@@ -190,11 +247,30 @@ export function createPaymentsService(deps: {
   orders: PaymentOrders;
   gateway: PaymentGateway;
   idempotency: PaymentIdempotency;
+  reservations: PaymentReservations;
+  /**
+   * How long an online payment stays payable, from validated configuration.
+   *
+   * Passed in rather than read from `Config` here, so the service depends on the VALUE and not
+   * on the shape of the config object — the same reason the mailer receives `resetUrlBase`
+   * rather than the whole config. Zod has already proven it a positive integer.
+   */
+  expiryMinutes: number;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
 }) {
-  const { repository, orders, gateway, idempotency, db, audit, logger } = deps;
+  const {
+    repository,
+    orders,
+    gateway,
+    idempotency,
+    reservations,
+    expiryMinutes,
+    db,
+    audit,
+    logger,
+  } = deps;
 
   /**
    * The currency, as `money.ts` understands it.
@@ -258,7 +334,12 @@ export function createPaymentsService(deps: {
       }
 
       const currency = requireCurrency(order.currency);
-      const amount = fromDb(order.total, currency);
+      /*
+       * `payableTotal` is the order's `grand_total`. Read through `fromDb` and carried as a
+       * `Money`, so the comparison below and the minor-unit conversion are both exact — there
+       * is no `Number()` anywhere on this path.
+       */
+      const amount = fromDb(order.payableTotal, currency);
       const amountMinor = toMinorUnits(amount);
       if (amountMinor <= 0) throw new OrderNotPayable('its total is zero');
 
@@ -282,6 +363,26 @@ export function createPaymentsService(deps: {
             })
           : null;
 
+      /**
+       * **The expiry window, stamped once, from configuration.**
+       *
+       * `initiatedAt` is captured ONCE here and used for nothing else, so the window is exactly
+       * `expiryMinutes` from a single instant rather than from whenever a later line happened to
+       * call `new Date()`. That also makes it the one seam a test needs.
+       *
+       * `null` for COD, unconditionally — decision C put COD out of expiry's scope, and
+       * `ck_payment_expires_at_only_online` refuses the row if this ever disagrees.
+       *
+       * **The client cannot influence this.** `InitiatePaymentRequestSchema` is a
+       * `strictObject` whose only field is `method`, so an `expiresAt` in the body is a 400
+       * naming the field, and nothing on this path reads one.
+       */
+      const initiatedAt = new Date();
+      const expiresAt =
+        params.method === 'online'
+          ? new Date(initiatedAt.getTime() + expiryMinutes * 60_000)
+          : null;
+
       try {
         return await withTransaction(db, logger, async () => {
           const created = await repository.createPayment({
@@ -296,6 +397,7 @@ export function createPaymentsService(deps: {
             amountMinor,
             actorUserId: params.userId,
             eventType: PAYMENT_AUDIT.initiated,
+            expiresAt,
           });
 
           await audit.record({
@@ -434,6 +536,177 @@ export function createPaymentsService(deps: {
     }> {
       const page = await repository.listForUser(params);
       return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
+     * **Expire one abandoned online payment, and give its stock back. Increment 36.**
+     *
+     * ONE transaction, and the lock order is the whole design:
+     *
+     *     order -> payment -> stock_reservation -> stock_item
+     *
+     * The order lock comes FIRST, and that is not defensive habit. Cancellation already locks
+     * the order and then reads payment status WITHOUT a lock, so if expiry took only the
+     * payment lock the two would not serialise at all: a customer could be refused a
+     * cancellation on a `pending` read while this transaction was turning that same payment
+     * `expired`. Taking the order lock first makes them queue. The webhook takes only the
+     * payment lock and never the order, so no wait cycle can form and no deadlock is possible.
+     *
+     * ## Atomicity is the point
+     *
+     * The transition, the history row, the reservation release and the audit entry commit
+     * together or not at all. If the release throws — `InvariantViolation` when the projection
+     * has diverged from `stock_reservation` — the whole transaction rolls back: the payment
+     * stays `pending`, no `payment_event` survives, no audit entry survives, the reservation
+     * stays `held`, and the next sweep tries again. **A failed release can never leave a
+     * payment marked expired.** That is why the release is inside this transaction and why
+     * nothing here catches and continues.
+     *
+     * ## What cannot happen
+     *
+     * A terminal payment is never expired: the status is re-read under the lock, `isTerminal`
+     * returns early, `canTransition` is consulted, and `applyTransition` is a CAS on
+     * `from_status` — four independent refusals. Two concurrent sweepers cannot both release:
+     * the row lock serialises them and the CAS admits one. And a webhook cannot resurrect an
+     * expired payment, because `expired` has no outgoing transitions.
+     *
+     * ## Local expiry is authoritative, and that has a price
+     *
+     * Nothing is read back from the provider. A payment expired here can still be captured at
+     * Razorpay, in which case the late webhook is ignored as already-terminal and the money is
+     * taken with no local record of success. That exposure is ACCEPTED by decision, not solved
+     * — there is deliberately no reconciliation, no read-back and no reversal in this
+     * increment. See docs/DECISIONS.md.
+     *
+     * Returns an outcome rather than throwing on the uninteresting cases, so the sweeper can
+     * count what happened without treating a lost race as a failure.
+     */
+    async expirePayment(params: {
+      paymentId: string;
+      storeId: string;
+      orderId: string;
+    }): Promise<
+      | { readonly outcome: 'expired' }
+      | { readonly outcome: 'skipped'; readonly reason: 'order_gone' | 'not_found' }
+      | { readonly outcome: 'ignored'; readonly reason: 'already_terminal' | 'illegal_transition' }
+    > {
+      return withTransaction(db, logger, async () => {
+        /* 1. The ORDER lock, first. See the lock-order note above. */
+        const orderLocked = await orders.lockForExpiry({
+          orderId: params.orderId,
+          storeId: params.storeId,
+        });
+        if (!orderLocked) {
+          logger.warn(
+            { paymentId: params.paymentId, orderId: params.orderId },
+            'payment_expiry_skipped_order_missing',
+          );
+          return { outcome: 'skipped', reason: 'order_gone' } as const;
+        }
+
+        /* 2 + 3. The payment lock, then its state re-read from the locked row. */
+        const locked = await repository.lockById({
+          paymentId: params.paymentId,
+          storeId: params.storeId,
+        });
+        if (!locked) {
+          return { outcome: 'skipped', reason: 'not_found' } as const;
+        }
+
+        /*
+         * 4. Already terminal — a webhook or another sweeper won the race between the candidate
+         * read and this lock. No writes at all, and not an error: this is the expected outcome
+         * of a race, and the sweeper counts it rather than logging it as a failure.
+         */
+        if (isTerminal(locked.status)) {
+          logger.info(
+            { paymentId: locked.id, status: locked.status },
+            'payment_expiry_ignored_terminal_state',
+          );
+          return { outcome: 'ignored', reason: 'already_terminal' } as const;
+        }
+
+        /* 5. The transition table is the authority on what may follow `pending`. */
+        if (!canTransition(locked.status, 'expired')) {
+          logger.warn(
+            { paymentId: locked.id, from: locked.status },
+            'payment_expiry_transition_rejected',
+          );
+          return { outcome: 'ignored', reason: 'illegal_transition' } as const;
+        }
+
+        const at = new Date();
+
+        /*
+         * 6. The history row first, exactly as the webhook path does. `provider_event_id` is
+         * NULL because no provider event caused this — expiry is a local decision, and a
+         * fabricated id would pollute the uniqueness guard that makes redelivery safe.
+         */
+        await repository.insertEvent({
+          paymentId: locked.id,
+          storeId: locked.storeId,
+          fromStatus: locked.status,
+          toStatus: 'expired',
+          actorType: 'system',
+          actorUserId: null,
+          providerEventId: null,
+          eventType: PAYMENT_AUDIT.expired,
+        });
+
+        /* 7. The same CAS the webhook uses. Zero rows means someone else moved it first. */
+        const applied = await repository.applyTransition({
+          paymentId: locked.id,
+          storeId: locked.storeId,
+          fromStatus: locked.status,
+          toStatus: 'expired',
+          /* `ck_payment_failure_code_only_when_failed` — an expiry is not a failure. */
+          failureCode: null,
+          at,
+        });
+        if (!applied) throw new Conflict('payment changed while being expired');
+
+        /*
+         * 8. Give the stock back. Inside the transaction, after the CAS, and deliberately not
+         * wrapped in a try: if this throws, everything above it rolls back with it.
+         */
+        await reservations.releaseForOrder({
+          orderId: locked.orderId,
+          storeId: locked.storeId,
+          reason: 'payment_expired',
+        });
+
+        /* 9. The audit action already existed, unused, since the payment increment. */
+        await audit.record({
+          storeId: locked.storeId,
+          actor: { type: 'system' },
+          action: PAYMENT_AUDIT.expired,
+          resourceType: PAYMENT_RESOURCE,
+          resourceId: locked.id,
+          metadata: {
+            from: locked.status,
+            to: 'expired',
+            orderId: locked.orderId,
+            method: locked.method,
+          },
+        });
+
+        logger.info(
+          { paymentId: locked.id, orderId: locked.orderId, storeId: locked.storeId },
+          'payment_expired',
+        );
+
+        return { outcome: 'expired' } as const;
+      });
+    },
+
+    /**
+     * Due online payments, as ids. Read OUTSIDE any transaction by the sweeper.
+     *
+     * Deliberately a hint and not a decision: each candidate is re-read under a lock before
+     * anything is written, so a payment that terminalised in between is simply ignored.
+     */
+    async listExpiryDue(params: { now: Date; limit: number }) {
+      return repository.listExpiryDue(params);
     },
 
     /**
@@ -616,6 +889,42 @@ export function createPaymentsService(deps: {
 
           /* istanbul ignore next -- unreachable behind FOR UPDATE; the guard is the point. */
           if (!applied) throw new Conflict('payment changed while being updated');
+
+          /**
+           * **Settle the order's reservation, driven by the transition that just committed.**
+           *
+           * After `applyTransition`, never before: that CAS on `from_status` is what proves
+           * THIS delivery performed the transition. A duplicate webhook never reaches here —
+           * `isTerminal` returns early, `uq_payment_event_provider` rejects a repeated
+           * `provider_event_id`, and the CAS would fail — and even if one did, the settlement
+           * is itself a CAS on `status = 'held'`, so it would move no counter.
+           *
+           * `succeeded` commits: the units are sold, and deliberately stay counted in
+           * `reserved` because they are still physically present. No counter moves and no
+           * `stock_ledger` row is written, because `on_hand` did not change.
+           *
+           * `failed` releases: the units go back to `available` and the order becomes payable
+           * and cancellable again.
+           *
+           * `expired` is not handled here because nothing produces it — there is no expiry
+           * window and no sweeper. When one is approved it will transition a payment the same
+           * way and reach this same branch with `payment_expired`.
+           *
+           * Keyed by `locked.orderId`, from the payment row the provider reference resolved to
+           * — never from the webhook payload, which is exactly how the store is resolved too.
+           */
+          if (target === 'succeeded') {
+            await reservations.commitForOrder({
+              orderId: locked.orderId,
+              storeId: locked.storeId,
+            });
+          } else {
+            await reservations.releaseForOrder({
+              orderId: locked.orderId,
+              storeId: locked.storeId,
+              reason: 'payment_failed',
+            });
+          }
 
           await audit.record({
             storeId: locked.storeId,

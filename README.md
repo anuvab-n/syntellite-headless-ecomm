@@ -12,9 +12,9 @@ are JSON APIs, not a UI.
 
 |               |                                                          |
 | ------------- | -------------------------------------------------------- |
-| **Endpoints** | 61 operations across 43 paths, all documented in OpenAPI |
-| **Tests**     | 1,668 passing across 57 files                            |
-| **Database**  | PostgreSQL 18.6 (Neon), 27 tables, 17 migrations         |
+| **Endpoints** | 79 operations across 55 paths, all documented in OpenAPI |
+| **Tests**     | 1,855 passing across 59 files                            |
+| **Database**  | PostgreSQL 18.6 (Neon), 33 tables, 21 migrations         |
 | **Language**  | TypeScript (strict, NodeNext) on Node 22                 |
 
 ---
@@ -50,7 +50,10 @@ product catalogue with option grids and per-variant SKUs · publish/archive life
 browse, search and price filtering · manual stock tracking with an append-only ledger · address
 book · cart with server-computed totals · coupon codes · checkout into an immutable order ·
 **cash-on-delivery payment** · payment status · order cancellation · **branded HTML invoice** for
-customers and for staff.
+customers and for staff · **stock reservation at checkout** · **manual shipping and fulfilment**
+(staff raise a shipment, ship it, mark it delivered; the customer sees carrier and tracking) ·
+**GST** (configurable effective-dated rates, per-SKU HSN/tax class, CGST/SGST vs IGST by place of
+supply, B2B/B2C, and an immutable tax snapshot on every order).
 
 ### Implemented but never run against the real provider
 
@@ -62,9 +65,12 @@ one real payment and one real webhook have been observed.
 
 ### Not built
 
-No shipping or fulfilment · no GST/tax anywhere · no refunds or returns · no admin order list or
-payment visibility · no staff-management endpoints · no email verification · no product images ·
-no payment retry · no guest checkout · no reporting.
+No shipping provider, carrier API or calculated shipping rates (shipping is free and fulfilment is
+manual) · no partial or multi-parcel shipments · **no statutory GST invoice** (tax is calculated
+and charged, but there is no invoice-number series, no HSN-wise summary and no IRN/QR — see
+below) · no e-way bills · no credit or debit notes · no GSTR export · no refunds or returns · no
+admin order list or payment visibility beyond the fulfilment queue · no staff-management endpoints
+· no email verification · no product images · no payment retry · no guest checkout · no reporting.
 
 ### Three limitations that will bite you
 
@@ -154,7 +160,7 @@ already taken.
 ### 4. Create the schema and the first store
 
 ```bash
-pnpm db:migrate   # applies all 17 migrations
+pnpm db:migrate   # applies all 21 migrations
 pnpm db:seed      # creates the store named by DEFAULT_STORE_SLUG
 ```
 
@@ -490,6 +496,43 @@ scope · `Signed` is verified by provider signature instead of a login.
 | `GET`  | `/users/me/payments`                     | Customer                           |
 | `POST` | `/webhooks/razorpay`                     | **Signed**                         |
 
+### Shipping and fulfilment — 6
+
+| Method       | Path                                      | Access                               |
+| ------------ | ----------------------------------------- | ------------------------------------ |
+| `GET`        | `/users/me/orders/:orderNumber/shipments` | Customer · status, carrier, tracking |
+| `GET`        | `/admin/orders/fulfilment`                | **Staff** · the fulfilment queue     |
+| `POST` `GET` | `/admin/orders/:orderNumber/shipments`    | **Staff** · one shipment per order   |
+| `POST`       | `/admin/shipments/:id/ship`               | **Staff** · moves the stock          |
+| `POST`       | `/admin/shipments/:id/deliver`            | **Staff**                            |
+| `PATCH`      | `/admin/shipments/:id`                    | **Staff** · corrects tracking only   |
+
+Shipping is free and fulfilment is manual — there is no carrier integration. A shipment is created
+`pending`, then shipped, then delivered; shipping is the only thing that decrements `on_hand`. An
+online order must be paid first; a COD order may ship while its payment is still `pending`.
+
+### GST and tax — 11
+
+| Method               | Path                             | Access                                 |
+| -------------------- | -------------------------------- | -------------------------------------- |
+| `GET` `PUT`          | `/admin/store/tax-profile`       | **Staff** · seller identity and origin |
+| `POST` `GET`         | `/admin/tax-classes`             | **Staff**                              |
+| `PATCH`              | `/admin/tax-classes/:code`       | **Staff** · rename or deactivate       |
+| `POST` `GET`         | `/admin/tax-classes/:code/rates` | **Staff** · effective-dated rates      |
+| `PUT`                | `/admin/skus/:code/tax`          | **Staff** · tax class + HSN/SAC        |
+| `GET` `PUT` `DELETE` | `/users/me/tax-identity`         | Customer · their own GSTIN             |
+
+**`PUT /admin/store/tax-profile` is the GST switch.** A store with no profile assesses no tax and
+its orders carry no tax snapshot. Once a profile exists, every checkout is assessed and a line
+whose SKU has no active tax class and no rate in force is refused with `422`.
+
+**No rate is built in.** There is no default, no seed and no constant anywhere in the source
+naming a GST percentage — a class has no rate until one is configured, and HSN codes are strings a
+merchant supplies. Rates cannot be edited or deleted, only superseded by a new dated window.
+
+Order responses gained `taxTotal`, `grandTotal` and a nullable `tax` object on the header and on
+each line. **`total` still means the goods total; `grandTotal` is what a payment charges.**
+
 ### Promotions — 5 · Inventory — 3 · Operations — 2
 
 | Method                 | Path                                | Access |
@@ -502,8 +545,9 @@ scope · `Signed` is verified by provider signature instead of a login.
 | `GET`                  | `/health/live`                      | Public |
 | `GET`                  | `/health/ready`                     | Public |
 
-**No staff order list and no staff payment visibility exist.** Staff can render an invoice for an
-order number they already have, but cannot browse, search or act on orders.
+**No general staff order list and no staff payment visibility exist.** Beyond the narrow
+fulfilment queue, staff can render an invoice for an order number they already have, but cannot
+browse, search or act on orders.
 
 ### Error format
 
@@ -534,7 +578,7 @@ pnpm verify   # format + lint + typecheck + depcruise + test. Run this before an
 Individually:
 
 ```bash
-pnpm test              # 1,668 tests across 57 files
+pnpm test              # 1,855 tests across 59 files
 pnpm test:watch
 pnpm test:coverage
 pnpm typecheck         # three tsconfigs: src, tests, tools
@@ -568,7 +612,7 @@ src/
 ├── container.ts             Composition root — the ONLY place adapters are wired
 ├── config.ts                Reads process.env once, validates with Zod
 ├── db/
-│   ├── schema/              Drizzle table definitions (14 files, 27 tables)
+│   ├── schema/              Drizzle table definitions (16 files, 33 tables)
 │   ├── migrations/          17 plain .sql files — the real source of truth
 │   ├── outbox/              Transactional outbox: dispatcher, publisher, queues
 │   ├── migrate.ts           pnpm db:migrate
@@ -586,6 +630,8 @@ src/
 │   ├── promotions/
 │   ├── orders/              checkout, orders, cancellation, invoice rendering
 │   ├── payments/            payment state machine, webhook handling
+│   ├── fulfilment/          shipments, the fulfilment queue, stock fulfilment
+│   ├── tax/                 GST: classes, effective-dated rates, the calculation
 │   └── stores/              tenant resolution
 ├── razorpay/                The ONLY file that names Razorpay
 ├── mail/                    SMTP adapter + the password-reset consumer
@@ -631,7 +677,7 @@ orders module never imports payments.
 code, and a single rounding boundary (`toMinorUnits`) at the point an amount is handed to the
 payment provider. Display formatting uses Indian digit grouping: `₹12,34,567.89`.
 
-**Tenancy is structural, not conditional.** 25 of 27 tables carry `store_id`, and **25 composite
+**Tenancy is structural, not conditional.** 31 of 33 tables carry `store_id`, and **32 composite
 foreign keys** make a cross-store reference _unrepresentable_ — the database refuses it, rather than
 application code remembering to check.
 
@@ -673,13 +719,37 @@ Beyond the three in [What works and what doesn't](#what-works-and-what-doesnt):
   them.
 - **A 100%-off coupon produces a `total` of 0**, which can be placed but never paid, because the
   payment amount must be positive. It can still be cancelled.
-- **The invoice is not a GST tax invoice** and says so on its face. No tax, no GSTIN, no HSN/SAC,
-  no invoice series — it uses the order number as its reference.
+- **The invoice is still not a STATUTORY GST tax invoice**, and says so on its face. It now shows
+  the tax that was calculated and charged, with the per-component breakdown, HSN codes and both
+  parties' GSTIN — but it carries no sequential invoice-number series, no HSN-wise summary and no
+  IRN/QR code, and it uses the order number as its reference. Increment 39.
 - **`/health/ready` gives each dependency 2,000 ms**, hardcoded. A Neon database that has scaled to
   zero takes longer to wake, so the first probe after an idle period reports `unavailable` and the
   next succeeds. Either keep the database warm or make the timeout configurable before deploying.
-- **`docs/DECISIONS.md` stops at Increment 30.** The design reasoning for payments, password reset,
-  cancellation and invoicing lives only in source file headers.
+- **`docs/DECISIONS.md` stops at Increment 30 for some subjects.** Increments 35–38 are
+  documented in §44–§47; the reasoning for payments, password reset, cancellation and invoicing
+  still lives only in source file headers.
+- **A COD payment never leaves `pending`.** There is no delivery-settlement step, so a COD order
+  can be shipped and delivered while its payment row still reads `pending`, and it stays
+  uncancellable. The money is not tracked anywhere.
+- **A shipment cannot be undone.** `pending → shipped → delivered` is one-way, with no `cancelled`
+  or `returned` state, and a shipped order can no longer be cancelled. A `pending` shipment on a
+  cancelled order is left behind as an operational fact that can never ship.
+- **GST is off until a store configures it.** A store with no seller tax profile assesses no tax
+  at all, and its orders carry a NULL tax snapshot — which records "not assessed", deliberately
+  distinct from "assessed at nil". Once a profile exists, a line whose SKU has no active tax class
+  and no rate in force is REFUSED with `422`, never silently untaxed. **This rule was settled by
+  engineering and needs accounting's ratification.**
+- **State matching for place of supply is free text.** There is no GST state-code catalogue — that
+  is statutory master data this build does not invent — so the seller's origin state and the
+  delivery state are compared after normalising case and whitespace. Two different SPELLINGS of
+  one state (`Orissa` / `Odisha`), an abbreviation or a typo compare unequal and produce IGST
+  where CGST+SGST was due. The value actually compared is snapshotted on the order so a wrong
+  determination can be found afterwards.
+- **GSTIN and PAN are validated for SHAPE only.** No checksum, and no registry lookup.
+- **One GST origin per store.** Multi-warehouse dispatch is deferred, so every order's place of
+  supply is computed against the same origin address.
+- **A tax rate cannot be edited or deleted**, only superseded by a new effective-dated window.
 
 ---
 
@@ -699,6 +769,11 @@ Beyond the three in [What works and what doesn't](#what-works-and-what-doesnt):
 | `/health/ready` says postgres unavailable, then fine                               | Neon cold start exceeding the 2s timeout. Probe again                                                                                                                           |
 | Tests fail with `Memory allocation error` or scattered `401`s                      | Out of memory. Use `pnpm exec vitest run --fileParallelism=false`                                                                                                               |
 | Tests fail at container startup                                                    | Docker is not running, or its daemon is returning 500. Restart Docker Desktop                                                                                                   |
+| `422` when shipping an order                                                       | The payment is not `succeeded`. Only COD may ship while `pending`                                                                                                               |
+| `409` on `POST /admin/orders/:orderNumber/shipments`                               | That order already has a shipment. Exactly one per order, enforced by a unique constraint                                                                                       |
+| `422 TAX_NOT_DETERMINABLE` at checkout                                             | The store has a GST profile, but a SKU has no tax class, its class is inactive, or no rate is in force. `details.skuCodes` names them                                           |
+| Orders show `tax: null` and no GST is charged                                      | The store has no seller tax profile. `PUT /admin/store/tax-profile`                                                                                                             |
+| IGST charged when you expected CGST+SGST                                           | The seller origin state and the delivery state did not match after normalising. Check for two spellings of the same state — there is no state-code catalogue                    |
 | `format:check` fails on a file you didn't write                                    | A stray root-level `.html` — usually a downloaded invoice. Move it out of the repo                                                                                              |
 | `EADDRINUSE :::8000`                                                               | An old `pnpm dev` is still alive. Kill it, or change `PORT`                                                                                                                     |
 | Container exits with `unable to find user ...: no matching entries in passwd file` | An Alpine/musl image on this Docker + WSL2 kernel. **Never use `-alpine` images here** — every image in `docker-compose.yml` is Debian-based for this reason                    |

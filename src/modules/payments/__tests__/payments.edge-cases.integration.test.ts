@@ -19,7 +19,9 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { DEFAULT_SKU_ON_HAND, giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { createInventoryRepository, createInventoryService } from '../../inventory/index.js';
+import { createFulfilmentRepository, createFulfilmentService } from '../../fulfilment/index.js';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 import { newId } from '../../../shared/id.js';
 import { NotFound } from '../../../shared/errors.js';
@@ -41,6 +43,7 @@ import { createPromotionsRepository } from '../../promotions/promotions.reposito
 import { createPromotionsRoutes } from '../../promotions/promotions.routes.js';
 import { createPromotionsService } from '../../promotions/promotions.service.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
+import { createTaxRepository, createTaxService } from '../../tax/index.js';
 import { createPaymentsRepository } from '../payments.repository.js';
 import { createPaymentsRoutes } from '../payments.routes.js';
 import { createPaymentsService } from '../payments.service.js';
@@ -64,6 +67,9 @@ describe('payments edge cases (integration)', () => {
   let storeId: string;
 
   const PASSWORD = 'a-sufficiently-long-password';
+
+  /** The approved production window, so a test asserts the real rule rather than a stub. */
+  const EXPIRY_MINUTES = 30;
   const CODE = 'EDGE-A';
   const CREDENTIALS = {
     keyId: 'rzp_test_edge',
@@ -99,6 +105,21 @@ describe('payments edge cases (integration)', () => {
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const recorders = testRecorders(db());
 
+    /**
+     * A REAL inventory service, not a stub.
+     *
+     * Checkout reserves stock now, so a stub would prove nothing about the behaviour these
+     * suites exercise most: that an order holds units, that a rollback gives them back, and
+     * that two concurrent checkouts cannot take the same one. The concurrency guarantee is a
+     * property of a PostgreSQL statement, and a mock cannot have it.
+     */
+    const inventory = createInventoryService({
+      repository: createInventoryRepository({ db: db() }),
+      db: db(),
+      ...recorders,
+      logger: silentLogger,
+    });
+
     const identity = createIdentityService({
       repository: identityRepository,
       sessions: createRefreshSessionRepository({ db: db() }),
@@ -129,6 +150,13 @@ describe('payments edge cases (integration)', () => {
 
     const idempotency = createIdempotencyStore({ db: db(), logger: silentLogger });
 
+    const tax = createTaxService({
+      repository: createTaxRepository({ db: db() }),
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
+
     const orders = createOrdersService({
       repository: createOrdersRepository({ db: db() }),
       cart: {
@@ -140,7 +168,25 @@ describe('payments edge cases (integration)', () => {
        * Late-bound, exactly as `container.ts` does it: `payments` is constructed below and
        * needs `orders` through its own port, so the arrow defers the lookup to call time.
        */
+      /**
+       * A REAL fulfilment service, late-bound exactly as `container.ts` binds it.
+       *
+       * The cancellation guard turns on shipment state, so a stub answering "never shipped"
+       * would let every cancellation test pass while the guard did nothing.
+       */
+      fulfilment: { hasBlockingShipment: (input) => fulfilment.hasBlockingShipment(input) },
       payments: { stateForOrder: (input) => payments.stateForOrder(input) },
+      reservations: {
+        reserve: (input) => inventory.reserveForOrder(input),
+        releaseForOrder: (input) => inventory.releaseForOrder(input),
+      },
+      /*
+       * A REAL tax service. No store in these suites configures a GST profile, so every
+       * determination is the unassessed one — tax_total 0, grand_total = total, snapshot NULL,
+       * which is exactly the behaviour these suites were written against. A stub would make
+       * that a property of the double rather than of the system.
+       */
+      tax: { determineForCheckout: (input) => tax.determineForCheckout(input) },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -172,6 +218,18 @@ describe('payments edge cases (integration)', () => {
       fetchImpl,
     });
 
+    const fulfilment = createFulfilmentService({
+      repository: createFulfilmentRepository({ db: db() }),
+      orders: {
+        lockByNumber: (input) => orders.lockForFulfilmentByNumber(input),
+        lockById: (input) => orders.lockForFulfilmentById(input),
+      },
+      payments: { stateForOrder: (input) => payments.stateForOrder(input) },
+      inventory: { fulfilForOrder: (input) => inventory.fulfilForOrder(input) },
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
     const payments = createPaymentsService({
       repository: createPaymentsRepository({ db: db() }),
       orders: {
@@ -187,15 +245,22 @@ describe('payments edge cases (integration)', () => {
               orderNumber: view.order.orderNumber,
               status: view.order.status,
               currency: view.order.currency,
-              total: view.order.total,
+              payableTotal: view.order.grandTotal,
             };
           } catch (err) {
             if (err instanceof NotFound) return null;
             throw err;
           }
         },
+        /* The order lock the expiry path takes first, wired exactly as container.ts does. */
+        lockForExpiry: (input) => orders.lockOrderForExpiry(input),
       },
       gateway,
+      expiryMinutes: EXPIRY_MINUTES,
+      reservations: {
+        commitForOrder: (input) => inventory.commitForOrder(input),
+        releaseForOrder: (input) => inventory.releaseForOrder(input),
+      },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -292,7 +357,7 @@ describe('payments edge cases (integration)', () => {
     return { token: response.body.accessToken as string, userId: user.id };
   }
 
-  async function givenSku(overrides: { code?: string; price?: string } = {}) {
+  async function givenSku(overrides: { code?: string; price?: string; onHand?: number } = {}) {
     const code = overrides.code ?? CODE;
     const parent = {
       id: newId(),
@@ -308,6 +373,7 @@ describe('payments edge cases (integration)', () => {
       name: `${code} variant`,
       price: overrides.price ?? '1000.0000',
       deletedAt: null,
+      onHand: overrides.onHand ?? DEFAULT_SKU_ON_HAND,
     });
   }
 

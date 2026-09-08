@@ -214,6 +214,27 @@ describe('API documentation', () => {
     apiRouter.get('/admin/orders/:orderNumber/invoice', (_req, res) => {
       res.status(200).type('html').send('<!doctype html><html></html>');
     });
+    apiRouter.get('/users/me/orders/:orderNumber/shipments', (_req, res) => {
+      res.status(200).json({ shipments: [] });
+    });
+    apiRouter.get('/admin/orders/fulfilment', (_req, res) => {
+      res.status(200).json({ orders: [], nextCursor: null });
+    });
+    apiRouter.post('/admin/orders/:orderNumber/shipments', (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    apiRouter.get('/admin/orders/:orderNumber/shipments', (_req, res) => {
+      res.status(200).json({ shipments: [] });
+    });
+    apiRouter.post('/admin/shipments/:id/ship', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/shipments/:id/deliver', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.patch('/admin/shipments/:id', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
     apiRouter.get('/users/me/orders/:orderNumber/invoice', (_req, res) => {
       res.status(200).type('html').send('<!doctype html><html></html>');
     });
@@ -228,6 +249,41 @@ describe('API documentation', () => {
     });
     apiRouter.get('/users/me/orders/:orderNumber/payment', (_req, res) => {
       res.status(200).json({ ok: true });
+    });
+
+    /* Increment 38 — the tax module's nine routes. */
+    apiRouter.get('/admin/store/tax-profile', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.put('/admin/store/tax-profile', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/tax-classes', (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    apiRouter.get('/admin/tax-classes', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.patch('/admin/tax-classes/:code', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/tax-classes/:code/rates', (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    apiRouter.get('/admin/tax-classes/:code/rates', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.put('/admin/skus/:code/tax', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.get('/users/me/tax-identity', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.put('/users/me/tax-identity', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.delete('/users/me/tax-identity', (_req, res) => {
+      res.status(204).send();
     });
 
     /**
@@ -353,7 +409,9 @@ describe('API documentation', () => {
         '/api/v1/admin/option-values/{id}',
         '/api/v1/admin/options/{id}',
         '/api/v1/admin/options/{id}/values',
+        '/api/v1/admin/orders/fulfilment',
         '/api/v1/admin/orders/{orderNumber}/invoice',
+        '/api/v1/admin/orders/{orderNumber}/shipments',
         '/api/v1/admin/products',
         '/api/v1/admin/products/{slug}',
         '/api/v1/admin/products/{slug}/archive',
@@ -362,8 +420,16 @@ describe('API documentation', () => {
         '/api/v1/admin/products/{slug}/skus',
         '/api/v1/admin/promotions',
         '/api/v1/admin/promotions/{code}',
+        '/api/v1/admin/shipments/{id}',
+        '/api/v1/admin/shipments/{id}/deliver',
+        '/api/v1/admin/shipments/{id}/ship',
         '/api/v1/admin/skus/{code}',
         '/api/v1/admin/skus/{code}/options',
+        '/api/v1/admin/skus/{code}/tax',
+        '/api/v1/admin/store/tax-profile',
+        '/api/v1/admin/tax-classes',
+        '/api/v1/admin/tax-classes/{code}',
+        '/api/v1/admin/tax-classes/{code}/rates',
         '/api/v1/auth/forgot-password',
         '/api/v1/auth/login',
         '/api/v1/auth/logout',
@@ -385,8 +451,10 @@ describe('API documentation', () => {
         '/api/v1/users/me/orders/{orderNumber}/invoice',
         '/api/v1/users/me/orders/{orderNumber}/payment',
         '/api/v1/users/me/orders/{orderNumber}/payments',
+        '/api/v1/users/me/orders/{orderNumber}/shipments',
         '/api/v1/users/me/password',
         '/api/v1/users/me/payments',
+        '/api/v1/users/me/tax-identity',
         '/api/v1/webhooks/razorpay',
         '/health/live',
         '/health/ready',

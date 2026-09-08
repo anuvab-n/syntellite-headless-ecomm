@@ -2,7 +2,14 @@ import { and, count, desc, eq, isNull, sql } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { sku } from '../../db/schema/catalogue.js';
-import { stockItem, stockLedger } from '../../db/schema/inventory.js';
+import {
+  RESERVATION_HELD,
+  stockItem,
+  stockLedger,
+  stockReservation,
+  type ReservationSettledReason,
+  type ReservationStatus,
+} from '../../db/schema/inventory.js';
 import { executor } from '../../db/transaction.js';
 
 /**
@@ -42,7 +49,15 @@ import { executor } from '../../db/transaction.js';
  * silently drift from the constraint — the same discipline the catalogue applies to
  * `PRODUCT_STATUSES`.
  */
-export { STOCK_REASONS, type StockReason } from '../../db/schema/inventory.js';
+export {
+  RESERVATION_HELD,
+  RESERVATION_SETTLED_REASONS,
+  RESERVATION_STATUSES,
+  STOCK_REASONS,
+  type ReservationSettledReason,
+  type ReservationStatus,
+  type StockReason,
+} from '../../db/schema/inventory.js';
 
 export type InventoryRepository = ReturnType<typeof createInventoryRepository>;
 
@@ -297,6 +312,182 @@ export function createInventoryRepository(deps: { db: Database }) {
       };
     },
 
+    /* ── Fulfilment (Increment 37) ────────────────────────────────────────── */
+
+    /**
+     * One order's reservations that fulfilment must act on, with their current state.
+     *
+     * Read INSIDE the fulfilment transaction, after the order lock, so the set cannot change
+     * underneath the decision. Ordered by `sku_id` ascending — the deterministic lock order
+     * Increment 35 established, applied here because the caller will take a `stock_item` row
+     * lock per SKU and two concurrent fulfilments of different orders sharing SKUs would
+     * otherwise be able to form a wait cycle.
+     *
+     * Returns every non-released reservation, not only the committed ones, because the caller
+     * has to distinguish three different answers: nothing to fulfil, a COD order still `held`,
+     * and an order already `fulfilled`. Filtering here would collapse them into one.
+     */
+    async listFulfillableReservations(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<{ skuId: string; quantity: number; status: string }[]> {
+      return executor(db)
+        .select({
+          skuId: stockReservation.skuId,
+          quantity: stockReservation.quantity,
+          status: stockReservation.status,
+        })
+        .from(stockReservation)
+        .where(
+          and(
+            eq(stockReservation.orderId, params.orderId),
+            eq(stockReservation.storeId, params.storeId),
+          ),
+        )
+        .orderBy(stockReservation.skuId);
+    },
+
+    /**
+     * **The physical movement. The only statement in this codebase that decreases `on_hand`.**
+     *
+     * One conditional `UPDATE`, the same shape as `reserveForSku` and for the same reasons.
+     * Both counters fall by the same amount, so `available = on_hand - reserved` is UNCHANGED —
+     * correct, because the units stopped being sellable when they were reserved, not now.
+     *
+     * Three predicates, each load-bearing:
+     *
+     *  - `store_id` — tenancy, from the locked reservation row, never from caller input.
+     *  - `on_hand >= :quantity` — **negative physical stock is impossible.** Also the reason
+     *    this is not a bare decrement: a divergence must fail rather than write a nonsense row.
+     *  - `reserved >= :quantity` — the units being shipped must be the ones that were held.
+     *
+     * `ck_stock_on_hand_non_negative` and `ck_stock_reserved_within_on_hand` are backstops
+     * behind those predicates. Note the second holds automatically: if `reserved <= on_hand`
+     * before, then `reserved - q <= on_hand - q` after.
+     *
+     * `RETURNING` gives both sides of the arithmetic from the SAME statement, so the ledger's
+     * `on_hand_before`/`on_hand_after` pair cannot come from two different reads — the property
+     * §39 built `adjustStock` around.
+     *
+     * `undefined` means the predicates did not hold, which for a caller that has already locked
+     * the order and read a `committed` reservation means the projection has DIVERGED. The
+     * service raises `InvariantViolation` rather than shipping stock it cannot account for.
+     */
+    async fulfilStockForSku(params: {
+      skuId: string;
+      storeId: string;
+      quantity: number;
+      at: Date;
+    }): Promise<{ onHandBefore: number; onHandAfter: number; available: number } | undefined> {
+      const [row] = await executor(db)
+        .update(stockItem)
+        .set({
+          // PostgreSQL does the arithmetic. Never in JavaScript.
+          onHand: sql`${stockItem.onHand} - ${params.quantity}`,
+          reserved: sql`${stockItem.reserved} - ${params.quantity}`,
+          updatedAt: params.at,
+        })
+        .where(
+          and(
+            eq(stockItem.skuId, params.skuId),
+            eq(stockItem.storeId, params.storeId),
+            sql`${stockItem.onHand} >= ${params.quantity}`,
+            sql`${stockItem.reserved} >= ${params.quantity}`,
+          ),
+        )
+        .returning({
+          onHandAfter: stockItem.onHand,
+          available: stockItem.available,
+        });
+
+      if (!row) return undefined;
+
+      return {
+        /* Derived from the same statement's result, so the pair describes one moment. */
+        onHandBefore: row.onHandAfter + params.quantity,
+        onHandAfter: row.onHandAfter,
+        available: row.available,
+      };
+    },
+
+    /**
+     * Move one order's reservations to a terminal fulfilment state. CAS-protected.
+     *
+     * `WHERE status = :fromStatus` is the compare-and-swap: a second fulfilment of the same
+     * order matches nothing, returns no rows, and therefore performs no second stock movement
+     * and writes no second ledger entry. That guarantee is independent of any lock the caller
+     * holds, which is what makes a duplicate staff click safe.
+     *
+     * `fulfilled_at` is a NEW column rather than a re-stamp of `settled_at`, so the moment the
+     * sale was committed survives the moment it shipped — see the schema comment.
+     */
+    async fulfilReservationsForOrder(params: {
+      orderId: string;
+      storeId: string;
+      fromStatus: ReservationStatus;
+      at: Date;
+    }): Promise<{ skuId: string; quantity: number }[]> {
+      return executor(db)
+        .update(stockReservation)
+        .set({
+          status: 'fulfilled',
+          settledReason: 'shipment_fulfilled',
+          fulfilledAt: params.at,
+        })
+        .where(
+          and(
+            eq(stockReservation.orderId, params.orderId),
+            eq(stockReservation.storeId, params.storeId),
+            eq(stockReservation.status, params.fromStatus),
+          ),
+        )
+        .returning({
+          skuId: stockReservation.skuId,
+          quantity: stockReservation.quantity,
+        });
+    },
+
+    /**
+     * Commit one order's HELD reservations without a payment success. **COD only.**
+     *
+     * The explicit mechanism the approved COD rule requires. A COD payment never terminalises,
+     * so its reservation sits `held` forever, and `held -> fulfilled` is deliberately illegal.
+     * Rather than inventing a payment transition — forbidden — fulfilment performs this
+     * `held -> committed` first, in the same transaction, and then fulfils normally.
+     *
+     * The reason is `cod_fulfilment`, NOT `payment_succeeded`: the money has not been received,
+     * and a reason claiming otherwise would misreport an unpaid sale. **Nothing about the
+     * payment row changes.**
+     *
+     * `reserved` does not move — commit never moves it, exactly as payment-success commit does
+     * not — so the reconciliation invariant holds throughout: the units are still counted in
+     * `reserved` right up until `fulfilStockForSku` takes them out.
+     */
+    async commitReservationsForCodFulfilment(params: {
+      orderId: string;
+      storeId: string;
+      at: Date;
+    }): Promise<{ skuId: string; quantity: number }[]> {
+      return executor(db)
+        .update(stockReservation)
+        .set({
+          status: 'committed',
+          settledReason: 'cod_fulfilment',
+          settledAt: params.at,
+        })
+        .where(
+          and(
+            eq(stockReservation.orderId, params.orderId),
+            eq(stockReservation.storeId, params.storeId),
+            eq(stockReservation.status, RESERVATION_HELD),
+          ),
+        )
+        .returning({
+          skuId: stockReservation.skuId,
+          quantity: stockReservation.quantity,
+        });
+    },
+
     /** Append one ledger entry. There is no update and no delete — the table is append-only. */
     async insertLedgerEntry(values: InsertLedgerValues): Promise<StockLedgerRecord> {
       const [row] = await executor(db).insert(stockLedger).values(values).returning(LEDGER_COLUMNS);
@@ -370,6 +561,229 @@ export function createInventoryRepository(deps: { db: Database }) {
      * `ON CONFLICT DO NOTHING` makes it idempotent, so a retry cannot fail on a row that is
      * already correct.
      */
+    /* ── Reservation ──────────────────────────────────────────────────────── */
+
+    /**
+     * **Take units for one SKU. The concurrency primitive of the reservation feature.**
+     *
+     * ONE conditional `UPDATE`, the same shape and for the same reasons as `adjustStock`
+     * above. It enforces three things at once and returns the resulting state, so no stock
+     * figure is ever read into JavaScript, decided upon, and written back:
+     *
+     *  1. store scope     — `store_id = :storeId`
+     *  2. the arithmetic  — `reserved = reserved + :quantity`, evaluated by PostgreSQL
+     *  3. legality        — `available >= :quantity`
+     *
+     * `available` rather than a restatement of `on_hand - reserved`, because `available` is the
+     * schema's ONE authoritative definition of availability. It is a `STORED` generated column,
+     * so every committed row version carries a materialised value that PostgreSQL itself kept
+     * consistent — there is no second place the formula could be written differently.
+     *
+     * ## Why two customers cannot both take the last unit
+     *
+     * `on_hand = 1, reserved = 0, available = 1`. Both request 1.
+     *
+     * T1 issues the `UPDATE`, matches, takes a row lock, writes `reserved = 1`, holds the lock
+     * to commit. T2 issues the same statement, reaches the same row, finds it locked, and
+     * BLOCKS. T1 commits. T2 unblocks — and under READ COMMITTED it does not proceed with the
+     * row version it first read: PostgreSQL re-fetches the newly committed version and
+     * **re-evaluates this `WHERE` clause against it** (the EvalPlanQual mechanism). That
+     * version has `available = 0`, `0 >= 1` is false, the row is skipped, and the statement
+     * reports **zero rows**. Exactly one succeeds.
+     *
+     * That re-evaluation is the whole guarantee, and it is why read-then-write is not merely
+     * slower but WRONG: two `SELECT`s would both see `available = 1`, both compute a legal
+     * result, and both write it. `adjustStock`'s header records this measured on this
+     * PostgreSQL — two concurrent `-4` from 5 left 1 and reported BOTH successful, with no
+     * CHECK constraint violated, because every value written was individually legal.
+     *
+     * ## Why there is no `SELECT ... FOR UPDATE`
+     *
+     * `FOR UPDATE` is necessary when one row's decision depends on READING ANOTHER ROW — you
+     * must pin several rows, then decide. That is not the case here: a cart line's availability
+     * is a function of its own `stock_item` row and nothing else, so every decision is a
+     * single-row decision and the conditional `UPDATE` covers it. Adding `FOR UPDATE` would put
+     * the arithmetic back in JavaScript — the shape that loses updates — and hold locks across
+     * application think-time, measured at roughly double the wall clock.
+     *
+     * `docs/DECISIONS.md` §39 anticipated that this increment would need it. Following the code
+     * it does not, and the divergence is approved and recorded.
+     *
+     * **It becomes necessary the moment a rule spans rows**: a kit or bundle where reserving A
+     * is only legal if B is also available, an all-or-nothing multi-location allocation, or any
+     * decision that must read one SKU's stock to decide another's. At that point this method is
+     * the wrong primitive and the increment introducing such a rule must revisit it.
+     *
+     * ## Reading the result
+     *
+     * `undefined` means the update matched nothing, which is *insufficient stock*, *no
+     * `stock_item` row for this SKU*, or *the SKU is not in this store* — indistinguishable
+     * here by design, exactly as in `adjustStock`. The caller has already proven the SKU is
+     * live and in-store (checkout's purchasability gate), and a missing projection row means
+     * zero available, so the service treats all three as insufficient.
+     */
+    async reserveForSku(params: {
+      skuId: string;
+      storeId: string;
+      quantity: number;
+      at: Date;
+    }): Promise<{ reserved: number; available: number } | undefined> {
+      const [row] = await executor(db)
+        .update(stockItem)
+        .set({
+          // PostgreSQL does the arithmetic. Never `reserved + quantity` in JavaScript.
+          reserved: sql`${stockItem.reserved} + ${params.quantity}`,
+          updatedAt: params.at,
+        })
+        .where(
+          and(
+            eq(stockItem.skuId, params.skuId),
+            eq(stockItem.storeId, params.storeId),
+            sql`${stockItem.available} >= ${params.quantity}`,
+          ),
+        )
+        .returning({ reserved: stockItem.reserved, available: stockItem.available });
+
+      return row;
+    },
+
+    /**
+     * Give units back for one SKU.
+     *
+     * The mirror of `reserveForSku`, and the ONLY statement that decreases `reserved`. Its
+     * `reserved >= :quantity` predicate should never fail: the caller reaches it only with a
+     * row it just moved out of `held`, and a held reservation is by construction included in
+     * the counter. So `undefined` here does not mean "insufficient" — it means the projection
+     * has DIVERGED from the reservation rows, and the service raises `InvariantViolation`
+     * rather than silently under-releasing.
+     *
+     * Kept as a guarded conditional update rather than a bare decrement precisely so that
+     * divergence surfaces as a loud failure instead of driving the counter negative and
+     * tripping `ck_stock_reserved_non_negative` with a less informative error.
+     */
+    async releaseForSku(params: {
+      skuId: string;
+      storeId: string;
+      quantity: number;
+      at: Date;
+    }): Promise<{ reserved: number; available: number } | undefined> {
+      const [row] = await executor(db)
+        .update(stockItem)
+        .set({
+          reserved: sql`${stockItem.reserved} - ${params.quantity}`,
+          updatedAt: params.at,
+        })
+        .where(
+          and(
+            eq(stockItem.skuId, params.skuId),
+            eq(stockItem.storeId, params.storeId),
+            sql`${stockItem.reserved} >= ${params.quantity}`,
+          ),
+        )
+        .returning({ reserved: stockItem.reserved, available: stockItem.available });
+
+      return row;
+    },
+
+    /**
+     * Record the reservations, one row per line, all `held`.
+     *
+     * One statement for N rows. Called only after every `reserveForSku` has succeeded, so a
+     * partially-reserved order never leaves reservation rows behind — and because the whole
+     * thing is one transaction, a later failure removes both the rows and the counter
+     * increments together.
+     *
+     * No `onConflictDoNothing`: a conflict on `pk_stock_reservation` means this order already
+     * has a reservation for that SKU, which is a bug worth failing on rather than swallowing.
+     */
+    async insertReservations(
+      rows: readonly {
+        orderId: string;
+        skuId: string;
+        storeId: string;
+        quantity: number;
+      }[],
+    ): Promise<void> {
+      if (rows.length === 0) return;
+      await executor(db)
+        .insert(stockReservation)
+        .values(rows.map((row) => ({ ...row, status: RESERVATION_HELD })));
+    },
+
+    /**
+     * **Settle every held reservation for one order. The exactly-once guarantee.**
+     *
+     * One conditional `UPDATE` whose `status = 'held'` predicate is the compare-and-swap: a
+     * second settlement of the same order matches nothing, returns no rows, and therefore
+     * drives no counter change. That property is independent of any lock the caller holds,
+     * which is what makes repeated cancellation and duplicate webhooks safe even if a future
+     * code path reaches them by another route.
+     *
+     * The same predicate is why a `committed` reservation can never be released: it is not
+     * `held`, so no release statement can match it. Structural, not conditional.
+     *
+     * `RETURNING sku_id, quantity` is what the caller decrements by — the settled rows and the
+     * counter movements come from the SAME statement, so they cannot disagree.
+     *
+     * Rows for different orders never contend, because the primary key leads on `order_id`.
+     */
+    async settleReservationsForOrder(params: {
+      orderId: string;
+      storeId: string;
+      toStatus: 'released' | 'committed';
+      reason: ReservationSettledReason;
+      at: Date;
+    }): Promise<{ skuId: string; quantity: number }[]> {
+      return executor(db)
+        .update(stockReservation)
+        .set({
+          status: params.toStatus,
+          settledReason: params.reason,
+          settledAt: params.at,
+        })
+        .where(
+          and(
+            eq(stockReservation.orderId, params.orderId),
+            eq(stockReservation.storeId, params.storeId),
+            eq(stockReservation.status, RESERVATION_HELD),
+          ),
+        )
+        .returning({
+          skuId: stockReservation.skuId,
+          quantity: stockReservation.quantity,
+        });
+    },
+
+    /** One order's reservations, for tests and for support answering "what did this hold?". */
+    async listReservationsForOrder(params: { orderId: string; storeId: string }): Promise<
+      {
+        skuId: string;
+        quantity: number;
+        status: string;
+        settledReason: string | null;
+        heldAt: Date;
+        settledAt: Date | null;
+      }[]
+    > {
+      return executor(db)
+        .select({
+          skuId: stockReservation.skuId,
+          quantity: stockReservation.quantity,
+          status: stockReservation.status,
+          settledReason: stockReservation.settledReason,
+          heldAt: stockReservation.heldAt,
+          settledAt: stockReservation.settledAt,
+        })
+        .from(stockReservation)
+        .where(
+          and(
+            eq(stockReservation.orderId, params.orderId),
+            eq(stockReservation.storeId, params.storeId),
+          ),
+        )
+        .orderBy(stockReservation.skuId);
+    },
+
     async initialiseStock(params: { skuId: string; storeId: string }): Promise<void> {
       await executor(db)
         .insert(stockItem)

@@ -3139,3 +3139,1707 @@ What later increments will need from this one, and therefore what had to be righ
 and `postal_code` for place of supply · `order_number` and `placed_at` for invoice identity ·
 per-line quantities and money for partial returns · `order_status_history` as the append-only
 spine every one of them will add transitions to.
+
+---
+
+## 44. Phase 3 increment 35 — inventory reservation
+
+One new table, no change to any existing one. The increment §39 named when it deferred
+_"reservations and allocation (the increment that will need `FOR UPDATE`, and the one that first
+writes `reserved`)"_ — and the one that makes §43's recorded consequence, _"an order can be placed
+for stock that is not there"_, impossible.
+
+**A numbering note.** This is section 44 for increment 35; increments 31–34 (payment, password
+reset, order cancellation, invoicing) shipped without sections here, and their reasoning currently
+lives in file headers under `src/`. That gap is recorded rather than closed, and nothing below
+renumbers or rewrites what came before it.
+
+### Why `stock_item.reserved` alone was not enough
+
+`reserved` shipped in §39 at zero, with its CHECK constraints already in place, precisely so this
+increment would _"change no formula and no constraint anywhere"_. It didn't. But a counter turned
+out to be insufficient on its own, and the reason is worth stating because "just increment the
+column" is the obvious first design.
+
+A counter cannot answer two questions this feature turns on: **whose units are these**, and **has
+this reservation already been settled?** Without an owner row, "release exactly once" is
+unenforceable — a second cancellation would decrement the counter again with nothing to refuse
+it, and the projection would silently drift below the truth. Four of the approved requirements
+(ownership, release-on-cancel, release-on-expiry, no duplicate effect under retry) reduce to that
+one missing record.
+
+So the counter stays as the fast projection and each `stock_reservation` row is the record that
+justifies part of it — the same relationship `stock_ledger` has to `on_hand`, and reconcilable the
+same way:
+
+```
+SUM(quantity) WHERE status IN ('held', 'committed')  =  stock_item.reserved
+```
+
+Three alternatives were considered and rejected. A bare counter fails the four requirements above.
+Rows **deleted** on settlement give exactly-once for free (`DELETE … RETURNING` matches nothing the
+second time) but destroy the history, which §3 #15's retention posture forbids. An append-only
+reservation **event log** works but needs an aggregate to enforce once-only and turns "is this
+still held?" into a fold — a third persistence pattern where the codebase already has projection
+plus ledger.
+
+### The table
+
+`stock_reservation`, owned by the inventory module: the schema sits in `db/schema/inventory.ts`,
+the statements in `inventory.repository.ts`, the operations in `inventory.service.ts`. That keeps
+the counter and the rows that justify it in one module, which is what "do not create a second
+inventory model" required.
+
+**Primary key `(order_id, sku_id)`**, no surrogate `id`, following `order_line` and `stock_item`,
+which both key on their natural composite. One reservation per order per SKU is therefore
+structural rather than a unique index somebody could later drop — and it is a free idempotency
+backstop: a code path that somehow reserved twice for one order hits a primary-key violation
+rather than double-counting units. `order_id` leads because "settle this order's reservations" is
+the only hot read.
+
+**Ownership is the ORDER, not the payment.** A reservation is created at checkout, before any
+payment row exists, and an order with no payment still holds stock. Both settlement operations are
+keyed by `order_id`, and nothing in the reservation model takes a payment id. Payment state
+changes are triggers, not owners — see _Payment interaction_ below.
+
+**Two tenant-scoped composite foreign keys**, both `RESTRICT`:
+
+```
+fk_stock_reservation_order_store  (order_id, store_id) -> "order" (id, store_id)
+fk_stock_reservation_sku_store    (sku_id,   store_id) -> sku     (id, store_id)
+```
+
+A cross-store reservation is unrepresentable rather than merely rejected in application code — the
+§3 posture every table here follows. Neither key needed a new index: `uq_order_id_store` already
+exists for `order_line` and `uq_sku_id_store` for `stock_item`. `RESTRICT` and not `CASCADE`
+because an order is never hard-deleted and a SKU is soft-deleted, so a hard delete with live
+reservations is a bug that must fail loudly rather than quietly discard the record of stock that
+was taken.
+
+`sku_id` points at the SKU and **not** at `stock_item`, for the reason `stock_ledger` does: an
+immutable record must not depend on a mutable projection's lifecycle.
+
+**Rows are retained permanently.** There is no delete path and no `deleted_at`. A settled
+reservation is the record that stock was taken and what became of it, which is the historical
+auditability the increment was required to preserve. There is also no `updated_at`: the row is
+written once and settled at most once, so `settled_at` already answers the only question
+`updated_at` would, and a second timestamp would be a second place for the two to disagree.
+
+No `expires_at`, and no `payment_id`. Both would encode rules this increment was not given — the
+first an expiry window nobody has approved, the second the wrong ownership.
+
+### The lifecycle
+
+```
+                  checkout transaction
+                          |
+                          v
+                      +-------+
+                      | held  |   reserved += quantity
+                      +---+---+
+              +-----------+-----------+
+              v                       v
+        +----------+            +-----------+
+        | released |            | committed |
+        +----------+            +-----------+
+     reserved -= quantity     reserved UNCHANGED
+```
+
+Both settled states are terminal in this increment. `held` is the only non-terminal one, named as
+`RESERVATION_HELD` so every compare-and-swap predicate has a single source.
+
+`reserved` rises exactly once, at creation. It falls exactly once, on `held -> released`. **Commit
+moves no counter at all**, and that is the load-bearing decision of the increment — see _Inventory
+semantics_.
+
+**Settlement is CAS-protected by `status = 'held'`.** Every release and every commit is one
+statement:
+
+```sql
+UPDATE stock_reservation
+   SET status = :toStatus, settled_reason = :reason, settled_at = :at
+ WHERE order_id = :orderId AND store_id = :storeId AND status = 'held'
+RETURNING sku_id, quantity;
+```
+
+A second settlement matches nothing, returns no rows, and therefore drives no counter change. That
+property holds **independently of any lock the caller happens to hold**, which is what makes
+repeated cancellation and duplicate webhook delivery safe even if a future code path reaches them
+by another route. The same predicate is why a `committed` reservation can never be released: it is
+not `held`, so no release statement can match it — structural, not conditional.
+
+`RETURNING` is what the caller decrements by, so the settled rows and the counter movements come
+from the same statement and cannot disagree.
+
+The `settled_reason` vocabulary is TECHNICAL, in the sense `STOCK_REASONS` established: one value
+per code path and nothing with an accounting treatment. `order_cancelled`, `payment_succeeded`,
+`payment_failed`, `payment_expired`. Without it, `released` could not distinguish a cancellation
+from a payment failure from an expiry — three paths with one outcome.
+
+`payment_expired` is **defined and unreachable**. It exists so the increment given an expiry window
+adds a caller rather than a vocabulary, exactly as `expired` already sits unreachable in
+`PAYMENT_STATUSES`.
+
+### Inventory semantics, and the one thing that did not change
+
+The definitions, now that something writes `reserved`:
+
+| Quantity    | Meaning                                                                                      |
+| ----------- | -------------------------------------------------------------------------------------------- |
+| `on_hand`   | Units **physically held**. Not a sales figure                                                |
+| `reserved`  | Units **not available for sale** — held for an unpaid order, or sold and awaiting fulfilment |
+| `available` | `on_hand - reserved`, generated by PostgreSQL. Still the only definition                     |
+
+`available = on_hand - reserved` remains authoritative and untouched: a `STORED GENERATED` column
+PostgreSQL refuses to write, so no code path, migration or operator can make it contradict its
+inputs.
+
+**Checkout does not decrement `on_hand`, and neither does payment.** A reservation changes what is
+SELLABLE, not what is physically present. A committed reservation is a sale awaiting fulfilment:
+the units are still in the building, so `on_hand` must keep counting them; they are no longer
+sellable, so `reserved` must keep counting them too. That is why commit moves no counter, and it
+is what lets `available` stay correct with no change to its formula or its three CHECKs.
+
+The consequence is deliberate and worth stating as plainly as §43 stated the one it replaces: **as
+paid orders accumulate, `available` trends to zero while `on_hand` stays flat.** That is not a
+leak — it is what "sold but not yet shipped" looks like in a system with no fulfilment. An operator
+watching availability fall while on-hand does not move is seeing the design work.
+
+**`stock_ledger` is unchanged, and remains exclusively about `on_hand`.** No new column, no widened
+reason vocabulary, no relaxed `actor_user_id`. The reason is not restraint but arithmetic: that
+table is defined around `on_hand` (`delta`, `on_hand_before`, `on_hand_after`, `CHECK
+(on_hand_before + delta = on_hand_after)`, `CHECK (delta <> 0)`), and `SUM(delta) = on_hand` is an
+asserted invariant. A reservation moves `reserved`, so recording one there would require either
+lying with `delta = 0` — which the CHECK refuses — or adding `reserved_before`/`reserved_after`
+plus a movement-kind discriminator, which changes what the ledger MEANS and breaks the invariant.
+
+Because commit does not move `on_hand`, none of that was needed. `actor_user_id` keeps its `NOT
+NULL` too — a sweeper-driven release has no user, which is exactly the widening that column's
+comment anticipates and this increment does not require.
+
+**Fulfilment owns the future decrement.** The increment that ships goods reduces `on_hand` and
+`reserved` together, writes the `stock_ledger` row for it, and inherits all three deferred
+changes: a new technical reason, the `actor_user_id` widening for a system actor, and a
+`fulfilled` reservation state. The seam is recorded rather than built.
+
+### Concurrency: one atomic conditional UPDATE
+
+The whole guarantee is one statement per SKU. Nothing reads a stock figure into JavaScript,
+decides, and writes it back.
+
+```sql
+UPDATE stock_item
+   SET reserved = reserved + :quantity, updated_at = :at
+ WHERE sku_id = :skuId AND store_id = :storeId
+   AND available >= :quantity
+RETURNING sku_id, on_hand, reserved, available;
+```
+
+`available >= :quantity` rather than a restatement of `on_hand - reserved >= :quantity`, because
+`available` is the schema's one authoritative definition and a `STORED` generated column carries a
+materialised, PostgreSQL-maintained value on every committed row version. (`adjustStock` restates
+the arithmetic as `on_hand + :delta >= reserved`; the reuse here is the preference, not a
+correction.)
+
+#### Why it is safe under READ COMMITTED
+
+`on_hand = 1, reserved = 0, available = 1`. Two customers each request 1.
+
+1. **T1** issues the `UPDATE`. It matches, takes a row lock, writes `reserved = 1`, holds the lock
+   until commit.
+2. **T2** issues the same statement, reaches the same row, finds it locked by an in-progress
+   transaction, and **blocks**.
+3. **T1 commits.**
+4. **T2 unblocks — and does not proceed with the row version it originally read.** Under READ
+   COMMITTED, PostgreSQL re-fetches the newly committed version and **re-evaluates the `WHERE`
+   clause against it**. This is the **EvalPlanQual** mechanism, and it is the behaviour this design
+   relies on. The new version has `available = 0`; `0 >= 1` is false; the row is skipped.
+5. T2's `UPDATE` reports **zero rows**, and the service raises `ReservationInsufficientStock`.
+
+Exactly one succeeds. `available >= 0` is then guaranteed twice over: the predicate never commits
+an update that would breach it, and `ck_stock_reserved_within_on_hand` is a backstop that turns any
+bug in the predicate into SQLSTATE 23514 rather than oversold stock.
+
+The re-evaluation is why read-then-write is not merely slower but **wrong**, and §39 measured it:
+two concurrent `-4` from 5 left 1 and reported BOTH successful, with no constraint violated,
+because every value written was individually legal. **A CHECK constraint prevents negative numbers;
+it does not prevent lost updates.**
+
+#### `SELECT ... FOR UPDATE` is intentionally not used
+
+Not for the single-SKU availability decision. `FOR UPDATE` is what you need when one row's decision
+depends on **reading another row** — pin several rows, then decide. That is not this: a cart line's
+availability is a function of its own `stock_item` row and nothing else, so every decision is a
+single-row decision and the conditional `UPDATE` covers it.
+
+Using it here would actively hurt. It puts the arithmetic back in JavaScript — the shape §39
+measured losing updates — and holds locks across application think-time, which §39 measured at
+roughly double the wall clock.
+
+### The `FOR UPDATE` divergence, recorded
+
+§39 wrote, when deferring this work, that it would be _"the increment that will need `FOR
+UPDATE`"_. **It did not, and this increment deliberately diverges from that expectation.** The
+divergence was raised in the design review, argued on the grounds above, and **explicitly
+approved** — it is a decision, not an omission, and not an oversight to be tidied up later.
+
+The boundary is precise. `FOR UPDATE` or another multi-row locking strategy becomes **necessary**
+the moment a rule spans stock rows:
+
+- **kits and bundles** — reserving A is only legal if B is also available;
+- **multi-location allocation** — an all-or-nothing choice across several `stock_item` rows;
+- **any rule where one stock row's decision depends on another stock row's state.**
+
+At that point `reserveForSku` is the wrong primitive and the increment introducing such a rule must
+revisit it rather than layering onto it. That is written on the method itself as well as here, so
+whoever adds the first bundle finds it.
+
+### Deadlock prevention: ascending `sku_id`, sequentially
+
+The real hazard is not the single-row race but a multi-SKU cart. Cart 1 holds [A, B]; cart 2 holds
+[B, A]. Unordered, T1 takes A and waits for B while T2 takes B and waits for A; PostgreSQL detects
+the cycle and kills one with SQLSTATE 40P01, which surfaces as a 500 rather than a 409.
+
+**All reservation operations acquire `stock_item` row locks in ascending canonical `sku_id`
+order.** Every transaction therefore acquires locks in the same total order, no wait cycle can
+form, and the later transaction simply blocks and then re-evaluates as above. Three details are
+load-bearing:
+
+- **`sku_id`, not `sku_code`.** The id is the row being locked. Sorting by code is a
+  plausible-looking bug that only manifests when two SKUs' code order and id order disagree — so a
+  test uses exactly that fixture.
+- **Sequential, never `Promise.all`.** The guarantee is about the order statements are ISSUED in.
+  Concurrent issue abandons it while looking like a harmless speedup, so it is forbidden in the
+  reservation loop and the prohibition is written at the loop.
+- **Releases sort too.** The settle statement is one multi-row `UPDATE` and rows for different
+  orders never contend (the PK leads on `order_id`), but the subsequent counter decrements must be
+  ordered as well — two cancellations of different orders sharing SKUs could otherwise deadlock.
+
+**This ordering is a correctness requirement, not an optimisation.** A test runs six rounds of
+opposite-order carts concurrently and asserts that no outcome is a 500 — every result must be a 201
+or a 409. Without the sort it fails intermittently, which is the point of running it repeatedly.
+
+No quantity aggregation is needed before sorting: `pk_cart_line` is `(cart_id, sku_id)`, so a cart
+cannot hold two lines for one SKU and neither can an order.
+
+### The checkout transaction boundary
+
+Reservation happens **inside the same transaction as checkout**, and its position within it is
+forced rather than chosen:
+
+| Step | What                                                                                         |
+| ---- | -------------------------------------------------------------------------------------------- |
+| …    | lock cart, reject empty, reject unpurchasable lines, load address, price, re-price promotion |
+| 14   | `markCheckedOut` CAS                                                                         |
+| 15   | insert order header (savepoint, order-number retry)                                          |
+| 16   | insert order lines                                                                           |
+| 16b  | **reserve**                                                                                  |
+| 17   | status history                                                                               |
+| 18   | audit                                                                                        |
+| 19   | `idempotency.complete`                                                                       |
+
+- **After the order header exists**, because `fk_stock_reservation_order_store` references
+  `order (id, store_id)`. That is what fixes the position; it was not a preference.
+- **Outside the step-15 savepoint**, so an order-number collision retries only the header insert.
+  Reserving inside it would re-run on every retry.
+- **After the `markCheckedOut` CAS**, so a losing concurrent checkout cannot take stock it is about
+  to roll back.
+- **Before `idempotency.complete`**, so a completed key always implies a fully reserved order.
+
+**Insufficient stock rolls back the entire checkout transaction** — the counter increments already
+made, the order header, its lines, and the cart transition, all together. The accepted cost is that
+a refused checkout consumed an order number and wrote rows that were then discarded. That is the
+right trade: it is one transaction, and the alternative — an advisory availability check before
+step 15 — returns an answer that is stale the instant it arrives, which is the reasoning §39 used
+to refuse availability checks in the first place.
+
+**No partial order and no partial reservation.** The first line that cannot be held throws, and
+reservation rows are inserted only after every counter increment has succeeded, so a failed
+checkout never leaves a `held` row behind even momentarily. This matches the existing rule that one
+unpurchasable line refuses the whole checkout.
+
+Both port operations assert `isInTransaction()` and raise `InvariantViolation` otherwise, the same
+guard `lockCartForCheckout` uses — a reservation that outlived a rolled-back checkout would hold
+stock for an order that does not exist.
+
+### Failure, rollback and idempotency
+
+| Case                                     | Outcome                                                                                   |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Same key, same payload, already complete | Middleware replays the stored 201; **the handler never runs**. Cannot reserve twice       |
+| Same key, still in flight                | `409 IDEMPOTENCY_CONFLICT`. Nothing reserved                                              |
+| Same key, different payload              | `422 IDEMPOTENCY_KEY_REUSE`. Nothing reserved                                             |
+| Concurrent same-key requests             | The unique index lets exactly one claim; the other is in-flight. One reservation          |
+| Failure after reserving                  | Whole transaction rolls back: counter increments **and** reservation rows vanish together |
+
+**Retry after a rollback is allowed, through the existing lifecycle unchanged.** The claim is made
+on a separate connection (§36), so it survives the rollback, and the middleware releases it after
+the response — so a retry proceeds, mints a **new** `order_id`, and reserves afresh. That is
+correct: the first attempt's reservation no longer exists. `pk_stock_reservation` does not prevent
+this and should not.
+
+`pk_stock_reservation` is the structural backstop for the case idempotency does not cover: a code
+path that reserved twice for one order within a single transaction fails loudly instead of silently
+double-counting.
+
+**Duplicate or concurrent webhook delivery cannot settle twice.** Four guards, three of them
+pre-existing: `isTerminal` returns early, `uq_payment_event_provider` rejects a repeated
+`provider_event_id`, `applyTransition` is a CAS on `from_status`, and settlement is itself a CAS on
+`status = 'held'`. Settlement runs only after `applyTransition` returns true, so a duplicate
+performs **zero** counter changes — asserted by comparing `settled_at` across two deliveries, since
+a re-settlement would re-stamp it.
+
+### Payment interaction
+
+No payment semantics changed. No new state, no new transition, no write to `order.status` — §43's
+separation of state spaces holds.
+
+| Payment transition     | Reservation         | Counter         |
+| ---------------------- | ------------------- | --------------- |
+| `pending -> succeeded` | `held -> committed` | unchanged       |
+| `pending -> failed`    | `held -> released`  | `reserved -= q` |
+| `pending -> expired`   | `held -> released`  | `reserved -= q` |
+| order cancelled        | `held -> released`  | `reserved -= q` |
+
+Settlement is invoked after the existing `applyTransition` CAS succeeds — that CAS is what proves
+this delivery performed the transition — and is keyed by `locked.order_id`, taken from the payment
+row the provider reference resolved to. **Never from the webhook payload**, which is exactly how
+the store is resolved too.
+
+**Payment expiry is not implemented.** There is no `expires_at` column and no sweeper, so nothing
+writes `payment.status = 'expired'` and the `payment_expired` release path is unreachable. The
+expiry window and the sweeper cadence are unapproved business decisions; inventing either was
+explicitly out of scope. **Expiry does not work today** — the vocabulary exists so the increment
+given a window adds a caller, and §3 #13's warning that _"two schedulers running the reservation
+sweeper release stock twice"_ becomes live guidance at that point rather than a forward reference.
+
+> **Superseded by §45 (Increment 36).** Expiry now exists: a 30-minute window on
+> `payment.expires_at`, swept every minute by the leader-elected scheduler, releasing held
+> reservations with `payment_expired`. The paragraph above is left as written because its
+> reasoning is why the vocabulary was ready — the caller was the only missing piece, and §3 #13's
+> warning is now live guidance rather than a forward reference. **COD is still excluded**, so the
+> COD limitation below stands unchanged.
+
+Two ports carry this across the module boundary, both declared by the consumer and adapted in
+`container.ts`, as `OrderPayments` already is: `OrderReservations` (reserve, release) for orders,
+`PaymentReservations` (commit, release) for payments. Payments has no reserve capability and cannot
+name a SKU; orders has no commit capability, because committing is caused by a payment succeeding.
+`no-cross-module-imports` holds by construction — depcruise reports 0 violations across 153
+modules.
+
+### COD: a known limitation, not a feature
+
+**Checkout is method-agnostic**, because the payment method is chosen later, at `POST
+/users/me/orders/{orderNumber}/payments`. At reservation time there is no such thing as a COD
+order. Reservations are therefore created for every order **before** the method is selected.
+
+A COD payment is created `pending`, and **no code path in this codebase transitions it** — there is
+no delivery confirmation, and the only writer of `succeeded`/`failed` is the Razorpay webhook,
+keyed on a `provider_ref` a COD payment does not have. Two consequences already existed before this
+increment: a COD payment stays `pending` indefinitely, and cancellation is therefore refused for
+every COD order with `PAYMENT_IN_PROGRESS`.
+
+This increment adds a third: **a COD order's reservation can remain `held` indefinitely**, holding
+stock with no release path.
+
+**No COD settlement behaviour was invented.** There is no COD wiring in the container, no
+commit-on-initiation, and no delivery endpoint — each would have been inventing COD semantics, which
+the approved scope forbade. The three candidate answers (commit at checkout; commit on a future
+delivery confirmation; hold until an operator acts) are materially different, and one of them
+contradicts the ownership model above.
+
+**This is a known limitation and an open business decision, not a completed COD feature.** A test
+asserts the current behaviour and is labelled a tripwire for the decision — it must change when the
+decision is made, and it is not an endorsement of the present state.
+
+### Ledger and audit
+
+**No `stock_ledger` change of any kind** — see _Inventory semantics_ for why none was possible or
+needed.
+
+Reservation history is the `stock_reservation` lifecycle fields themselves: `held_at`,
+`settled_at`, `settled_reason`, and the terminal `status`. Append-only in effect — written once,
+settled once, never deleted — which is the same shape `order_status_history` and `payment_event`
+have.
+
+**No new audit actions were added.** `order.placed`, `order.cancelled`, `payment.succeeded` and
+`payment.failed` already mark every moment a reservation changes state, and they remain the
+surrounding business audit trail. Per-SKU audit entries would multiply audit volume by cart size
+for no information the reservation rows do not already carry. Nothing was invented here that was
+not implemented.
+
+### API boundary
+
+**No new endpoint** — customer or admin. The lifecycle is owned entirely by existing operations:
+checkout creates reservations, cancellation releases them, the payment webhook commits or releases
+them. The OpenAPI document still describes **61 operations across 43 paths**, unchanged.
+
+One contract change on an existing endpoint, and it is documented: **`POST
+/users/me/checkout`'s `409` now includes `INSUFFICIENT_STOCK`**, whose `details.skuCodes` names the
+offending lines. The whole checkout fails; there is no partial order. A client that treated `409` as
+"unchanged, retry later" needed to know this one keeps failing until stock exists.
+
+**No public availability endpoint was added.** §39 withheld public stock signals because _"without
+reservations, a displayed 'in stock' cannot be held for the duration of a checkout that does not
+exist yet"_. That objection is now gone, which makes the question newly answerable — but it is a new
+public promise with its own caching and staleness semantics and belongs to its own increment.
+
+### A test-fixture finding worth recording
+
+`giveSku` was extended with an **opt-in** `onHand`, not a defaulted one, and the first attempt got
+this wrong in a way worth writing down.
+
+Defaulting stock creation in the shared fixture **broke 64 of the inventory suite's 68 tests** with
+`stock_item_pkey` violations. That suite is _about_ the projection's lifecycle — it inserts its own
+`stock_item` rows and asserts that a SKU starts with none — so a fixture that silently pre-created
+them changed the meaning of the suite rather than merely its setup.
+
+The resolution: `giveSku` creates a `stock_item` row **only when a quantity is asked for**.
+Checkout-performing suites (orders, cancellation, payments) pass one explicitly; catalogue, cart and
+inventory keep their previous fixture exactly.
+
+That leaves a deliberate product behaviour, and it is not an accident of the fixture: **a SKU with
+no `stock_item` row is treated as unavailable, not auto-created during checkout.** Zero rows from
+the reserve statement means insufficient stock, a missing projection row, or a SKU outside the
+store — indistinguishable by design, exactly as in `adjustStock`. Checkout has already proven the
+SKU is live and in-store, and a missing row means zero available, so all three answer a clean `409`
+naming the code. Creating inventory rows as a side effect of a customer checkout was rejected: the
+correct fix for a never-adjusted SKU is to wire `initialiseStockForSku` into SKU creation, where it
+already exists unwired, and that is its own decision.
+
+A related finding, and a second confirmation of the fault §43 recorded: **`sku` now has four
+referencing keys** — `stock_item`, `cart_line`, `order_line` and `stock_reservation` — and the
+hard-delete constraint test silently moved between three of them as it was isolated, passing each
+time on a key it was not testing. Two of the new reservation constraint tests did the same: a
+non-`held` status with a null `settled_at` trips `ck_stock_reservation_settled_at` before the
+status vocabulary is ever checked, and a `settled_at` built in JavaScript is EARLIER than the
+column's `now()` default, so `ck_stock_reservation_settled_after_held` fires first.
+
+Every new reference to a table, and every CHECK that pairs two columns, degrades an existing
+constraint test unless the row is isolated. §43's rule stands and grew a second confirmation: _a
+test asserting a database refusal must assert the constraint NAME, and must isolate the row so
+that no other constraint can be the one that refuses._
+
+One case cannot be isolated and is documented instead: a wrong `store_id` violates the order's
+composite key and the SKU's at once, because one column feeds both. That test asserts the shared
+`fk_stock_reservation_` prefix — enough to prove a composite key refused it rather than the plain
+store key or a CHECK, without pinning an order PostgreSQL does not guarantee.
+
+### Verification
+
+Recorded as actually executed, not as intended.
+
+| Check                                | Result                                            |
+| ------------------------------------ | ------------------------------------------------- |
+| Full test suite                      | **1,703 passed**, 57 files, **exit 0**, 528.92s   |
+| `pnpm format:check`                  | exit 0                                            |
+| `pnpm lint`                          | exit 0                                            |
+| `pnpm typecheck` (3 configs)         | exit 0                                            |
+| `pnpm depcruise`                     | exit 0 — **0 violations**, 153 modules / 629 deps |
+| `pnpm build`                         | exit 0                                            |
+| `pnpm db:generate`                   | exit 0 — "No schema changes, nothing to migrate"  |
+| `pnpm exec drizzle-kit check`        | exit 0 — "Everything's fine"                      |
+| Migration                            | **18 applied**; Neon reports **28 tables**        |
+| `stock_reservation` constraints live | 16                                                |
+| OpenAPI                              | 61 operations / 43 paths, unchanged               |
+
+**One honesty note on the suite.** The green run was `vitest run --fileParallelism=false`. Plain
+`pnpm test` in parallel mode failed on this machine for environmental reasons — a Docker daemon
+outage mid-run (`Could not find a working container runtime strategy` ×28, daemon 500/502/409) and,
+on other attempts, `Memory allocation error` and worker-fork crashes across modules unrelated to
+this work, with the same files passing in isolation. That is a host-capacity problem, not a code
+problem, but the parallel run is not currently reliable here and the sequential figure is the one
+that was verified.
+
+The test count rose from 1,668 to 1,703 (+35). The concurrency claim is proven against real
+PostgreSQL via Testcontainers, never a mock: stock 1 with two different customers checking out
+through `Promise.all` yields exactly `[201, 409]`, one order, one reservation and `available = 0`;
+five units against six simultaneous buyers yields exactly five successes.
+
+### What this increment does NOT do
+
+**Deferred, explicitly:**
+
+- **Payment expiry and the sweeper** — no `expires_at`, no scheduled job. Needs the window and the
+  cadence approved. `payment_expired` is defined and unreachable. **Delivered by §45.**
+- **COD settlement and delivery confirmation** — see _COD_ above. The open decision, not an
+  omission to be patched.
+- **Fulfilment / shipment** — the decrement of `on_hand`, its `stock_ledger` movement, the new
+  technical reason, the `actor_user_id` widening for a system actor, and a `fulfilled` reservation
+  state. All five belong together, to that increment.
+  _(Delivered in §46, with one revision: `actor_user_id` was NOT widened — manual fulfilment has
+  a staff actor, so a system actor stays deferred with the provider.)_
+- **Public availability** — no stock figure on any public payload.
+- **Reservation admin endpoints** — no per-order reservation view, no manual release override. The
+  correct fix for a stuck reservation is to resolve its order or payment; `GET /admin/inventory`
+  already reports `reserved` and `available`.
+- **Multi-location inventory** — the seam is still §39's: a `location_id` on both inventory tables
+  plus a widened `stock_item` primary key, and now a widened `stock_reservation` key as well.
+- **Reconciliation and repair tooling** — the invariant is asserted by a test, but nothing can
+  rebuild `reserved` from `stock_reservation` if it ever diverged. This increment adds a second
+  projection depending on the tooling §39 already deferred.
+- **Refunds and returns** — unchanged from §43 and the payment increment.
+- **Shipping, GST and tax** — unchanged from §43. No rate, carrier, HSN/SAC, place of supply or
+  GSTIN.
+
+**Not deferred but worth naming, because this increment surfaced it without creating it:** a
+payment can still succeed against a cancelled order — the webhook does not check order status. The
+stock consequence is now visible (the reservation was released, so the commit finds nothing to
+commit) but the underlying gap predates this work and fixing it is a payment-semantics change.
+
+---
+
+## 45. Phase 3 increment 36 — payment expiry
+
+The caller §44 said was the only missing piece. `expired` had a state, a CHECK, a transition, an
+audit action and a reservation reason; this increment adds a column, an index, one service
+method, a sweeper, and one entry in a scheduler task list that had been empty since Phase 0.
+
+Nothing else changed. No new state, no new endpoint, no new dependency, no new scheduler, no
+change to the payment API, and no COD behaviour.
+
+### The approved decisions
+
+| #   | Decision                | Value                                                       |
+| --- | ----------------------- | ----------------------------------------------------------- |
+| A   | Online expiry window    | **30 minutes**                                              |
+| B   | Sweeper cadence         | **every 60 seconds**                                        |
+| C   | Scope                   | **`method = 'online'` only**                                |
+| D   | Late provider success   | **local expiry wins; the webhook is ignored**               |
+| E   | Lock order              | **order → payment**, so expiry serialises with cancellation |
+| F   | Retry after expiry      | **not included.** `uq_payment_order` stands                 |
+| G   | `expires_at` visibility | **not exposed through any API**                             |
+| H   | Window anchor           | **exactly 30 minutes after initiation**                     |
+
+Every one of these is a business decision that was approved before implementation, and none was
+chosen here.
+
+### `expires_at`, and why it is a column
+
+`timestamptz`, nullable, stamped once at initiation.
+
+Deriving eligibility from `created_at + window` at query time was rejected for three reasons: it
+bakes the window into every query that asks; it makes the window unchangeable for payments
+already in flight, so a configuration change would silently move deadlines customers had already
+been given; and it leaves nothing on the row explaining why something expired. A column answers
+all three — a payment keeps the window it was given, and the row says what it was.
+
+**Nullable, and deliberately not `NOT NULL` for online payments.** NULL means "never expires",
+which is exactly right for COD and for the one historical online payment that predates the
+column. A biconditional (`expires_at IS NOT NULL ⟺ method = 'online'`) would have required
+backfilling a window for a row whose window nobody can now reconstruct, and would refuse a
+future non-expiring online method. The service guarantees a fresh online payment gets one; the
+database guarantees COD never does:
+
+```sql
+CHECK (expires_at IS NULL OR method = 'online')   -- ck_payment_expires_at_only_online
+```
+
+One direction only, and that direction is the one that matters: it makes an expiring COD payment
+**unrepresentable**, not merely unwritten. Without it, a future caller stamping `expires_at` on a
+COD payment would have introduced COD settlement by the back door — the single thing this
+increment was told not to invent.
+
+### The index, and why it is not store-leading
+
+```sql
+CREATE INDEX ix_payment_expiry_due
+  ON payment (expires_at)
+  WHERE status = 'pending' AND expires_at IS NOT NULL AND method = 'online';
+```
+
+`ix_payment_store_status` cannot serve this query and that is the whole reason a new index
+exists: it leads with `store_id` and carries no time column, so a cross-tenant sweep would
+degrade to a scan plus a filter.
+
+**Not store-leading**, because the sweeper is one leader-elected task serving every store. This
+is the only unscoped read in the codebase, and it is safe for a specific reason: it returns
+**ids only**, and every subsequent write is scoped by the `store_id` on the row it locked — never
+by anything a caller supplied. Tenancy moves from the read to the write rather than being
+dropped.
+
+Partial on all three predicates the query carries, so it holds only rows that can ever be due and
+shrinks as payments terminalise. A store with a million paid orders contributes nothing to it. A
+test asserts the index exists and, with `enable_seqscan = off`, that the candidate query's plan
+actually names it — on a table of a few rows a sequential scan is genuinely cheaper, so without
+disabling it the plan would say nothing about whether the index is usable.
+
+### The window is stamped once, from configuration
+
+`PAYMENT_EXPIRY_MINUTES=30`, validated by Zod as a positive integer — a zero or negative window
+would expire a payment the instant it was created. The service receives the **value**, not the
+config object, the same way the mailer receives `resetUrlBase` alone.
+
+`initiate` captures one `initiatedAt` and derives the window from it, rather than calling
+`new Date()` wherever a timestamp is needed. That is what makes the window exactly 30 minutes
+from a single instant, and it is the one seam a test needs.
+
+**The client cannot influence it.** `InitiatePaymentRequestSchema` is a `strictObject` whose only
+field is `method`, so an `expiresAt` in the body is a 400 naming the field — asserted by a test,
+rather than assumed from the schema.
+
+**`expires_at` is not in `PAYMENT_COLUMNS`**, and that is how decision G is enforced. Every read
+path selects that list explicitly, so the field is not merely omitted from a DTO — no query
+returns it, and it cannot reach a response body through a mapper somebody widens later. The
+sweeper does not need it either: it selects ids and re-reads status under a lock.
+
+### The expiry transaction, and the lock order
+
+One transaction per payment:
+
+```
+1. SELECT … FROM "order"  WHERE id = :orderId  FOR UPDATE
+2. SELECT … FROM payment  WHERE id = :paymentId FOR UPDATE
+3. re-read status from the locked row
+4. isTerminal      -> ignored/already_terminal, no writes
+5. canTransition   -> ignored/illegal_transition
+6. INSERT payment_event (pending -> expired, actor system, provider_event_id NULL)
+7. UPDATE payment … WHERE status = 'pending'        -- the existing CAS
+8. reservations.releaseForOrder(reason: payment_expired)
+9. audit.record(PAYMENT_AUDIT.expired, actor system)
+COMMIT
+```
+
+**The order lock comes first, and it is the entire reason expiry serialises with cancellation.**
+Cancellation locks the order and then reads payment status **without a lock** —
+`findStateByOrderId` is a plain `SELECT`, which the inspection confirmed. So if expiry took only
+the payment lock the two would not serialise at all: a customer could be refused a cancellation
+on a stale `pending` read while this transaction was turning that same payment `expired`.
+
+The webhook takes only the payment lock and never the order, so no wait cycle can form and no
+deadlock is possible. The global order this increment establishes is:
+
+```
+order -> payment -> stock_reservation -> stock_item
+```
+
+`provider_event_id` is NULL on the expiry event because no provider event caused it. Fabricating
+one would pollute `uq_payment_event_provider`, which is what makes webhook redelivery safe.
+`failure_code` stays NULL because an expiry is not a failure — `ck_payment_failure_code_only_when_failed`
+agrees.
+
+### Atomicity, and why the release is inside the transaction
+
+The transition, the history row, the reservation release and the audit entry commit together or
+not at all.
+
+If the release throws — `InvariantViolation`, when `stock_item.reserved` has diverged from
+`stock_reservation` — **everything rolls back**: the payment stays `pending`, no `payment_event`
+survives, no audit entry survives, the reservation stays `held`, and the payment is still
+eligible on the next pass. Nothing catches and continues inside the transaction, because a catch
+there is exactly how a partial state gets committed.
+
+That is asserted by provoking a real divergence rather than by mocking one: the reservation row
+is left `held` while the projection is zeroed, so `releaseForSku` matches nothing and the
+inventory service raises. The test then checks all five properties above, including that the
+payment is still returned by the candidate query.
+
+### Concurrency
+
+| Race                           | Resolution                                                                                                                                                                                                                               |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Expiry ∥ webhook success       | Same payment row lock. Whichever terminal transition commits first wins; the loser sees terminal and settles nothing. A test asserts exactly one of the two did the work, and that the reservation settled consistently with whoever won |
+| Two concurrent expiry attempts | Row lock serialises them; the `status = 'pending'` CAS admits one. One `expired`, one `ignored`, and `reserved` moves once                                                                                                               |
+| Expiry ∥ cancellation          | Serialised by the order lock. Either outcome is legal — cancellation refuses `pending` and permits `expired` — and the reservation is released exactly once either way                                                                   |
+| Webhook after expiry           | `isTerminal` returns early. Nothing is committed, resurrected or recommitted                                                                                                                                                             |
+
+**Correctness does not depend on leader election.** The scheduler guarantees one sweeper, but if
+that guarantee were lost, a second sweeper would produce `ignored` results rather than
+double-releasing stock — the row lock and the CAS are the actual safety, and leadership is an
+efficiency.
+
+### The sweeper reuses the scheduler that was already there
+
+One entry in `TASKS`, which had been empty since Phase 0 and whose header already named this job.
+No BullMQ, no second scheduler, no new dependency. The existing machinery supplies everything:
+leadership re-checked **per task** (it can lapse mid-tick), a `running` set so a slow pass cannot
+overlap itself, per-task error isolation, and graceful shutdown.
+
+`TASKS` moved to below the container construction, because a task now needs it. Its previous
+position above was only possible while the list was empty.
+
+What the sweeper does per pass: read candidate **ids** outside any transaction, then process each
+in its own transaction. Not one transaction for the batch — that would hold a batch's worth of
+order and payment locks against live checkouts, and one poisoned row would roll back every expiry
+beside it. `PAYMENT_EXPIRY_SWEEP_BATCH_SIZE=100` bounds a pass; a larger backlog drains over
+several.
+
+The candidate list is therefore a **hint**, not a decision. A payment can terminalise between the
+read and the lock, which is why `expirePayment` re-reads under the lock and why a lost race is
+counted as `ignored` rather than logged as a failure.
+
+`sweep(now = new Date())` takes the instant as a parameter. That is the only seam the tests need:
+seed `expires_at` in the past, sweep at a chosen `now`, assert. It continues this repository's
+practice of controlling time through **data** — there are no fake timers anywhere in it, and this
+increment did not introduce the first.
+
+The sweeper never throws. A pass that propagated would kill the scheduler tick that called it, so
+each failure is counted and logged at `error` with the payment id — a payment repeatedly failing
+to expire is holding stock and someone has to be able to find it. **Nothing is swallowed
+silently**, and a pass that found nothing logs nothing at all: this runs every minute forever, and
+an idle heartbeat would bury the passes that mattered.
+
+### Late Razorpay success: an accepted financial exposure
+
+**Local expiry is authoritative. Razorpay is never read back.**
+
+The adapter makes exactly one outbound call, `POST /orders`, and keeps only the returned id.
+Nothing else about the provider's own lifecycle is fetched or stored, so the system has no
+information other than its own window — which is why local expiry must be authoritative rather
+than merely convenient.
+
+The consequence, stated plainly because it involves real money: **a payment expired here can
+still be captured at Razorpay.** The late webhook is ignored as already-terminal, the stock stays
+released, the order stays `placed` — and the customer may have been charged with no local record
+of success.
+
+There is deliberately no read-back, no provider-side cancellation, no refund call and no
+reconciliation in this increment; each was explicitly out of scope. **This is a known financial
+and operational exposure requiring manual reconciliation**, and a test pins the behaviour so it
+cannot change silently. The mitigation is operational — a window long enough that a genuine
+customer completes inside it — not technical, and closing it properly is a reconciliation
+increment.
+
+### COD is untouched, and still limited
+
+Nothing about COD changed. No settlement, no expiry, no delivery confirmation, no transition.
+
+Expiry is online-only by decision C, enforced three ways: the service stamps `null` for COD, the
+candidate query filters `method = 'online'`, and `ck_payment_expires_at_only_online` makes the
+alternative unrepresentable. Four tests cover it — COD has a NULL window, the sweeper never
+selects it even at a far-future instant, the payment stays `pending`, and the reservation stays
+`held`.
+
+**§44's COD limitation stands unchanged: a COD order's reservation can remain held indefinitely**,
+because a COD payment has no terminal transition and this increment did not give it one. That is
+still a known limitation and an open business decision, not something this increment quietly
+fixed.
+
+### Retry after expiry is not included
+
+`uq_payment_order` is untouched, so an expired order still cannot be paid again — `POST
+…/payments` returns `409 PAYMENT_ALREADY_EXISTS` exactly as before. No `payment_attempt` table,
+no relaxed constraint, no change to the initiation contract.
+
+That leaves a real dead end: an order whose payment expired has its stock back but no way to pay.
+Fixing it means either one _live_ payment per order or an attempt model, and both change the
+payments API — which makes it its own increment rather than a corner of this one.
+
+### No API change, and no event
+
+No new endpoint. No change to the initiation request or response, the payment response, the order
+response, or `order.status`. `GET` payment endpoints keep showing whatever `status` holds, which
+now includes `expired`; the invoice already rendered that as _Payment failed_.
+
+**No domain event.** `PAYMENT_AUDIT.expired` already existed, unused, and is now written with a
+system actor — audit was ready. An event was deliberately not added: the handler registry has
+exactly one consumer (`user.password_reset_requested`), and §39's rule that _an event with no
+consumer is a guess at one_ has held for six increments. A test asserts the outbox contains no
+`payment.*` event after a sweep — scoped to payment events rather than asserting an empty outbox,
+because registration publishes `user.registered` and a blanket assertion would have been testing
+the fixture.
+
+### The migration
+
+Migration 19, `20260908093306_lying_doctor_faustus.sql`. Additive only: `ADD COLUMN`, `CREATE
+INDEX`, `ADD CONSTRAINT`.
+
+Read before applying, as every generated migration in this project is. The FK-before-index fault
+has appeared six times; there is no foreign key here and the new index is referenced by nothing,
+so nothing needed hoisting — the only ordering that matters is the CHECK following the column it
+constrains, which it does.
+
+`ADD COLUMN` with no default and no `NOT NULL` is metadata-only in PostgreSQL: no table rewrite,
+no long lock. **`CREATE INDEX`, deliberately not `CONCURRENTLY`** — Drizzle runs migrations inside
+a transaction and `CONCURRENTLY` cannot run in one. The table is small so a plain build is
+instant; a large table would need the index created outside the migration runner.
+
+**No backfill, and the live data is why.** Every existing row takes NULL, which is correct: the
+six COD payments are ineligible by decision and the single online payment is already terminal.
+The CHECK validates against all seven rows and passes because all seven are NULL.
+
+Rollback is dropping the constraint, the index, then the column — safe at any time, since nothing
+else references any of the three and losing `expires_at` only stops future expiry. Payments
+already `expired` stay expired, which is correct: their stock was already released.
+
+### Verification
+
+| Check                         | Result                                                                                                                                                                 |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Payments suite (targeted)     | 108 passed, exit 0                                                                                                                                                     |
+| Full suite                    | **1,727 passed**, 57 files, exit 0, 470.40s                                                                                                                            |
+| `pnpm format:check`           | exit 0                                                                                                                                                                 |
+| `pnpm lint`                   | exit 0                                                                                                                                                                 |
+| `pnpm typecheck` (3 configs)  | exit 0                                                                                                                                                                 |
+| `pnpm depcruise`              | exit 0 — 0 violations, 154 modules / 631 dependencies                                                                                                                  |
+| `pnpm build`                  | exit 0                                                                                                                                                                 |
+| `pnpm db:generate`            | exit 0 — "No schema changes, nothing to migrate"                                                                                                                       |
+| `pnpm exec drizzle-kit check` | exit 0 — "Everything's fine"                                                                                                                                           |
+| Live Neon                     | 19 migrations, `expires_at` nullable, `ix_payment_expiry_due` partial on all three predicates, `ck_payment_expires_at_only_online` present, `ck_payment_status` intact |
+| Dependencies                  | unchanged — 17 production, 21 development                                                                                                                              |
+| OpenAPI                       | 61 operations / 43 paths, unchanged                                                                                                                                    |
+
+The full suite was run with `vitest run --fileParallelism=false`. Plain `pnpm test` in parallel
+mode remains unreliable on this machine for environmental reasons recorded in §44 — Docker daemon
+outages and memory pressure, with the same files passing in isolation — and the sequential figure
+is the one that was verified.
+
+Test count rose from 1,703 to 1,727 (+24). Concurrency is proven against real PostgreSQL via
+Testcontainers, never a mock, and the index claim is proven by `EXPLAIN` rather than asserted.
+
+### What this increment does NOT do
+
+**Deferred, explicitly:**
+
+- **COD settlement, COD expiry, delivery confirmation** — §44's limitation stands.
+- **Retry after expiry** — needs either one-live-payment-per-order or an attempt model, and both
+  change the payments API.
+- **Provider read-back, provider-side cancellation, refunds, reconciliation** — the late-capture
+  exposure above is accepted, not solved.
+- **Fulfilment / `on_hand` decrement** — unchanged from §44. Expiry moves `reserved`, never
+  `on_hand`, and writes no `stock_ledger` row.
+- **Public `expires_at`** — decision G. It is not in `PAYMENT_COLUMNS`, so no read path can
+  return it.
+- **Reservation admin endpoints, multi-location inventory, reconciliation tooling** — unchanged
+  from §44.
+- **Shipping, GST/tax, statutory invoicing, returns, order-status redesign, new providers** —
+  unchanged from §43 and §44.
+  _(Shipping delivered in §46 as manual, free fulfilment; GST/tax, statutory invoicing, returns,
+  order-status redesign and new providers all remain deferred.)_
+
+**Not deferred but worth naming again:** a payment can still succeed against a _cancelled_ order,
+because the webhook does not check order status. This increment neither created nor fixed that;
+expiry simply gives it one more shape, since a cancelled order's reservation is already released
+when the late capture lands.
+
+---
+
+## 46. Phase 3 increment 37 — shipping and fulfilment foundation
+
+The fourth state space, and the increment that finally decrements `on_hand`. Two new tables, one
+new reservation state, one new ledger reason, six routes — and no shipping provider, no shipping
+price, and no change to what `order.total` means.
+
+### The approved decisions
+
+| Decision                 | Value                                                                     |
+| ------------------------ | ------------------------------------------------------------------------- |
+| Provider                 | **Manual fulfilment. No provider, adapter, port, credentials or webhook** |
+| Pricing                  | **Free. `shipping_total` is not stored, because it is not charged**       |
+| Methods                  | **One implied method.** No table, no selection, no endpoint               |
+| Free-shipping promotions | **Not included.** The promotion model is untouched                        |
+| Selection timing         | **Not selectable.** Checkout is unchanged                                 |
+| Shipments per order      | **Exactly one**, enforced by `uq_shipment_order`                          |
+| Partial fulfilment       | **Not supported.** No `shipment_item`, no partial quantities              |
+| States                   | `pending -> shipped -> delivered`, separate from `order.status`           |
+| Payment prerequisite     | online must be `succeeded`; **COD may be `pending`**                      |
+| COD                      | No settlement, no transition, no expiry. Fulfilment may proceed unpaid    |
+| Inventory                | `committed -> fulfilled` at shipment: both counters fall, one ledger row  |
+| Cancellation             | A `shipped` or `delivered` shipment blocks it                             |
+| Customer visibility      | status, carrier, tracking number, URL, two timestamps                     |
+| Staff queue              | Narrow, keyset-paged, fulfilment-only                                     |
+| Shipping cost            | Zero, and **`order.total` is not redefined**                              |
+| GST/tax                  | Out of scope                                                              |
+| Staff actor              | `stock_ledger.actor_user_id` stays NOT NULL                               |
+
+None of these was chosen here; all were approved before implementation.
+
+### Why fulfilment state is not `order.status`
+
+The rule already existed, recorded in a migration header:
+
+> _"§43 fixed that `cart.status`, `order.status`, the payment table and a future shipment table
+> stay **four separate state spaces**."_
+
+This is that shipment table, and it holds to it. `order.status` still has two values answering
+one question — has the customer withdrawn the order — and nothing in this increment writes it.
+
+Expanding it was considered and rejected on four grounds. One column cannot carry a carrier, a
+tracking number and two timestamps. It would make the column answer two unrelated questions. It
+would require widening `ck_order_status` plus both `order_status_history` CHECKs and
+re-examining every reader of `CANCELLABLE_ORDER_STATUSES`. And "is this order fulfilled?" is a
+question ABOUT a shipment, answered by joining rather than by mirroring — the same reasoning §39
+used for `available` and §44 for `reserved`.
+
+### The two tables
+
+**`shipment`** — the authoritative record that goods left. `id`, `store_id`, `order_id`,
+`status`, `carrier`, `tracking_number`, `tracking_url`, `shipped_at`, `delivered_at`, timestamps.
+No `deleted_at`: a shipment is historical operational data, and the retention posture that
+forbids deleting an order forbids deleting the record that it shipped.
+
+**`shipment_event`** — append-only transitions, the same shape as `payment_event` and
+`order_status_history`: no `updated_at`, no `deleted_at`, so there is no column with which to
+rewrite the past. It gives `order_status_history.note` — present and unused since §43 — its first
+real analogue: "left with neighbour", "second delivery attempt".
+
+`uq_shipment_order` is **not** store-scoped, deliberately. `order_id` is a UUIDv7 primary key,
+globally unique on its own, so adding `store_id` would weaken the constraint rather than scope
+it: a composite unique would permit two shipments for one order if a caller ever supplied the
+wrong store. Tenancy comes from `fk_shipment_order_store` and from every repository predicate.
+
+Tracking uniqueness is `(store_id, carrier, tracking_number) WHERE tracking_number IS NOT NULL`
+— the shape of `uq_payment_provider_ref`. Store- and carrier-scoped rather than global, because
+two couriers legitimately reuse number formats and two tenants must never collide. A test asserts
+both halves: a duplicate under one carrier is refused, and the same number under a different
+carrier is accepted.
+
+### `pending` earns its place
+
+Creation does not ship. The two are separate calls because moving stock is irreversible and
+should not be a side effect of a request whose body is tracking metadata — and because `pending`
+is the state in which a tracking number can be attached, which is the normal case: a shipment is
+raised when picking starts and the courier is frequently chosen later.
+
+That is why `carrier` and `tracking_number` are nullable, and why the `PATCH` exists at all.
+
+There is deliberately no `packed` (no operational step acts on it), no `failed` and no `returned`
+(returns are out of scope), and no `cancelled` — a shipment that should not have existed is
+corrected by cancelling the order before it ships, and a state nothing can produce looks
+supported to every reader of the enum.
+
+### The inventory lifecycle, completed
+
+§44 promised that _"the fulfilment increment decrements both together and writes the
+`stock_ledger` row for it."_ This is that increment.
+
+| Event                                | `on_hand` | `reserved` | `available`   | ledger              |
+| ------------------------------------ | --------- | ---------- | ------------- | ------------------- |
+| checkout                             | —         | **+q**     | falls         | —                   |
+| payment succeeded                    | —         | —          | —             | —                   |
+| payment failed / expired / cancelled | —         | **−q**     | rises         | —                   |
+| **shipment**                         | **−q**    | **−q**     | **unchanged** | **one row per SKU** |
+
+`available` is unchanged by shipping, and that is correct rather than surprising: the units
+stopped being sellable when they were reserved, not when they left. A test asserts it explicitly,
+because it is the property most likely to look like a bug.
+
+The reservation gains one terminal state, `committed -> fulfilled`, with `settled_reason`
+`shipment_fulfilled`. `held -> fulfilled` and `released -> fulfilled` are illegal, and `fulfilled`
+is absorbing.
+
+**`fulfilled_at` is a new column, not a re-stamp of `settled_at`.** `committed -> fulfilled` is a
+second settled-to-settled move, and overwriting would destroy the fact that matters most: when
+the sale was committed. An auditor needs both instants — when the units stopped being sellable,
+and when they left the building — and one timestamp can hold only one.
+
+The reconciliation invariant is unchanged, which is the point of decrementing `reserved` in the
+same statement: `SUM(quantity) WHERE status IN ('held','committed') = stock_item.reserved` still
+holds, because `fulfilled` rows drop out of the sum exactly as the counter drops. The partial
+index `ix_stock_reservation_sku_outstanding` needed no change for the same reason.
+
+### `stock_ledger` gains exactly one reason
+
+`shipment`. The first non-manual reason, and still a MECHANISM rather than an accounting
+treatment — which is why it belongs in a vocabulary that still excludes `damage`, `shrinkage` and
+`write_off`.
+
+One row per shipped SKU, negative delta, with `on_hand_before`/`on_hand_after` taken from the
+SAME statement that moved the counter, so the pair cannot come from two reads. A test asserts the
+row's arithmetic against the column it moved.
+
+**`actor_user_id` stays NOT NULL.** That column's comment anticipated a system actor for order
+allocation; manual fulfilment does not need one, because every shipment is despatched by an
+authenticated staff member. A provider webhook would be the first system actor and would need its
+own decision — deferred with the provider.
+
+### COD: an authorised unpaid fulfilment path
+
+The hardest coupling in the increment, and the one the approved rules had to resolve explicitly.
+
+A COD payment is created `pending` and no code path terminalises it, so its reservation sits
+`held` forever. Requiring `committed` would make COD unshippable and therefore unsellable.
+`held -> fulfilled` is deliberately illegal. Inventing a payment transition was forbidden.
+
+**The mechanism:** when a COD order ships, fulfilment performs `held -> committed` with
+`settled_reason = 'cod_fulfilment'` first, then `committed -> fulfilled`, both inside the shipping
+transaction. Two reservation transitions, one transaction, and **no payment write of any kind** —
+no status change, no `payment_event`, no audit entry against the payment.
+
+The reason is `cod_fulfilment` and NOT `payment_succeeded`, deliberately: the money has not been
+received, and a reason claiming otherwise would misreport an unpaid sale as a paid one. The
+capability is carried by a flag named `allowUncommittedCod` — named for what it permits rather
+than for its caller, so it cannot be passed casually: it means _this order may ship without its
+money having arrived_.
+
+**This is not COD settlement.** A COD payment remains `pending` after delivery, a COD order
+remains uncancellable for the reason §44 recorded, and the settlement dependency is still open. A
+test asserts the payment is untouched after shipping, and exists to keep that true.
+
+### The payment prerequisite
+
+| Method   | Status                           | May fulfil |
+| -------- | -------------------------------- | ---------- |
+| `online` | `succeeded`                      | yes        |
+| `online` | `pending` / `failed` / `expired` | no — `422` |
+| `cod`    | `pending`                        | **yes**    |
+| _(none)_ | —                                | no — `422` |
+
+Checked at BOTH creation and shipping. Not required by the rule, but it stops staff building a
+queue of shipments that can never ship, and surfaces an unpaid order when someone first tries to
+act on it. The COD branch is written positively rather than assuming `pending` is the only
+possible COD status, so a future settlement increment fails loudly here instead of silently
+taking the unpaid path.
+
+### The lock order, extended
+
+```
+order -> payment -> shipment -> stock_reservation -> stock_item
+```
+
+The ORDER lock always comes first. Cancellation already locks the order and reads shipment state
+without a lock; taking the order lock here is what makes the two serialise.
+
+**The ship and deliver routes address a SHIPMENT, which creates a problem the lock order does not
+solve on its own**: something must be read before any lock can be taken. The resolution is a
+single unlocked read of `shipment.order_id`, which is safe precisely because that column is
+IMMUTABLE — no statement anywhere updates it, and a shipment cannot move between orders. Nothing
+is decided from that read; the order is locked, the shipment is re-read locked, and every decision
+comes from the locked copy.
+
+The payment webhook and the expiry sweeper never take a shipment lock, and nothing here takes a
+payment lock before an order lock, so no wait cycle is possible.
+
+### Atomicity: inventory moves before the CAS
+
+The order is deliberate. Inventory is moved, and only then does the shipment CAS `pending ->
+shipped`. If the movement throws — a divergent projection, a released reservation, an order
+holding no reservation — the transaction rolls back and the shipment is still `pending`, so it can
+be retried once the cause is fixed.
+
+**A shipment is never `shipped` with the stock movement incomplete.** A test provokes a real
+divergence — the reservation left `committed` while the projection is zeroed — and asserts all
+five properties: the shipment stays `pending` with a null `shipped_at`, only the creation event
+row survives, no ledger row survives, no `shipment.shipped` audit entry survives, and the
+reservation is still `committed` and therefore retryable.
+
+Because there is one shipment per order and no partial fulfilment, the operation fulfils the
+COMPLETE reservation or throws. There is no partial state to represent.
+
+### Concurrency
+
+| Race                                 | Resolution                                                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Two staff creating a shipment        | `uq_shipment_order`. One `201`, one `409`, one shipment, one event                                                                          |
+| Two staff shipping the same shipment | Shipment row lock + CAS on `from_status`. One `200`, one `409`, **one stock movement, one ledger row, one event**                           |
+| Two staff delivering                 | Same CAS. `delivered_at` never re-stamped                                                                                                   |
+| Cancellation vs shipping             | Both take the ORDER lock first → serialised                                                                                                 |
+| Payment expiry vs shipping           | Both take the ORDER lock first → serialised. If expiry wins, the reservation is released and fulfilment finds nothing committed and refuses |
+| Staff of another store               | `404`. Every predicate carries `store_id`, from the token                                                                                   |
+
+**No `Idempotency-Key` anywhere in this module.** Creation is guarded by a unique constraint —
+a constraint doing the work a header would only approximate — and the transitions by a row lock
+plus a CAS. Adding the header would be ceremony on top of guarantees that already hold. The
+existing infrastructure is unchanged.
+
+### Cancellation
+
+A `shipped` or `delivered` shipment blocks cancellation, checked under the ORDER lock the
+cancellation transaction already holds. It runs BEFORE the payment check, because it is the more
+final answer: a shipped order stays shipped, where an unpaid one may become payable, and a
+customer whose goods are in transit should be told that rather than told about their payment.
+
+**A `pending` shipment does NOT block.** Nothing has moved, so refusing would trap a customer
+whose order a staff member had merely started picking. The pending shipment is then left behind as
+an operational fact that can never ship, because the ship path refuses a cancelled order — a
+consequence asserted by a test rather than left to be discovered.
+
+Returns and cancellation-after-shipment refunds are not implemented.
+
+### Money, and what `order.total` still means
+
+**`order.total = subtotal - discount_total`, unchanged**, and `ck_order_total_identity` still
+enforces it in the database. No `shipping_total`, no `grand_total`, no change to what payments
+charge.
+
+Shipping is free in this increment, so there is no shipping amount to store — and a zero-valued
+column would be a field with no reader, which is what §24's `product.price` mirror taught. When
+shipping is charged, the additive shape is a `shipping_total` plus a `grand_total` with its own
+identity CHECK, leaving `ck_order_total_identity` untouched; that was designed during the
+inspection and deliberately not built.
+
+No `Number()` arithmetic was introduced. The custom `no-money-arithmetic` ESLint rule makes it
+impossible outside `shared/money.ts`, and this module handles no money at all.
+
+### The tax boundary
+
+No GST, no HSN/SAC, no place-of-supply, no rates, no statutory invoice change.
+
+What is preserved for the future tax increment, without implementing any of it: the order's
+immutable nine-column address snapshot (untouched), the carrier and tracking as text on the
+shipment, and `shipped_at` — the date a rate would be a function of. Those are stored as facts at
+the moment they are true, exactly as `order_line` snapshots `sku_name` and `unit_price`.
+
+One gap the inspection surfaced and this increment does not close: **there is no origin address
+anywhere in the codebase** — no warehouse, no store address, no `location_id`. Place of supply
+needs both endpoints, and the destination is the only one that exists. That is a tax-increment
+prerequisite, recorded here rather than guessed at.
+
+### Audit, and no events
+
+Four audit actions: `shipment.created`, `shipment.shipped`, `shipment.delivered`,
+`shipment.tracking_updated`. The last one is there because a tracking number is a
+CUSTOMER-VISIBLE fact, and a correction to one is precisely what an audit trail exists for.
+
+**No domain event.** The outbox handler registry still has exactly one consumer, and §39's rule
+has held for eight increments: an event with no consumer is a guess at one. `shipment.shipped` is
+the most obviously event-worthy thing here — "your order has shipped" is the notification every
+shop sends, and the mail infrastructure already exists — which is exactly why it must not get a
+speculative one: the consumer is one increment away, not zero, and the event should ship WITH it
+so its payload is designed against a real reader. A test asserts the outbox holds no `shipment.*`
+event.
+
+Tracking corrections write no `shipment_event` row: nothing about fulfilment STATE changed, and
+putting a non-transition into an append-only history of transitions would corrupt what that table
+means.
+
+### The API
+
+Six new operations, taking the documented surface to **68 operations across 49 paths**.
+
+| Method       | Path                                       | Access   |
+| ------------ | ------------------------------------------ | -------- |
+| `GET`        | `/users/me/orders/{orderNumber}/shipments` | Customer |
+| `GET`        | `/admin/orders/fulfilment`                 | Staff    |
+| `POST` `GET` | `/admin/orders/{orderNumber}/shipments`    | Staff    |
+| `POST`       | `/admin/shipments/{id}/ship`               | Staff    |
+| `POST`       | `/admin/shipments/{id}/deliver`            | Staff    |
+| `PATCH`      | `/admin/shipments/{id}`                    | Staff    |
+
+No existing contract changed. Checkout, the payment endpoints, the order responses and
+`order.status` are all untouched.
+
+**Action endpoints, not `PATCH {status}`** — the reasoning §26 recorded for product
+publish/archive. With a status field, `{"status":"delivered"}` on a pending shipment is a request
+the server must accept, validate and refuse; with action routes there is no route to call, so it
+is unrepresentable. The `PATCH` that does exist has no `status` field in its schema and cannot
+reach the column.
+
+The customer response carries six fields and no shipment id, no order id, no note and nothing
+about inventory. It is built by an explicit mapper rather than by spreading the record, so a
+column added later cannot reach a customer by default.
+
+The staff queue is narrow by construction: the predicate is exactly "work to do", and there is no
+customer search, no status filter, no date range and no free text — each would be a `400` from
+the `strictObject` rather than a silently ignored parameter. Keyset-paged on `(placed_at,
+order_number)` rather than OFFSET, because a queue is worked from the front while rows leave it
+and OFFSET would skip orders as earlier ones ship.
+
+**Existing staff authorization was sufficient.** `requireScope('staff')`, re-derived from the
+database on every request. No role table, no fulfilment permission, no role management — that
+would have been a different increment.
+
+### Two findings worth recording
+
+**`z.string().url()` accepts `javascript:alert(1)`.** Found by a test that expected a `400` and
+got a `201`. `trackingUrl` is rendered as a customer-facing link, so a scheme-less URL validator
+is a stored-XSS delivery route — and the invoice's `esc()` does not help, because escaping a
+href's text does not neuter its scheme. The field now allow-lists `http` and `https` explicitly,
+with `.url()` kept for the clear message on malformed input.
+
+**`String.replace` corrupted `docs.ts`.** The OpenAPI block contained `pattern: '^ORD-…{6}$'`, and
+`$'` is a replacement pattern meaning "the portion after the match" — so a single `.replace()`
+spliced the file's own tail in four times, taking it from 5,500 lines to 17,689. Repaired by
+rebuilding from the known-clean head and tail and concatenating rather than replacing. The lesson
+is narrow and worth having: **never pass generated code through `String.replace` as the
+replacement argument**; use a function replacement or plain concatenation.
+
+### The migration, and the seventh appearance of a known fault
+
+Migration 20, `20260908101813_flowery_dust.sql`.
+
+**Drizzle emitted `fk_shipment_event_shipment_store` BEFORE `uq_shipment_id_store`, the unique
+index it references.** Applied as generated, PostgreSQL refuses it: _there is no unique constraint
+matching given keys for referenced table "shipment"_. This is the **seventh** appearance of that
+fault — §43 records the fifth, §44 the sixth — and the first time it was predicted in an
+inspection before it happened.
+
+Every `CREATE INDEX` was hoisted above every `ADD CONSTRAINT … FOREIGN KEY`; no statement was
+added, removed or altered, and the count is unchanged at 21. The correction is documented in the
+migration header. The re-added CHECK constraints stay last, because one of them constrains the
+`fulfilled_at` column added above it.
+
+Not destructive. The three `DROP CONSTRAINT` statements drop CHECKs immediately re-added as
+strict SUPERSETS — `ck_stock_ledger_reason` gains `shipment`, `ck_stock_reservation_status` gains
+`fulfilled`, `ck_stock_reservation_reason_values` gains two reasons — so no row that was legal
+before is illegal after, and the whole migration is one transaction so no window exists where a
+CHECK is missing. `ADD COLUMN fulfilled_at` is nullable with no default: metadata-only, no
+rewrite. **No backfill**: every existing reservation is `held`, `released` or `committed`, so
+`fulfilled_at` is correctly NULL for all of them.
+
+Rollback is dropping the two tables and `fulfilled_at`, then narrowing the three CHECKs — safe
+only while nothing has shipped, because after that narrowing `ck_stock_reservation_status` would
+reject existing rows and dropping the tables would discard the record that goods left.
+
+### Verification
+
+| Check                                        | Result                                                        |
+| -------------------------------------------- | ------------------------------------------------------------- |
+| Fulfilment state (unit)                      | 8 passed                                                      |
+| Payments + fulfilment integration            | 158 passed                                                    |
+| Orders, payments, inventory suites (7 files) | 452 passed                                                    |
+| OpenAPI drift guard                          | 10 passed                                                     |
+| Full suite                                   | **1,785 passed**, 58 files, exit 0                            |
+| `pnpm format:check`                          | exit 0                                                        |
+| `pnpm lint`                                  | exit 0                                                        |
+| `pnpm typecheck`                             | exit 0                                                        |
+| `pnpm depcruise`                             | exit 0 — **0 violations**, 162 modules                        |
+| `pnpm build`                                 | exit 0                                                        |
+| `pnpm db:generate`                           | exit 0 — no schema drift                                      |
+| `pnpm exec drizzle-kit check`                | exit 0                                                        |
+| Live Neon                                    | 30 tables, 20 migrations, all constraints and indexes present |
+| Dependencies                                 | unchanged — 17 production, 21 development                     |
+
+The full suite ran with `--fileParallelism=false`, for the environmental reasons §44 and §45
+record. Concurrency is proven against real PostgreSQL via Testcontainers, never a mock.
+
+### What this increment does NOT do
+
+**Deferred, explicitly:** shipping provider, carrier API, provider webhooks, provider read-back ·
+calculated rates, zones, weight-based pricing, shipping methods · multiple shipments, partial
+fulfilment, backorders · GST, tax, HSN/SAC, place of supply, statutory invoice · refunds, returns
+· COD settlement and delivery-payment transition · payment retry · reconciliation · reporting
+dashboards · general admin order management · storefront, product images, reviews, wishlist ·
+role management.
+_(GST, HSN/SAC and place of supply delivered in §47; the STATUTORY invoice — numbering series,
+HSN-wise summary, IRN/QR — remains deferred to Increment 39. Everything else here still stands.)_
+
+**Still open from earlier increments, and untouched:** a COD payment never terminalises, so a COD
+order remains uncancellable and its money is not tracked; a payment can still succeed against a
+cancelled order, because the webhook does not check order status; and there is no origin address
+for place of supply. _(The origin address was added in §47 as six typed `store.origin_*` columns;
+the two payment gaps remain open.)_
+
+**The provider seam is intentionally not built.** `PaymentGateway` shows what it will look like —
+a consumer-declared port with no provider name in any type, plus an adapter beside `razorpay/`
+that is the only file naming the vendor. Building it now would be an abstraction with one caller
+and no second case, and the wrong seam is more expensive than a late one.
+
+---
+
+## 47. Phase 3 increment 38 — GST / tax foundation
+
+The increment that finally charges tax. Three tables, twenty-nine new columns across `order` and
+`order_line`, eleven routes — and not one GST rate, HSN code or state code anywhere in the
+source. Everything statutory is data a merchant supplies; everything in code is arithmetic.
+
+### The approved decisions
+
+| #   | Decision                             | Value                                                                       |
+| --- | ------------------------------------ | --------------------------------------------------------------------------- |
+| 1   | Prices                               | **GST-EXCLUSIVE.** `sku.price` is the pre-tax value                         |
+| 2   | Seller of record                     | **The STORE**, not the platform                                             |
+| 3   | Origin                               | **One GST origin/dispatch address per store.** Multi-warehouse deferred     |
+| 4   | Classification unit                  | **The SKU**                                                                 |
+| 5   | Within a product                     | Two SKUs MAY differ in HSN/SAC and tax class                                |
+| 6   | HSN/SAC                              | **Snapshotted on the order line**                                           |
+| 7   | Customer GSTIN                       | Optional, its own concern, **never on the address table**                   |
+| 8   | B2B / B2C                            | Valid customer GSTIN supplied ⇒ B2B; otherwise B2C. Nothing else            |
+| 9   | Place of supply                      | **Delivery destination**, represented so exceptions can be added explicitly |
+| 10  | Split                                | Same state ⇒ CGST+SGST; different ⇒ IGST                                    |
+| 11  | Rates                                | **Configurable, effective-dated. NEVER hardcoded**                          |
+| 12  | Ordering                             | Discount allocated BEFORE tax; basis is `line_total − discount_amount`      |
+| 13  | Arithmetic                           | Existing Decimal.js and ROUND_HALF_UP, at line/component level              |
+| 14  | Snapshot                             | Tax facts frozen at the transaction boundary                                |
+| 15  | Currency                             | **INR only**                                                                |
+| 16  | COD                                  | Tax authoritative WITHOUT payment success. COD state machine untouched      |
+| 17  | Invoice numbering                    | FY-scoped series per store — **deferred to Increment 39**                   |
+| 18  | E-invoice / e-way bill               | Deferred                                                                    |
+| 19  | Returns, refunds, credit/debit notes | Deferred                                                                    |
+| 20  | Master data                          | Engineering invents none of it                                              |
+
+None of these was chosen here; all were approved before implementation.
+
+### The one rule that was NOT handed down, and how it was settled
+
+Decisions 1–20 fix what tax IS. They are silent on what happens to a store that has configured
+none of it — and every existing order, fixture and test in this repository was created by
+exactly such a store.
+
+Two obvious answers were both wrong. Refusing every checkout until a merchant fills in a GST
+profile invents a business rule and breaks 1,800 tests. Charging zero on an unclassified SKU
+asserts an exemption accounting has not granted, which is the more dangerous of the two because
+nobody notices until a return is filed.
+
+**So configuration IS the switch, and it is all-or-nothing:**
+
+| Store state                | Behaviour                                                                                          |
+| -------------------------- | -------------------------------------------------------------------------------------------------- |
+| No seller tax profile      | No determination. `tax_total` 0, `grand_total = total`, snapshot NULL                              |
+| Seller tax profile present | Every line MUST resolve an active class and a rate in force, or the checkout is refused with `422` |
+
+No new flag, no new column, no `store_setting` key: the profile a merchant has to fill in anyway
+is the switch, and `ck_store_tax_profile` makes "half configured" unrepresentable so the
+question has exactly one answer. **This is the one operational rule engineering settled, and it
+is flagged for accounting ratification.**
+
+The NULL snapshot is what makes it honest. NULL across the group records _"not assessed"_; a
+determination that produced zero arrives as a FULL snapshot with zero rates. Collapsing the two
+would make an unassessed order indistinguishable from an exempt one, and `ck_order_tax_snapshot`
+keeps them apart for ever.
+
+### `total` was not redefined. It never will be.
+
+§43 pinned it: _"`total` means the payable GOODS total, before any tax, permanently. When GST
+arrives it adds `tax_total` and `grand_total` alongside; it must not redefine `total`."_
+
+That is exactly what happened, and both identities now stand side by side in the database:
+
+```
+ck_order_total_identity        total       = subtotal - discount_total     (unchanged)
+ck_order_grand_total_identity  grand_total = total + tax_total             (new)
+```
+
+A row where either disagrees is an order that cannot be invoiced, and it would be found by an
+accountant rather than by a test. `tax_total` is the SUM of the line figures, never an
+independent calculation — the same rule §43 applied to `discount_total`, for the same reason:
+an invoice whose lines do not foot to its header is what `allocate()` exists to prevent.
+
+**`grand_total` is now the payable amount**, and `payment.amount` is copied from it. The port
+was renamed `payableTotal` at the same time so the two cannot be confused at either end. For
+every order placed before this increment the two are equal by the identity above, which is why
+the change is invisible to all of them.
+
+### The three tables
+
+**`tax_class`** — a classification a SKU points at. Holds NO percentage: rates are
+effective-dated and a class is not, so a rate here would mean either losing the old value on
+every change or versioning the class, which is the same split done worse. No soft delete; a
+class is deactivated, and nothing historical depends on it surviving because the order line
+carries the code and name as text.
+
+**`tax_rate`** — CGST, SGST, IGST and cess as separate `NUMERIC(9,6)` columns, with a half-open
+`[effective_from, effective_to)` window. Components are stored separately because a blended
+percentage cannot produce a compliant breakdown later. **No relationship between them is
+enforced**: the conventional arrangement is that IGST equals CGST plus SGST, and encoding that
+would make this schema the authority on a rule the finance function owns.
+
+**`customer_tax_identity`** — the third thing §43 named and declined to build: _"a customer's
+GSTIN is customer tax identity — a third thing, alongside address data and order-time tax
+determination."_ One row per user, two fields, and nothing else. Approved decision 7 put it here
+rather than on `address`; approved Phase 1B forbade a broader profile redesign.
+
+### Overlap prevention, and the extension that was not added
+
+Two windows for one class must never both be in force. Three mechanisms, in order of strength:
+
+1. `uq_tax_rate_class_from` — no two rates may START at the same instant.
+2. `uq_tax_rate_class_open` — at most ONE open-ended window per class. This is the half that
+   matters in practice: adding a new rate without closing the old one is the mistake that
+   actually happens.
+3. The service LOCKS the `tax_class` row before checking, so two staff configuring rates
+   serialise rather than both passing an unlocked check.
+
+`EXCLUDE USING gist (store_id WITH =, tax_class_id WITH =, tstzrange(...) WITH &&)` would say all
+of it in one line. It needs `btree_gist`, which is not a trusted extension and therefore requires
+SUPERUSER in a migration — a privilege this project's migration runner should not need and a
+managed provider may withhold. Drizzle also cannot express EXCLUDE, so the constraint would live
+only in hand-written SQL and be invisible to `db:generate`. The row lock closes the same gap at
+no cost, and a concurrency test proves it: two simultaneous overlapping rates produce one `201`
+and one `409`, with exactly one row written.
+
+### SKU classification, and a deliberate departure from §41
+
+§41 recorded the placement this column would take: _"`sku.tax_class_id` nullable, falling back
+to `product.tax_class_id`"_. Increment 38 built the column and **dropped the product fallback.**
+
+Approved decision 5 settles the question §41 and §42 each raised once and left open — _"whether
+two SKUs of one product may attract different GST rates"_ — and the answer is yes. Once that is
+true, a product-level fallback is not a convenience but an ambiguity: a SKU with no class would
+silently inherit a classification that may be wrong for it, and a wrong classification is under-
+or over-charged tax on every sale. There is exactly one place a SKU's classification comes from.
+
+An unclassified SKU is NOT untaxed. In a store with a GST profile, checkout refuses it with
+`422 TAX_NOT_DETERMINABLE` naming the SKU codes — the same shape as `CHECKOUT_LINES_UNAVAILABLE`,
+and for the same reason: a customer must be told which item is the problem.
+
+### The determination, and where it happens
+
+```
+ 9. line money and the subtotal
+10. allocate the cart discount across the lines        <- §42, unchanged
+11. resolve the seller tax profile                     <- new
+12. resolve the customer tax identity                  <- new
+13. determine the authoritative tax instant            <- new
+14. resolve classification and the effective rate      <- new
+15. calculate line taxes, tax_total, grand_total       <- new
+16. insert the order and its immutable snapshots
+17. transition the cart
+18. complete the idempotency claim
+```
+
+Steps 11–15 sit AFTER the allocation because approved decision 12 and §42 fix that ordering, and
+BEFORE the insert because `ck_order_grand_total_identity` refuses a header whose totals are not
+yet known — there is no "insert now, tax later" option. All of it runs inside the existing
+checkout transaction, so the profile, the registration and the classifications are read in the
+same snapshot as the order they are written onto. `determineForCheckout` asserts it is in a
+transaction rather than trusting the caller, exactly as `lockCartForCheckout` and `reserve` do.
+
+**Orders does no tax arithmetic.** It hands over line money it computed and a destination state
+it snapshotted, and writes back a determination verbatim. There is no rate, no percentage and no
+tax calculation anywhere in `orders.service.ts`; the one place tax is computed is
+`tax.calculator.ts`, which is pure and needs no database to test.
+
+### Rounding: once per component
+
+Not per line, and not per invoice.
+
+Per-component is what makes the stored breakdown add up. `ck_order_line_tax_total` requires
+`tax_total` to equal the sum of the four stored amounts exactly, so carrying components unrounded
+and rounding only the total would produce a row the database refuses. Rounding each and summing
+the rounded values makes the identity hold by construction.
+
+ROUND_HALF_UP is inherited from `money.ts`, whose own comment records why — _"it is what Indian
+GST rules, invoice expectations, and every merchant's spreadsheet assume"_ — and approved
+decision 13 restates it. **No rounding rule is defined in this increment.** There is exactly one
+in the codebase, and §42's rule held again: the tax module added no money code, only calls.
+
+### What is snapshotted, and why every single field
+
+Approved decision 14: _"Historical invoices/orders must not re-read mutable tax master data."_
+Every source below is mutable, and §40's rule reaches all of them — _"the moment a past invoice
+reads a live address, a customer fixing a typo rewrites history."_
+
+**On `order`:** `tax_total`, `grand_total`, `tax_at`, `supply_type`, `place_of_supply_state`,
+`place_of_supply_basis`, `seller_gstin`, `seller_legal_name`, the six `origin_*` columns,
+`customer_tax_category`, `customer_gstin`, `customer_legal_name`.
+
+**On `order_line`:** `taxable_value`, `hsn_code`, `tax_class_code`, `tax_class_name`, and a
+RATE and an AMOUNT for each of CGST, SGST, IGST and cess, plus `tax_total`.
+
+Both the rate and the amount, deliberately: storing only amounts makes a line impossible to
+explain, and storing only rates makes it recomputable and therefore vulnerable to a future change
+in how rounding works. **There is no foreign key from an order to `tax_class` or `tax_rate`
+anywhere** — that is the point.
+
+`tax_at` is its own column rather than a reuse of `placed_at`, for the reason `placed_at` is not
+`created_at`: they coincide today because tax is determined at checkout, and an increment that
+moves the determination must be able to say so without restating what "placed" means.
+
+**The acceptance test changes all of it.** One test places an order, then closes the rate and
+adds a very different one, renames the tax class, reclassifies the SKU under a new HSN, changes
+the seller's GSTIN and legal name and moves the premises to another state, and changes the
+customer's registration — then asserts every figure and every identity on the persisted row and
+through the API is byte-identical. That is Phase 8's mandatory criterion, and it is one test
+rather than nine because the failure it guards against is systemic.
+
+### Place of supply, and the limitation this increment does not close
+
+Approved decision 9 asked for two things. The rule — delivery destination for the ordinary
+domestic goods flow — and the representation: _"Do not hide statutory exceptions inside a generic
+state comparison."_
+
+`place_of_supply_basis` is that representation. One value exists (`delivery_destination`), so
+every order records WHICH rule decided it, and a future exception becomes a new value rather than
+an invisible change in behaviour that no historical order can be distinguished by.
+
+**The weak link is the comparison itself, and it is named rather than hidden.** §43 declined to
+invent a GST state-code catalogue and this increment was told the same, so both sides are free
+text: `store.origin_state` and the order's `ship_state`. `normaliseStateName` repairs case,
+surrounding whitespace and internal runs — the overwhelmingly common case — and cannot repair two
+genuine spellings of one state (`Orissa` / `Odisha`), an abbreviation, or a typo. Those compare
+unequal and produce IGST where CGST+SGST was due.
+
+A test asserts the limitation directly, so anybody who later adds a catalogue finds the case
+already written down. **Closing it requires a statutory state catalogue, which is accounting
+master data, not an engineering choice.** The normalised value is snapshotted onto the order
+precisely so a wrong determination can be found and explained afterwards rather than merely
+suspected.
+
+### COD, again
+
+Approved decision 16: tax becomes authoritative at CHECKOUT and does not wait for payment.
+
+That is forced rather than chosen. §44 and §45 both record that a COD payment is created
+`pending` and no code path terminalises it; §46 added an authorised unpaid fulfilment path on top
+of that. If tax waited for payment success, every COD order would be permanently unassessed. So
+the determination happens at checkout for both methods, the COD payment row is untouched, and a
+test asserts the payment is still `pending` while `tax_at` is set and `tax_total` is charged.
+
+The COD state machine was not modified in any way.
+
+### The seller identity: four dead columns, made live
+
+`store.legal_name`, `gstin`, `pan` and `registered_address` have existed since the first
+migration and were read and written by NOTHING — the seed never set them, no route touched them,
+and `ResolvedStore` deliberately excluded them on the stated grounds that they _"belong to
+invoicing."_ This is invoicing, so three of the four now have a staff-only write path.
+
+**`registered_address` was declined.** An untyped `jsonb` defaulting to `{}` has no shape, no
+validator and no NOT NULL on anything inside it, and place of supply is the single most
+consequential field on a tax invoice — it does not belong in a blob. Six typed `origin_*` columns
+replace it. The blob is kept rather than dropped because dropping a column is destructive and it
+may hold operator-entered values; it is documented as superseded and read by nothing.
+
+`ResolvedStore` stays narrow. The tax profile is read by the tax repository, not by the resolver
+every request pays for.
+
+### GSTIN validation: shape, and deliberately no checksum
+
+`^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$`, applied in Zod AND as a CHECK, because §24's
+rule holds: a bulk import or an operator running SQL during an incident bypasses the validation
+boundary.
+
+The check-digit ALGORITHM is a different thing and is not implemented. Approved decision 8 asked
+for strict SHAPE validation; implementing a checksum would be engineering inventing a validation
+rule, and a wrong implementation rejects a legitimate registration — a worse failure than
+accepting a well-shaped invalid one, which the tax authority rejects anyway.
+
+The same judgement governs HSN: two to eight digits, no catalogue, and deliberately no fixed
+digit count, because the number required depends on a turnover threshold this project was told
+not to invent.
+
+### The invoice: it shows the tax, and it still disclaims
+
+The document now renders per-component CGST/SGST/IGST/cess rows, the HSN against each line, both
+parties' GSTIN, the place of supply and the supply type — because withholding figures a customer
+has actually been charged would be misleading in the other direction.
+
+**What it does not do is claim compliance.** The disclaimer was REWORDED, not removed:
+
+> _"This document is NOT a statutory GST tax invoice. The tax shown was calculated and charged,
+> but the document carries no sequential invoice number, no HSN-wise summary, and no IRN or QR
+> code."_
+
+A document that quietly stopped disclaiming the moment it grew a tax row would be the worst
+possible outcome of this increment, and a test asserts the wording survives. A second test
+asserts an unassessed order renders exactly as it did before, with no GST block at all.
+
+The letterhead is still the hardcoded `COMPANY` constant, and the seller of record is now named
+separately from it in the GST block. Reconciling the two — along with the FY-scoped invoice
+series, the HSN-wise summary and IRN/QR — is Increment 39.
+
+### Audit, and no events
+
+Five audit actions: `tax.profile_updated`, `tax.class_created`, `tax.class_updated`,
+`tax.rate_created`, `tax.sku_classified`. All five change what customers are charged, which is
+the bar promotions set for auditing configuration; a rate change moves it for every customer at
+once. The seller GSTIN and legal name go into the trail because they are the seller's own PUBLIC
+registration details, printed on every invoice; the origin ADDRESS does not, because §40's rule
+about log aggregators applies and it adds nothing.
+
+The customer's own tax identity is NOT audited. §42's reasoning for the cart applies exactly: an
+audit row per self-service edit buries the entries that matter, and the value an audit needs is
+the one snapshotted onto the order.
+
+**No domain event.** §39's rule has held for ten increments. `tax.rate_changed` is the obvious
+candidate — a reporting pipeline would want it — and that is precisely why it must not be
+published speculatively. A test asserts no `tax.*` event reaches the outbox.
+
+A discovery worth recording: `audit.record` refuses to write outside a transaction by default,
+and four tax write paths initially called it without one. That default is correct and caught a
+real defect — a profile change that switched GST on with no trail of who did it is exactly the
+entry an auditor comes looking for. All four now commit the write and its audit row together.
+
+### The API
+
+Eleven new operations across six paths, taking the documented surface to **79 operations across
+55 paths**.
+
+| Method               | Path                              | Access                     |
+| -------------------- | --------------------------------- | -------------------------- |
+| `GET` `PUT`          | `/admin/store/tax-profile`        | Staff — **the GST switch** |
+| `POST` `GET`         | `/admin/tax-classes`              | Staff                      |
+| `PATCH`              | `/admin/tax-classes/{code}`       | Staff                      |
+| `POST` `GET`         | `/admin/tax-classes/{code}/rates` | Staff                      |
+| `PUT`                | `/admin/skus/{code}/tax`          | Staff                      |
+| `GET` `PUT` `DELETE` | `/users/me/tax-identity`          | Customer                   |
+
+Everything is addressed by CODE; no database id appears in a URL or a body. A tax class code is
+immutable after creation, because every order line that used it carries the code as a snapshot
+and renaming would leave historical invoices naming a code the admin surface no longer has.
+
+There is deliberately **no rate update and no rate delete**. A rate that was in force is what a
+historical order was assessed under; superseding it with a new dated window is the honest
+correction. Orders snapshot their own rates, so a figure is safe either way — but the master data
+should still tell the truth about what applied when.
+
+SKU classification got its own route rather than fields on `PATCH /admin/skus/{code}`, so a
+well-tested existing contract did not have to be widened for data with a different authority and
+a different reviewer.
+
+**The order response changed additively:** `taxTotal`, `grandTotal` and a nullable `tax` object
+on the header, and a nullable `tax` object per line. Nullable rather than zeroed, so "not
+assessed" and "assessed at nil" stay distinguishable on the wire as well as in the database. A
+test asserts the exact key set of both.
+
+Nothing a client sends can reach a tax figure. A test fires nine forged fields at checkout —
+`taxTotal`, `grandTotal`, `supplyType`, `placeOfSupply`, `sellerGstin`, `customerGstin`,
+`cgstRate`, `taxClassCode`, `hsnCode` — and every one is a `400` naming the field, because every
+request schema in the system is a `strictObject`.
+
+### The migration, and the eighth appearance of a known fault
+
+Migration 21, `20260908180451_tiresome_tombstone.sql`, 76 statements, one transaction.
+
+**Drizzle emitted `fk_tax_rate_class_store` BEFORE `uq_tax_class_id_store`, the unique index it
+references.** This is the EIGHTH appearance of that fault — §43 records the fifth, §44 the sixth,
+§46 the seventh. Every `CREATE INDEX` was hoisted above every `ADD CONSTRAINT … FOREIGN KEY`.
+
+A second correction was needed, and it is new. Drizzle emitted `order.grand_total` as `NOT NULL`
+with no default, which cannot be added to a populated table, and `order_line.taxable_value` as
+`NOT NULL DEFAULT 0`, which would then violate `ck_order_line_taxable_value` on every existing
+row. Both are handled by a backfill block: `grand_total` arrives nullable, both columns are
+backfilled from data already present, and `grand_total` is then set `NOT NULL`.
+
+**The backfill states facts rather than inventing them.** `grand_total := total` because no tax
+was calculated or charged on any pre-existing order, so `total + 0` is arithmetic;
+`taxable_value := line_total − discount_amount` because that identity was already true of every
+line and the column merely materialises it. What those orders deliberately do NOT get is a
+determination — every snapshot column stays NULL.
+
+Not destructive. No `DROP` of any kind: no column removed, narrowed or retyped, no existing CHECK
+dropped or replaced, and `registered_address` left exactly as it was.
+
+Applied to Neon: **33 tables, 21 migrations**, all three tables, nine indexes, six foreign keys
+and 24 new CHECK constraints verified live, with 11 pre-existing orders backfilled and zero
+identity violations.
+
+### Verification
+
+| Check                                         | Result                                        |
+| --------------------------------------------- | --------------------------------------------- |
+| Tax calculator (unit)                         | 30 passed                                     |
+| Payments + fulfilment + GST integration       | 198 passed (45 of them GST)                   |
+| Orders, inventory, tax, http, payments        | 650 passed                                    |
+| Full suite                                    | **1,855 passed**, 59 files, exit 0            |
+| Fresh-database migration                      | 33 tables, 21 migrations, exit 0              |
+| Mutation gate                                 | **11 probes, 11 killed**                      |
+| `format:check` · `lint` · `typecheck`         | exit 0                                        |
+| `depcruise`                                   | exit 0 — 0 violations, 170 modules            |
+| `build` · `db:generate` · `drizzle-kit check` | exit 0, no drift                              |
+| Dependencies                                  | **unchanged** — 17 production, 21 development |
+
+### An incident worth recording
+
+Midway through this increment a `git checkout` on a single test file — intended to remove a
+debug probe — reverted `payments.integration.test.ts` to `HEAD`, discarding the Increment 36
+expiry tests, the Increment 37 fulfilment tests and the Increment 38 GST tests in one stroke.
+Nothing was staged, no stash existed, and `git fsck` found no dangling blob.
+
+It was fully recovered because each block had been composed in a scratch file before being
+spliced in, and those files survived. The harness itself was rebuilt from the sibling
+`payments.edge-cases.integration.test.ts`, which carried the same shape.
+
+Two things are worth carrying forward. **`git checkout -- <file>` is a destructive command on a
+repository with uncommitted work**, and it should never be reached for to undo an edit that an
+editor tool can undo precisely. And `core.autocrlf=true` restored the file with CRLF line
+endings, which silently broke every subsequent exact-string patch until it was normalised — a
+second failure mode hiding behind the first.
+
+### What this increment does NOT do
+
+**Deferred, explicitly:** invoice numbering and the FY-scoped series · HSN-wise and rate-wise
+invoice summaries · e-invoicing, IRN, QR · e-way bills · credit and debit notes · refunds and
+returns · GSTR-1/3B export and reconciliation · reverse charge · composition scheme · exemptions
+and zero-rating as first-class concepts · multi-location origin · shipping tax (shipping is free,
+so there is nothing to tax) · multi-currency GST · a GST state-code catalogue · a GSTIN checksum
+· rate correction in place.
+
+**Still open from earlier increments, and untouched:** a COD payment never terminalises · a
+payment can still succeed against a cancelled order · `store_setting` and `feature_flag` remain
+dead tables.
+
+**The one thing accounting must ratify:** that an unconfigured store assesses no tax, and that a
+configured store REFUSES an unclassified line rather than assessing it at zero. Everything else
+in this section was decided before implementation.
