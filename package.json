@@ -32,7 +32,6 @@
     "db:studio": "drizzle-kit studio",
     "db:seed": "node --env-file-if-exists=.env --import tsx src/db/seed.ts",
     "keys:generate": "tsx scripts/generate-keys.ts",
-    "cli": "node --env-file-if-exists=.env --import tsx src/cli/index.ts",
     "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm depcruise && pnpm test"
   },
   "dependencies": {

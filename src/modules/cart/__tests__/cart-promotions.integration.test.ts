@@ -1395,15 +1395,26 @@ describe('cart promotions (integration)', () => {
       /**
        * **A coupon on an empty cart must be unreachable, not merely unlikely.**
        *
-       * This assertion FAILED when the emptiness check lived in JavaScript: the apply read a
-       * non-empty cart, priced the coupon, and wrote its association after the clear had
-       * committed. The guard now sits in the WHERE clause of the insert, so the losing apply
-       * writes nothing and answers 422 — which is also the sequential answer.
+       * This FAILED when the emptiness check lived in JavaScript: the apply read a non-empty
+       * cart, priced the coupon, and wrote its association after the clear had committed. The
+       * guard now sits in the WHERE clause of the insert, so a losing apply writes nothing.
+       *
+       * The state is what is asserted, NOT the apply's status code. Both orderings end with an
+       * empty cart and no promotion, and they disagree only about what the apply returned:
+       *
+       *   clear then apply → the apply finds nothing to discount and answers 422
+       *   apply then clear → the apply legitimately succeeds with 200, and the clear then
+       *                      removes both the items and the promotion it had just added
+       *
+       * An earlier version of this test also required `applied.status === 422` here, which
+       * conflated "the cart ended empty" with "the apply lost". The second ordering is equally
+       * correct and made the test fail intermittently under load. What must hold either way —
+       * and what the WHERE-clause guard is there to guarantee — is that no coupon is left
+       * attached to an empty cart.
        */
       if (final.body.cart.items.length === 0) {
         expect(final.body.cart.promotion).toBeNull();
         expect(await promotionRows()).toEqual([]);
-        expect(applied.status).toBe(422);
       }
     });
   });

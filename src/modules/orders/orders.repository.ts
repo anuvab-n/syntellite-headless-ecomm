@@ -330,6 +330,30 @@ export function createOrdersRepository(deps: { db: Database }) {
       return row;
     },
 
+    /**
+     * One order in this store, WHOSEVER it is.
+     *
+     * The deliberate absence of a `user_id` predicate is the whole point, and it is the reason
+     * this is a separate method rather than an optional argument on `findOwnedOrderByNumber`:
+     * a caller that forgot to pass an owner would silently get store-wide reach, and that is
+     * exactly the kind of hole an optional security parameter creates. Two names, two
+     * predicates, and the narrower one stays the default.
+     *
+     * `store_id` is still non-negotiable — staff of one tenant must not read another's orders.
+     * Only ownership within the store is relaxed, and only for callers behind `requireStaff`.
+     */
+    async findStoreOrderByNumber(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<OrderRecord | undefined> {
+      const [row] = await executor(db)
+        .select(ORDER_COLUMNS)
+        .from(order)
+        .where(and(eq(order.orderNumber, params.orderNumber), eq(order.storeId, params.storeId)))
+        .limit(1);
+      return row;
+    },
+
     /** The lines of one order, in the sequence they were written. */
     async listOrderLines(params: { orderId: string; storeId: string }): Promise<OrderLineRecord[]> {
       return executor(db)

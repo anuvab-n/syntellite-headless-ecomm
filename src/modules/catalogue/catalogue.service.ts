@@ -1,4 +1,5 @@
 import type { Database } from '../../db/client.js';
+import { uniqueViolationConstraint } from '../../db/errors.js';
 import { withTransaction } from '../../db/transaction.js';
 import type { AuditActor, AuditTrail } from '../../shared/audit.js';
 import {
@@ -197,40 +198,6 @@ export class OptionInUse extends Conflict {
  */
 export function buildOptionSignature(optionValueIds: readonly string[]): string {
   return [...optionValueIds].sort().join(',');
-}
-
-/**
- * PostgreSQL unique-violation SQLSTATE, and a bounded walk of the `cause` chain.
- *
- * Duplicated deliberately rather than imported from the identity module: `dependency-cruiser`
- * forbids module-to-module imports, and promoting eight lines to shared infrastructure for a
- * second caller would be a guess about the third. If a fourth module needs it, that is the
- * point at which it becomes shared.
- *
- * Drizzle does NOT throw the driver's error — it wraps it in a `DrizzleQueryError` whose own
- * properties are `query`, `params`, and `cause`. The SQLSTATE and constraint name live on
- * `cause`, so a top-level check finds `undefined` for something that plainly is a unique
- * violation. That bug cost a debugging session in Phase 1; see docs/DECISIONS.md.
- */
-const UNIQUE_VIOLATION = '23505';
-const MAX_CAUSE_DEPTH = 3;
-
-type PostgresError = { code?: unknown; constraint?: unknown; cause?: unknown };
-
-function uniqueViolationConstraint(err: unknown): string | undefined {
-  let current: unknown = err;
-
-  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
-    if (typeof current !== 'object' || current === null) return undefined;
-
-    const candidate = current as PostgresError;
-    if (candidate.code === UNIQUE_VIOLATION) {
-      return typeof candidate.constraint === 'string' ? candidate.constraint : '';
-    }
-    current = candidate.cause;
-  }
-
-  return undefined;
 }
 
 /**

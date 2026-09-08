@@ -1,4 +1,5 @@
 import type { Database } from '../../db/client.js';
+import { uniqueViolationConstraint } from '../../db/errors.js';
 import { withTransaction } from '../../db/transaction.js';
 import type { AuditActor, AuditTrail } from '../../shared/audit.js';
 import {
@@ -174,9 +175,13 @@ export type PaymentsService = ReturnType<typeof createPaymentsService>;
 /**
  * Order statuses a payment may be created against.
  *
- * One value, because `ORDER_STATUSES` has one value. Named here rather than inlined so the
- * increment that adds `cancelled` has an obvious place to exclude it — and so the check reads
- * as a rule rather than as a string comparison.
+ * `placed` only. `cancelled` is deliberately absent — that is what stops a customer cancelling
+ * an order and then paying for it, which would leave a cancelled order that had been charged.
+ * The status is read inside this service's own transaction, so the check cannot be raced by a
+ * cancellation committing between the read and the insert.
+ *
+ * Named rather than inlined so the exclusion reads as a rule, and so the increment that adds a
+ * fulfilment status has an obvious place to decide about it.
  */
 const PAYABLE_ORDER_STATUSES: readonly string[] = ['placed'];
 
@@ -204,32 +209,6 @@ export function createPaymentsService(deps: {
       throw new InvariantViolation(`order currency ${value} is not a supported currency`);
     }
     return value;
-  }
-
-  /**
-   * Is this error the unique-violation that means "somebody else got there first"?
-   *
-   * Matched on PostgreSQL's SQLSTATE `23505`, not on a message: driver messages are not a
-   * contract and change between versions. Used for two different constraints, and in both cases
-   * the violation is the expected outcome of a race rather than a fault.
-   *
-   * **The cause chain is walked, and that is not defensive padding.** Drizzle wraps a driver
-   * error in a `DrizzleQueryError` whose own `code` is undefined, so a check on the top-level
-   * error alone silently never matches — and the symptom is a `500` where a `409` was intended,
-   * on the exact path that decides whether a customer is charged twice. Found by a concurrency
-   * test returning `[201, 500]` instead of `[201, 409]`.
-   */
-  function uniqueViolationConstraint(err: unknown): string | null {
-    let current: unknown = err;
-    /* Bounded rather than `while (true)`: a self-referential cause must not hang the request. */
-    for (let depth = 0; depth < 5 && typeof current === 'object' && current !== null; depth += 1) {
-      if ((current as { code?: unknown }).code === '23505') {
-        const constraint = (current as { constraint?: unknown }).constraint;
-        return typeof constraint === 'string' ? constraint : '';
-      }
-      current = (current as { cause?: unknown }).cause;
-    }
-    return null;
   }
 
   return {
@@ -458,18 +437,23 @@ export function createPaymentsService(deps: {
     },
 
     /**
-     * The status of an order's payment, for a caller deciding whether the order may change.
+     * The status and method of an order's payment, for a caller deciding what to say or do
+     * about that order.
      *
-     * Exported on the service because the ORDERS module needs it to answer "may this be
-     * cancelled?", and it must not reach for the payment table itself. The composition root
-     * adapts this onto the port orders declares.
+     * Exported on the service because the ORDERS module needs it twice — to answer "may this be
+     * cancelled?" and to word an invoice correctly — and it must not reach for the payment table
+     * itself. The composition root adapts this onto the port orders declares.
+     *
+     * Status and method together in one call, because both callers want both and a second round
+     * trip for a single column would be waste. Nothing else about the payment crosses: not the
+     * amount, not the provider, not the provider reference.
      */
-    async statusForOrder(params: {
+    async stateForOrder(params: {
       orderId: string;
       storeId: string;
-    }): Promise<PaymentStatus | null> {
-      const status = await repository.findStatusByOrderId(params);
-      return status ?? null;
+    }): Promise<{ status: PaymentStatus; method: PaymentMethod } | null> {
+      const state = await repository.findStateByOrderId(params);
+      return state ?? null;
     },
 
     /**

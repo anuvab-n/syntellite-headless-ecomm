@@ -108,8 +108,23 @@ export function createApp(opts: CreateAppOptions): Express {
 
   app.use(
     helmet({
-      // This is a JSON API with no HTML responses, so a CSP has nothing to protect and
-      // its default `form-action`/`frame-ancestors` directives only confuse debugging.
+      /**
+       * Off globally, and that is no longer free.
+       *
+       * It was chosen when this was a JSON API with no HTML responses, where a CSP had nothing
+       * to protect and its `form-action`/`frame-ancestors` defaults only confused debugging.
+       * **The invoice endpoint broke that assumption**: `GET /users/me/orders/{n}/invoice`
+       * returns a document built from customer-supplied text.
+       *
+       * Rather than switch a global policy on — which would have to be permissive enough for
+       * Swagger UI at `/docs` and would then protect the invoice barely at all — that one route
+       * sets its own restrictive header on its own response: `default-src 'none'` with inline
+       * styles and nothing else. Escaping in `renderInvoice` is the primary defence; the
+       * per-route policy is the second.
+       *
+       * A second HTML response would need the same treatment. If a third appears, move the
+       * policy here and make `/docs` the exception instead.
+       */
       contentSecurityPolicy: false,
       // Payment gateways redirect back to the storefront; a strict referrer policy here
       // would strip the referrer a gateway sometimes needs.

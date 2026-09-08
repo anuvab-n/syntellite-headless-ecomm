@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
+
 import { STORAGE_SCALE } from '../../shared/money.js';
 import {
   PRODUCT_STATUSES,
@@ -9,6 +11,13 @@ import {
   type SkuOptionRecord,
   type SkuRecord,
 } from './catalogue.repository.js';
+
+/**
+ * Re-exported, so a caller of this module needs one import rather than two.
+ *
+ * The shape lives in `shared/pagination.ts` — one definition for every list endpoint.
+ */
+export type { PaginationResponse };
 
 /**
  * The catalogue module's wire contracts.
@@ -247,37 +256,6 @@ export const PRODUCT_LIST_MAX_LIMIT = 100;
  *
  * Parsing is handled by `boundedIntParam` below, which explains why coercion is not used.
  */
-/**
- * A digits-only query parameter, parsed then bounds-checked.
- *
- * NOT `z.coerce.number()`, which was the first attempt and was quietly wrong: `Number('')` is
- * `0`, so `?offset=` passed validation and returned the first page. `?limit=` happened to fail
- * only because its floor is 1 — the two parameters were consistent by accident, not by design.
- * An empty value is a malformed request: the client wrote the parameter and supplied nothing.
- *
- * Requiring `^\d+$` up front also rejects `-1`, `2.5`, `1e3`, and `0x10` with one rule instead
- * of relying on downstream bounds to catch each.
- *
- * The default is applied AFTER the pipe, not via `.default()` on it. `.default()` sits outside
- * a pipe and short-circuits — it returns the raw default without parsing, so a string default
- * came back as a string and `pagination.offset` was `'0'` instead of `0`. Caught by a test
- * asserting the exact metadata, not by reading the Zod docs.
- */
-const boundedIntParam = (opts: { min: number; max?: number; default: number }) => {
-  const bounds =
-    opts.max === undefined
-      ? z.number().int().min(opts.min)
-      : z.number().int().min(opts.min).max(opts.max);
-
-  return z
-    .string()
-    .regex(/^\d+$/, 'must be a whole number')
-    .transform(Number)
-    .pipe(bounds)
-    .optional()
-    .transform((value) => value ?? opts.default);
-};
-
 export const ListProductsQuerySchema = z.strictObject({
   limit: boundedIntParam({
     min: 1,
@@ -383,19 +361,6 @@ export const PublicListProductsQuerySchema = ListProductsQuerySchema.extend({
 );
 
 export type PublicListProductsQuery = z.infer<typeof PublicListProductsQuerySchema>;
-
-/**
- * Pagination metadata.
- *
- * `total` is the count of rows matching the same visibility predicate as the page — this
- * store's, not soft-deleted — so a client can compute page count without discovering on the
- * last page that the total counted rows it can never see.
- */
-export type PaginationResponse = {
-  limit: number;
-  offset: number;
-  total: number;
-};
 
 export type ProductListResponse = {
   products: ProductResponse[];

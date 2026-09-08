@@ -1,4 +1,4 @@
-import { Router, type Request, type RequestHandler } from 'express';
+import { Router, type Request, type RequestHandler, type Response } from 'express';
 
 import { asyncHandler } from '../../http/async-handler.js';
 import { requireAuth, requireUser, type AccessTokenVerifier } from '../../http/middleware/auth.js';
@@ -6,6 +6,7 @@ import { requireStore } from '../../http/middleware/store.js';
 import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
 import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
+import { renderInvoice, type InvoiceInput } from './invoice.js';
 import type { OrdersService } from './orders.service.js';
 import {
   CheckoutRequestSchema,
@@ -19,11 +20,18 @@ import {
 } from './dto.js';
 
 /**
- * The orders module's HTTP surface: three customer routes.
+ * The orders module's HTTP surface: five customer routes and one staff route.
  *
- * **No admin or staff surface.** An operator order list is a reporting concern, and reporting is
- * out of scope for this increment. Adding one would also need its own visibility rules — which
- * orders a support agent may see, and whether a customer's address is among them.
+ * **The staff surface is exactly one route** — `GET /admin/orders/{orderNumber}/invoice`, the
+ * invoice for any order in the store. It exists because re-issuing a customer's invoice is a
+ * routine support request whose only previous answers were "ask the customer to fetch it
+ * themselves" and "impersonate them", the second of which is the worse security posture.
+ *
+ * **There is still no operator order list.** That is a reporting concern and needs its own
+ * visibility rules — which orders a support agent may see, and whether another customer's
+ * address is among them. The invoice route sidesteps the question because it requires an order
+ * number, so the agent already has one from the customer; a browsable list does not, and
+ * inventing one as a side effect of an invoice request would be the wrong way to settle it.
  *
  * ## The middleware chain, and why the order changed
  *
@@ -50,11 +58,19 @@ export function createOrdersRoutes(deps: {
    * this module must not reach for — the same reason `requireStaff` arrives pre-built elsewhere.
    */
   requireIdempotency: RequestHandler;
+  /**
+   * The `staff` scope guard, pre-built by the composition root — the same instance the
+   * catalogue, inventory and promotions routers use.
+   *
+   * Passed in for the reason `requireIdempotency` is: the privilege check belongs to identity,
+   * and this file only declares which privilege a route requires.
+   */
+  requireStaff: RequestHandler;
   logger: Logger;
   // Annotated rather than inferred: without it `tsc` cannot name the router type portably
   // under pnpm's nested `node_modules`. Every other routes file does the same.
 }): Router {
-  const { orders, requireIdempotency, logger } = deps;
+  const { orders, requireIdempotency, requireStaff, logger } = deps;
 
   const router = Router();
   const auth: RequestHandler = requireAuth({
@@ -82,6 +98,38 @@ export function createOrdersRoutes(deps: {
     type: 'customer',
     userId: requireUser(req).id,
   });
+
+  /**
+   * The one HTML response in this API, sent identically to whoever asked for it.
+   *
+   * Shared by the customer and staff invoice routes so the two cannot drift: the hardening on
+   * this response — a per-route CSP because the API disables CSP globally, and `no-store`
+   * because the document carries a delivery address — must not be something one route
+   * remembers and the other forgets.
+   */
+  const sendInvoice = (
+    res: Response,
+    result: {
+      view: { order: InvoiceInput['order']; lines: InvoiceInput['lines'] };
+      payment: InvoiceInput['payment'];
+    },
+  ): void => {
+    res
+      .status(200)
+      .type('html')
+      .set(
+        'Content-Security-Policy',
+        "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      )
+      .set('Cache-Control', 'private, no-store')
+      .send(
+        renderInvoice({
+          order: result.view.order,
+          lines: result.view.lines,
+          payment: result.payment,
+        }),
+      );
+  };
 
   /**
    * The idempotency claim this request already holds.
@@ -216,6 +264,93 @@ export function createOrdersRoutes(deps: {
         actor: customerActor(req),
       });
       res.status(200).json({ order: toOrderResponse(view) });
+    }),
+  );
+
+  /**
+   * GET /users/me/orders/:orderNumber/invoice
+   *
+   * The invoice for one of the customer's own orders, as a self-contained HTML document.
+   *
+   * **`text/html`, not JSON** — the only such response in this API, which is why it sets two
+   * headers the other routes do not need:
+   *
+   *  - `Content-Security-Policy`, because `app.ts` disables CSP globally on the stated grounds
+   *    that this is "a JSON API with no HTML responses". That is no longer true here, so the
+   *    document carries its own policy: no scripts at all, no remote anything, and inline
+   *    styles only. Escaping in `renderInvoice` is the primary defence; this is the second one.
+   *  - `X-Content-Type-Options: nosniff` comes from helmet already, and matters more here than
+   *    anywhere else in the API.
+   *
+   * `Cache-Control: private, no-store` because the document contains a delivery address. A
+   * shared cache holding it would be a data leak, and a browser cache holding it after logout
+   * is one too.
+   *
+   * Prints to PDF from any browser — the document has `@media print` rules for exactly that.
+   * A server-generated PDF would need a rendering dependency, which is a decision worth taking
+   * on its own terms rather than as a side effect of this endpoint.
+   *
+   * Failure modes: `400` for a malformed order number; `404` for an order that is unknown,
+   * another customer's or another store's — all indistinguishable, and rendered through the
+   * standard JSON error envelope, because an error is not a document.
+   */
+  router.get(
+    '/users/me/orders/:orderNumber/invoice',
+    auth,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const { userId, storeId } = scope(req);
+      sendInvoice(
+        res,
+        await orders.getOrderForInvoice({
+          userId,
+          storeId,
+          orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+        }),
+      );
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/{orderNumber}/invoice` — the invoice for ANY order in the store.
+   *
+   * The staff counterpart of the route above, and the first `/admin/order*` route in the
+   * project. It exists because "re-send the customer their invoice" is a support request that
+   * arrives daily, and the only previous answer was to ask the customer to fetch it themselves
+   * or to impersonate them — the second of which is a far worse security posture than an
+   * explicit, guarded staff route.
+   *
+   * ### What is and is not relaxed
+   *
+   * `store_id` scoping is NOT relaxed: the repository method behind this still filters by
+   * tenant, so staff of one store cannot read another's orders. Only *ownership within the
+   * store* is dropped, which is precisely what "admin" means here.
+   *
+   * ### Deliberately still absent
+   *
+   * There is no `GET /admin/orders` list and no staff order detail endpoint. This route needs
+   * the order number, so it serves a support agent who already has one from the customer. A
+   * browsable admin order surface is a larger design question — filtering, pagination, PII
+   * exposure and what staff may see of another customer's address — and inventing it as a side
+   * effect of an invoice request would be the wrong way to decide it.
+   *
+   * Failure modes are the customer route's, minus one: `404` here means the order is unknown
+   * **or belongs to another store**. A different customer's order is no longer a 404, which is
+   * the entire feature.
+   */
+  router.get(
+    '/admin/orders/:orderNumber/invoice',
+    auth,
+    requireStaff,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      sendInvoice(
+        res,
+        await orders.getStoreOrderForInvoice({
+          storeId: requireUser(req).storeId,
+          orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+        }),
+      );
     }),
   );
 

@@ -287,10 +287,23 @@ describe('GET /api/v1/products/:slug (integration)', () => {
         expect(response.status).toBe(404);
         expect(bodyOf(response)).toEqual(bodyOf(first!));
       }
-      // And nothing about the product reaches the caller.
+      /*
+       * And nothing about the product reaches the caller.
+       *
+       * `requestId` is EXCLUDED from this check, and it has to be. It is a random UUID, so its
+       * 32 hex characters occasionally contain the price as a substring by pure coincidence —
+       * this assertion failed with `requestId: "82707e4d-...-f99e665b1499"`, which leaks
+       * nothing at all. Roughly a 1-in-2000 chance per run, which is exactly often enough to
+       * erode trust in a suite while looking like a real leak.
+       *
+       * The narrowing is what makes the test honest: it now searches the fields that could
+       * actually carry product data, and no longer searches a random identifier.
+       */
       for (const response of responses) {
-        expect(JSON.stringify(response.body)).not.toContain('Blue Cotton Shirt');
-        expect(JSON.stringify(response.body)).not.toContain('1499');
+        const { requestId: _ignored, ...leakable } = response.body.error as Record<string, unknown>;
+        const serialised = JSON.stringify(leakable);
+        expect(serialised).not.toContain('Blue Cotton Shirt');
+        expect(serialised).not.toContain('1499');
       }
     });
   });

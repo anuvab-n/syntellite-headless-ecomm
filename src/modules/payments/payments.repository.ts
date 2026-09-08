@@ -417,16 +417,18 @@ export function createPaymentsRepository(deps: { db: Database }) {
      * deciding whether the order may be cancelled, and a payment it cannot see is exactly the
      * one that must block it.
      */
-    async findStatusByOrderId(params: {
+    async findStateByOrderId(params: {
       orderId: string;
       storeId: string;
-    }): Promise<PaymentStatus | undefined> {
+    }): Promise<{ status: PaymentStatus; method: PaymentMethod } | undefined> {
       const [row] = await executor(db)
-        .select({ status: payment.status })
+        .select({ status: payment.status, method: payment.method })
         .from(payment)
         .where(and(eq(payment.orderId, params.orderId), eq(payment.storeId, params.storeId)))
         .limit(1);
-      return row === undefined ? undefined : (row.status as PaymentStatus);
+      return row === undefined
+        ? undefined
+        : { status: row.status as PaymentStatus, method: row.method as PaymentMethod };
     },
 
     /** The transition timeline for one payment, oldest first. Store-scoped. */

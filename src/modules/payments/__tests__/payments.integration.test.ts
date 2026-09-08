@@ -30,6 +30,7 @@ import { createRazorpayGateway } from '../../../razorpay/gateway.js';
 import { createCartRepository } from '../../cart/cart.repository.js';
 import { createCartRoutes } from '../../cart/cart.routes.js';
 import { createCartService } from '../../cart/cart.service.js';
+import { createScopeGuards } from '../../../http/middleware/scope.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
@@ -117,6 +118,10 @@ describe('payments (integration)', () => {
   function build(options: { slug?: string; providerRef?: string; fetchFails?: boolean } = {}) {
     const slug = options.slug ?? testDb.config.defaultStoreSlug;
     const identityRepository = createIdentityRepository({ db: db() });
+    const scopeGuards = createScopeGuards({
+      loadSubject: async (params) => identityRepository.findSubjectById(params),
+      logger: silentLogger,
+    });
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const recorders = testRecorders(db());
 
@@ -161,7 +166,7 @@ describe('payments (integration)', () => {
        * Late-bound, exactly as `container.ts` does it: `payments` is constructed below and
        * needs `orders` through its own port, so the arrow defers the lookup to call time.
        */
-      payments: { statusForOrder: (input) => payments.statusForOrder(input) },
+      payments: { stateForOrder: (input) => payments.stateForOrder(input) },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -273,6 +278,7 @@ describe('payments (integration)', () => {
         orders,
         verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
         requireIdempotency: requireIdempotency({ store: idempotency, logger: silentLogger }),
+        requireStaff: scopeGuards.requireScope('staff'),
         logger: silentLogger,
       }),
     );
@@ -448,6 +454,29 @@ describe('payments (integration)', () => {
 
   const paymentRows = () => db().select().from(payment);
   const eventRows = () => db().select().from(paymentEvent);
+
+  /**
+   * Retry an assertion until it holds, or give up.
+   *
+   * For the one thing in this system that is deliberately NOT awaited: the idempotency
+   * middleware writes its completion or release after the response has already been sent. A
+   * test that reads the row once is racing that write, and loses often enough under parallel
+   * load to make the suite untrustworthy — which is worse than a slow test.
+   *
+   * Bounded, so a genuine regression still fails rather than hanging the run.
+   */
+  async function waitFor(assertion: () => Promise<void>, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        await assertion();
+        return;
+      } catch (err) {
+        if (Date.now() >= deadline) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
 
   /* ══ Authentication and authorization ═══════════════════════════════════ */
 
@@ -971,9 +1000,19 @@ describe('payments (integration)', () => {
        * "2xx completes the key; anything else releases it" — and it is the behaviour that
        * matters here: a gateway outage must not make the customer's own key unusable until it
        * expires. Asserted as the row being gone, because release deletes it.
+       *
+       * **Polled rather than read once.** The middleware releases the key AFTER the response has
+       * been sent and deliberately does not await that write — `captureResponse` says so: *"the
+       * response has already left, so making the client wait for bookkeeping would add latency
+       * to every successful request"*. So the row can still be present for a few milliseconds
+       * after a `503` reaches the client, and a single read is a race that fails under
+       * full-suite parallel load. This is the same fire-and-forget window that makes one test in
+       * `http/__tests__/idempotency.integration.test.ts` flaky.
        */
-      const claims = await db().select().from(idempotencyKey).where(eq(idempotencyKey.key, KEY));
-      expect(claims).toEqual([]);
+      await waitFor(async () => {
+        const claims = await db().select().from(idempotencyKey).where(eq(idempotencyKey.key, KEY));
+        expect(claims).toEqual([]);
+      });
     });
 
     /** The point of releasing: the very same key works once the gateway comes back. */

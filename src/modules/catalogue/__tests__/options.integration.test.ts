@@ -1340,8 +1340,19 @@ describe('variant options (integration)', () => {
       const audit = (await auditFor('product')).filter((r) => r.action === 'product.deleted');
       expect(audit).toHaveLength(1);
       const metadata = audit[0]?.metadata as Record<string, unknown>;
-      // Names are freed for reuse by the partial index, so the trail must say what went.
-      expect(metadata['cascadedOptionNames']).toEqual(['Size', 'Colour']);
+      /*
+       * Names are freed for reuse by the partial index, so the trail must say what went.
+       *
+       * Compared as a SET, not a sequence. `softDeleteOptionsForProduct` uses
+       * `UPDATE ... RETURNING` with no `ORDER BY`, and PostgreSQL makes no promise about the
+       * order rows come back in — so asserting a sequence was testing the planner, not the
+       * audit trail, and it failed intermittently under parallel load. What the trail actually
+       * has to record is WHICH options were cascaded.
+       */
+      expect(new Set(metadata['cascadedOptionNames'] as string[])).toEqual(
+        new Set(['Size', 'Colour']),
+      );
+      expect((metadata['cascadedOptionNames'] as string[]).length).toBe(2);
     });
   });
 

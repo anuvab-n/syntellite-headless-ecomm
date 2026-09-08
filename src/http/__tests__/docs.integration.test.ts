@@ -211,6 +211,12 @@ describe('API documentation', () => {
     apiRouter.post('/auth/reset-password', (_req, res) => {
       res.status(204).send();
     });
+    apiRouter.get('/admin/orders/:orderNumber/invoice', (_req, res) => {
+      res.status(200).type('html').send('<!doctype html><html></html>');
+    });
+    apiRouter.get('/users/me/orders/:orderNumber/invoice', (_req, res) => {
+      res.status(200).type('html').send('<!doctype html><html></html>');
+    });
     apiRouter.post('/users/me/orders/:orderNumber/cancel', (_req, res) => {
       res.status(200).json({ ok: true });
     });
@@ -347,6 +353,7 @@ describe('API documentation', () => {
         '/api/v1/admin/option-values/{id}',
         '/api/v1/admin/options/{id}',
         '/api/v1/admin/options/{id}/values',
+        '/api/v1/admin/orders/{orderNumber}/invoice',
         '/api/v1/admin/products',
         '/api/v1/admin/products/{slug}',
         '/api/v1/admin/products/{slug}/archive',
@@ -375,6 +382,7 @@ describe('API documentation', () => {
         '/api/v1/users/me/orders',
         '/api/v1/users/me/orders/{orderNumber}',
         '/api/v1/users/me/orders/{orderNumber}/cancel',
+        '/api/v1/users/me/orders/{orderNumber}/invoice',
         '/api/v1/users/me/orders/{orderNumber}/payment',
         '/api/v1/users/me/orders/{orderNumber}/payments',
         '/api/v1/users/me/password',

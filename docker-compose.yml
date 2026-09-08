@@ -1,28 +1,121 @@
-# Local development dependencies only. The API/worker/scheduler run on the host via
-# `pnpm dev` for fast reload; `docker compose --profile app up` runs them containerised
-# to verify the image before a deploy.
+# Local development dependencies.
+#
+# The API, worker and scheduler run on the HOST — `pnpm dev`, `pnpm dev:worker`,
+# `pnpm dev:scheduler` — for fast reload. There are deliberately no app services here: the
+# repository has no Dockerfile, so a containerised app is not something this file can express.
+# (The previous version advertised `docker compose --profile app up`, which did not exist.)
+#
+#   docker compose up -d              # Redis + MailHog — everything the app needs
+#   docker compose --profile local-db up -d   # ...plus a local Postgres, if you want one
+#   docker compose down               # stop
+#   docker compose down -v            # stop and discard the local Postgres volume
+#
+# ── The database is NOT here by default ────────────────────────────────────────────────────
+#
+# `DATABASE_URL` in `.env` points at Neon, so nothing in this file is needed to reach the
+# database. The `postgres` service below sits behind the `local-db` profile for the two cases
+# that still want one: working offline, and avoiding the ~200ms round trip to us-east-2.
+#
+# It is NOT what the test suite uses either. `tests/helpers/postgres.ts` starts its own
+# throwaway container per run via Testcontainers, so `pnpm test` needs neither this file nor a
+# running stack.
+#
+# ── No image is `-alpine` ─────────────────────────────────────────────────────────────────
+#
+# docs/DECISIONS.md §172: Debian-based images, **never** `-alpine`, because Alpine/musl images
+# fail to exec on some Docker Desktop + WSL2 kernels — "accessing a corrupted shared library",
+# reproducible with a bare `docker run alpine:3 echo ok`. That is not theoretical on this
+# machine: `postgres:16-alpine` failed exactly that way while this stack was being rewritten.
+#
+# The previous version applied the rule to Postgres and then used `redis:7-alpine` anyway.
+# Both are Debian now.
 name: ecom-backend
 
 services:
+  # ── Redis ───────────────────────────────────────────────────────────────────────────────
+  #
+  # REQUIRED. The API will not become ready without it: `/health/ready` treats it as a
+  # required dependency, because the lock database holds idempotency keys and rate-limit
+  # counters — losing a key there is a duplicate charge, not a cache miss.
+  redis:
+    image: redis:7
+    ports:
+      # Host port 56379, not 6379: that port is routinely held by another project's Redis, and
+      # a collision presents as a confusing "port already allocated". Matches the REDIS_*_URL
+      # values in .env and .env.example. Container-internal port stays 6379.
+      - '56379:6379'
+    # Persistence off: this instance holds nothing worth keeping across a restart, and an
+    # fsync in the middle of a test run is pure latency.
+    #
+    # NOTE: one instance backs all three logical databases (/0 cache, /1 locks, /2 queue), so
+    # they share an eviction policy. Production MUST separate them — /1 requires `noeviction`.
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Mailpit (SMTP catcher) ──────────────────────────────────────────────────────────────
+  #
+  # REQUIRED for password reset, and no longer decorative. `POST /auth/forgot-password` emits
+  # an outbox event whose handler sends the reset link over SMTP to `SMTP_HOST:SMTP_PORT`
+  # (localhost:1025). Without this running, the mail send throws, the outbox retries, and the
+  # customer never gets their link.
+  #
+  # **Read the mail at http://localhost:8025.** That is where the reset link appears — nothing
+  # leaves your machine.
+  #
+  # ── Mailpit, not MailHog ──
+  #
+  # The previous stack used `mailhog/mailhog`, which **cannot start on this machine**:
+  #
+  #   Error response from daemon: unable to find user mailhog:
+  #   no matching entries in passwd file
+  #
+  # and `-u root` fails the same way ("unable to find user root"), so the image's passwd file
+  # itself is unreadable — the Alpine/musl failure mode §172 describes, in its most complete
+  # form. There is no override that fixes it.
+  #
+  # Mailpit is MailHog's maintained successor by the same design: SMTP on 1025, web UI on 8025,
+  # no configuration. A drop-in swap that needs no change to `.env`, and it starts healthy here.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - '1025:1025' # SMTP — matches SMTP_PORT in .env
+      - '8025:8025' # Web UI — open this to read the reset emails
+    environment:
+      # Keep messages in memory only; a dev mailbox is not worth a volume.
+      MP_MAX_MESSAGES: '500'
+    # The image ships its own healthcheck, so none is declared here.
+    restart: unless-stopped
+
+  # ── Postgres (opt-in) ───────────────────────────────────────────────────────────────────
+  #
+  # NOT started by default — `.env` points at Neon. Bring it up with:
+  #
+  #   docker compose --profile local-db up -d
+  #
+  # then point DATABASE_URL at it and run `pnpm db:migrate && pnpm db:seed`:
+  #
+  #   DATABASE_URL=postgres://ecom:ecom@localhost:55432/ecom
   postgres:
-    # Debian-based, NOT `-alpine`. Alpine/musl images fail to exec on some Docker Desktop
-    # + WSL2 kernels ("accessing a corrupted shared library" — reproducible with a bare
-    # `docker run alpine:3 echo ok`). Debian costs ~80MB more and starts everywhere.
+    profiles: ['local-db']
     image: postgres:16
     environment:
       POSTGRES_USER: ecom
       POSTGRES_PASSWORD: ecom
       POSTGRES_DB: ecom
     ports:
-      # Non-default HOST port on purpose. 5432 is routinely taken by a native Postgres
-      # install, and a collision there produces a confusing "port already allocated"
-      # instead of an obvious one. Container-internal port stays 5432.
+      # Host port 55432, for the same reason Redis is remapped: 5432 is routinely taken by a
+      # native Postgres install.
       - '55432:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
     command:
-      # Surfaces slow queries during development rather than in production.
       - postgres
+      # Surfaces slow queries during development rather than in production.
       - -c
       - log_min_duration_statement=200
     healthcheck:
@@ -30,57 +123,17 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      # Also remapped: 6379 is commonly held by another project's Redis.
-      - '56379:6379'
-    # NOTE: one local instance backs all three logical DBs, so the eviction policy is
-    # shared. Production MUST separate them — the lock DB requires `noeviction`.
-    command: ['redis-server', '--save', '', '--appendonly', 'no']
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  minio:
-    image: minio/minio:latest
-    command: ['server', '/data', '--console-address', ':9001']
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - '9000:9000'
-      - '9001:9001'
-    volumes:
-      - miniodata:/data
-    healthcheck:
-      test: ['CMD', 'mc', 'ready', 'local']
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  # Creates the media bucket once, then exits.
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/ecom-media &&
-      mc anonymous set download local/ecom-media
-      "
-
-  mailhog:
-    image: mailhog/mailhog:latest
-    ports:
-      - '1025:1025' # SMTP
-      - '8025:8025' # web UI
-
+# ── What was removed, and why ─────────────────────────────────────────────────────────────
+#
+# `minio` and `minio-init` are gone. They existed for object storage that does not exist:
+# nothing in `src/` reads `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID` or `S3_SECRET_ACCESS_KEY`, and
+# those three keys have been dropped from `.env` for the same reason. `S3_BUCKET` and
+# `S3_REGION` remain only because `config.ts` requires them to boot.
+#
+# Two containers, a volume and a bucket-creation job for a feature with no code is a stack
+# people learn to skip — and a stack people skip stops being trustworthy. They come back with
+# the increment that actually uploads a file.
 volumes:
   pgdata:
-  miniodata:

@@ -1,10 +1,19 @@
 import { z } from 'zod';
 
+import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
+
 import {
   MAX_PROMOTION_PERCENT,
   PROMOTION_DISCOUNT_TYPES,
   type PromotionRecord,
 } from './promotions.repository.js';
+
+/**
+ * Re-exported, so a caller of this module needs one import rather than two.
+ *
+ * The shape lives in `shared/pagination.ts` — one definition for every list endpoint.
+ */
+export type { PaginationResponse };
 
 /**
  * The promotions module's wire contracts.
@@ -135,29 +144,6 @@ const discountTypeField = z.enum(PROMOTION_DISCOUNT_TYPES);
 export const PromotionCodeParamsSchema = z.object({ code: codeField });
 
 export type PromotionCodeParams = z.infer<typeof PromotionCodeParamsSchema>;
-
-/**
- * A digits-only query parameter, parsed then bounds-checked.
- *
- * The same construction §28 arrived at for products, and for the same reasons: not
- * `z.coerce.number()`, because `Number('')` is `0` and `?offset=` would silently mean the first
- * page; and the default applied AFTER the pipe, because `.default()` short-circuits a pipe and
- * would return a string.
- */
-const boundedIntParam = (opts: { min: number; max?: number; default: number }) => {
-  const bounds =
-    opts.max === undefined
-      ? z.number().int().min(opts.min)
-      : z.number().int().min(opts.min).max(opts.max);
-
-  return z
-    .string()
-    .regex(/^\d+$/, 'must be a whole number')
-    .transform(Number)
-    .pipe(bounds)
-    .optional()
-    .transform((value) => value ?? opts.default);
-};
 
 export const ListPromotionsQuerySchema = z.strictObject({
   limit: boundedIntParam({
@@ -317,12 +303,6 @@ export type PromotionResponse = {
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
-};
-
-export type PaginationResponse = {
-  limit: number;
-  offset: number;
-  total: number;
 };
 
 export function toPromotionResponse(row: PromotionRecord): PromotionResponse {

@@ -38,4 +38,5 @@ export {
   type OrderLineRecord,
 } from './orders.repository.js';
 export { createOrdersRoutes } from './orders.routes.js';
+export { renderInvoice, type InvoiceInput, type InvoicePaymentState } from './invoice.js';
 export { ORDER_AUDIT, ORDER_RESOURCE } from './orders.events.js';

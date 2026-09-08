@@ -9,7 +9,7 @@ import { createIdempotencyStore } from '../../../db/idempotency/idempotency.repo
 import { address } from '../../../db/schema/address.js';
 import { cart, cartLine } from '../../../db/schema/cart.js';
 import { product, sku } from '../../../db/schema/catalogue.js';
-import { auditLog } from '../../../db/schema/identity.js';
+import { appUser, auditLog } from '../../../db/schema/identity.js';
 import { idempotencyKey } from '../../../db/schema/idempotency.js';
 import { stockItem, stockLedger } from '../../../db/schema/inventory.js';
 import { order, orderLine, orderStatusHistory } from '../../../db/schema/orders.js';
@@ -31,6 +31,7 @@ import { newId } from '../../../shared/id.js';
 import { createCartRepository } from '../../cart/cart.repository.js';
 import { createCartRoutes } from '../../cart/cart.routes.js';
 import { createCartService } from '../../cart/cart.service.js';
+import { createScopeGuards } from '../../../http/middleware/scope.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
@@ -100,8 +101,34 @@ describe('orders (integration)', () => {
 
   const db = () => testDb.handle.db;
 
+  /**
+   * Retry an assertion until it holds, or give up.
+   *
+   * For the one write in this system that is deliberately not awaited: the idempotency
+   * middleware completes or releases the key after the response has already been sent. Reading
+   * the row once immediately afterwards races that write.
+   *
+   * Bounded, so a genuine regression still fails rather than hanging the run.
+   */
+  async function waitFor(assertion: () => Promise<void>, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        await assertion();
+        return;
+      } catch (err) {
+        if (Date.now() >= deadline) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
+
   function build(slug = testDb.config.defaultStoreSlug) {
     const identityRepository = createIdentityRepository({ db: db() });
+    const scopeGuards = createScopeGuards({
+      loadSubject: async (params) => identityRepository.findSubjectById(params),
+      logger: silentLogger,
+    });
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const recorders = testRecorders(db());
 
@@ -150,7 +177,7 @@ describe('orders (integration)', () => {
        * payment' is the truthful wiring for it; cancellation against a real payment is covered
        * by `order-cancellation.integration.test.ts`, which wires the real service.
        */
-      payments: { statusForOrder: async () => null },
+      payments: { stateForOrder: async () => null },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -192,6 +219,7 @@ describe('orders (integration)', () => {
         orders,
         verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
         requireIdempotency: requireIdempotency({ store: idempotency, logger: silentLogger }),
+        requireStaff: scopeGuards.requireScope('staff'),
         logger: silentLogger,
       }),
     );
@@ -212,13 +240,22 @@ describe('orders (integration)', () => {
   async function signIn(
     app: App,
     identity: Identity,
-    options: { email?: string; storeId?: string } = {},
+    options: { email?: string; storeId?: string; staff?: boolean } = {},
   ): Promise<{ token: string; userId: string }> {
     const email = options.email ?? 'ada@example.com';
     const user = await identity.registerCustomer({
       storeId: options.storeId ?? storeId,
       input: { email, password: PASSWORD, firstName: 'Ada', lastName: 'Lovelace' },
     });
+
+    /*
+     * Promoted by UPDATE, not by an endpoint, because no endpoint grants `is_staff` — that
+     * would be a privilege-escalation route on a public API. The token is minted after the
+     * promotion so it carries the scope.
+     */
+    if (options.staff === true) {
+      await db().update(appUser).set({ isStaff: true }).where(eq(appUser.id, user.id));
+    }
 
     const response = await request(app)
       .post('/api/v1/auth/login')
@@ -1014,8 +1051,19 @@ describe('orders (integration)', () => {
       expect(
         (await checkout(built.app, { addressId: addr.id }, { token: auth.token, key: KEY })).status,
       ).toBe(422);
-      // A 4xx releases, so the SAME key is usable again — the customer fixes the cart and retries.
-      expect(await db().select().from(idempotencyKey)).toEqual([]);
+      /*
+       * A 4xx releases, so the SAME key is usable again — the customer fixes the cart and
+       * retries.
+       *
+       * Polled, because the middleware performs that release AFTER the response has been sent
+       * and deliberately does not await it: *"the response has already left, so making the
+       * client wait for bookkeeping would add latency to every successful request"*. Reading
+       * once here is a race that is lost often enough under full-suite parallel load to make
+       * this test flaky. A deterministic read passes on the first attempt.
+       */
+      await waitFor(async () => {
+        expect(await db().select().from(idempotencyKey)).toEqual([]);
+      });
 
       await request(built.app)
         .delete(`/api/v1/users/me/cart/items/${CODE_B}`)
@@ -1031,6 +1079,305 @@ describe('orders (integration)', () => {
   });
 
   /* ── The address snapshot ──────────────────────────────────────────────── */
+
+  /* ── The invoice endpoint ──────────────────────────────────────────────── */
+
+  /**
+   * The route, not the document. `invoice.test.ts` attacks the rendering — escaping, money,
+   * banners — against a literal record; what is left to prove here is that the endpoint is
+   * mounted, scoped to the owner, and sends the headers an HTML response in a
+   * CSP-disabled API needs.
+   */
+  describe('the invoice', () => {
+    const invoice = (app: App, orderNumber: string, token?: string) => {
+      const req = request(app).get(`/api/v1/users/me/orders/${orderNumber}/invoice`);
+      return token === undefined ? req : req.set('Authorization', `Bearer ${token}`);
+    };
+
+    it('serves an HTML document for the customer’s own order', async () => {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      expect(placed.status).toBe(201);
+      const orderNumber = placed.body.order.orderNumber as string;
+
+      const response = await invoice(built.app, orderNumber, built.token);
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toMatch(/text\/html/);
+      expect(response.text.startsWith('<!doctype html>')).toBe(true);
+      expect(response.text).toContain('Syntellite Innovation');
+      expect(response.text).toContain(orderNumber);
+      /* An unpaid order is a proforma, and the document says so. */
+      expect(response.text).toContain('Proforma');
+    });
+
+    /**
+     * The two headers this route sets and no other does.
+     *
+     * `Content-Security-Policy` because `app.ts` turns CSP off globally on the stated grounds
+     * that the API serves no HTML — so this response has to carry its own. `no-store` because
+     * the document contains a delivery address, and a shared cache holding one is a leak.
+     */
+    it('sets a restrictive CSP and refuses to be cached', async () => {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      const orderNumber = placed.body.order.orderNumber as string;
+
+      const response = await invoice(built.app, orderNumber, built.token);
+
+      expect(response.headers['content-security-policy']).toContain("default-src 'none'");
+      expect(response.headers['content-security-policy']).toContain("style-src 'unsafe-inline'");
+      expect(response.headers['cache-control']).toBe('private, no-store');
+    });
+
+    it('requires authentication', async () => {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      const orderNumber = placed.body.order.orderNumber as string;
+
+      expect((await invoice(built.app, orderNumber)).status).toBe(401);
+    });
+
+    /** Another customer's invoice is a `404`, exactly as their order is — never a `403`. */
+    it('returns 404 for another customer’s order, as JSON not HTML', async () => {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      const orderNumber = placed.body.order.orderNumber as string;
+
+      const other = await signIn(built.app, built.identity, { email: 'mallory@example.com' });
+      const response = await invoice(built.app, orderNumber, other.token);
+
+      expect(response.status).toBe(404);
+      expect(response.headers['content-type']).toMatch(/application\/json/);
+      expect(response.body.error.code).toBe('NOT_FOUND');
+    });
+
+    it('rejects a malformed order number', async () => {
+      const built = build();
+      const auth = await signIn(built.app, built.identity);
+      expect((await invoice(built.app, 'not-an-order', auth.token)).status).toBe(400);
+    });
+
+    it('returns 404 for an order that does not exist', async () => {
+      const built = build();
+      const auth = await signIn(built.app, built.identity);
+      expect((await invoice(built.app, 'ORD-20260907-ZZZZZZ', auth.token)).status).toBe(404);
+    });
+
+    /** The document reflects the order it was built from, including its money. */
+    it('shows the order’s own totals', async () => {
+      const built = await readyToCheckout([{ quantity: 1 }]);
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      const orderNumber = placed.body.order.orderNumber as string;
+
+      const response = await invoice(built.app, orderNumber, built.token);
+
+      /* `1000.0000` on the order renders as the display form. */
+      expect(placed.body.order.total).toBe('1000.0000');
+      expect(response.text).toContain('₹1,000.00');
+    });
+  });
+
+  /* ── The staff invoice route ───────────────────────────────────────────── */
+
+  /**
+   * `GET /admin/orders/{orderNumber}/invoice` — the same document, one predicate wider.
+   *
+   * What has to be proved is precisely the difference from the customer route: staff reach ANY
+   * order in their store, staff reach NO order outside it, and a non-staff caller is refused
+   * even for an order they own. The document itself is `invoice.test.ts`'s job.
+   */
+  describe('the staff invoice', () => {
+    const adminInvoice = (app: App, orderNumber: string, token?: string) => {
+      const req = request(app).get(`/api/v1/admin/orders/${orderNumber}/invoice`);
+      return token === undefined ? req : req.set('Authorization', `Bearer ${token}`);
+    };
+
+    /** Places an order as a customer and returns its number, plus the app it lives in. */
+    async function givenSomeonesOrder(): Promise<{
+      app: App;
+      identity: Identity;
+      orderNumber: string;
+    }> {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      expect(placed.status).toBe(201);
+      return {
+        app: built.app,
+        identity: built.identity,
+        orderNumber: placed.body.order.orderNumber as string,
+      };
+    }
+
+    /** The feature: an order staff did not place, and do not own, still renders. */
+    it('serves the invoice for another customer’s order', async () => {
+      const { app, identity, orderNumber } = await givenSomeonesOrder();
+      const staff = await signIn(app, identity, { email: 'ops@example.com', staff: true });
+
+      const response = await adminInvoice(app, orderNumber, staff.token);
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toMatch(/text\/html/);
+      expect(response.text.startsWith('<!doctype html>')).toBe(true);
+      expect(response.text).toContain('Syntellite Innovation');
+      expect(response.text).toContain(orderNumber);
+    });
+
+    /**
+     * The same response hardening as the customer route.
+     *
+     * Asserted separately rather than assumed from the shared helper: a future refactor that
+     * gave this route its own `res.send` would pass every other test in this block.
+     */
+    it('sets the same restrictive CSP and refuses to be cached', async () => {
+      const { app, identity, orderNumber } = await givenSomeonesOrder();
+      const staff = await signIn(app, identity, { email: 'ops@example.com', staff: true });
+
+      const response = await adminInvoice(app, orderNumber, staff.token);
+
+      expect(response.headers['content-security-policy']).toContain("default-src 'none'");
+      expect(response.headers['cache-control']).toBe('private, no-store');
+    });
+
+    /** The document is byte-identical to the one the customer gets. Two routes, one renderer. */
+    it('renders exactly what the customer’s own route renders', async () => {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      const orderNumber = placed.body.order.orderNumber as string;
+      const staff = await signIn(built.app, built.identity, {
+        email: 'ops@example.com',
+        staff: true,
+      });
+
+      const mine = await request(built.app)
+        .get(`/api/v1/users/me/orders/${orderNumber}/invoice`)
+        .set('Authorization', `Bearer ${built.token}`);
+      const theirs = await adminInvoice(built.app, orderNumber, staff.token);
+
+      expect(mine.status).toBe(200);
+      expect(theirs.status).toBe(200);
+      expect(theirs.text).toBe(mine.text);
+    });
+
+    /** Authorization, not ownership, is what this route turns on. */
+    it('refuses a customer — even for their own order', async () => {
+      const built = await readyToCheckout();
+      const placed = await checkout(
+        built.app,
+        { addressId: built.address.id },
+        { token: built.token, key: KEY },
+      );
+      const orderNumber = placed.body.order.orderNumber as string;
+
+      const response = await adminInvoice(built.app, orderNumber, built.token);
+
+      expect(response.status).toBe(403);
+      expect(response.body.error.code).toBe('PERMISSION_DENIED');
+    });
+
+    it('requires a token', async () => {
+      const { app, orderNumber } = await givenSomeonesOrder();
+      expect((await adminInvoice(app, orderNumber)).status).toBe(401);
+    });
+
+    /**
+     * Tenancy is NOT relaxed, and this is the assertion that says so.
+     *
+     * Staff of another store present a valid staff token and still get a 404 — the same answer
+     * the order number would get if it had never existed.
+     */
+    it('does not reach an order in another store', async () => {
+      const otherStoreId = newId();
+      await db()
+        .insert(store)
+        .values({ id: otherStoreId, slug: 'other', name: 'Other', isActive: true });
+
+      const { orderNumber } = await givenSomeonesOrder();
+
+      /*
+       * A second app bound to the other store, because a store is resolved from the host and a
+       * login cannot cross that boundary — the same shape the `ownership and tenancy` block
+       * uses. `theirs` is a genuine staff token; it is only the tenant that differs.
+       */
+      const theirs = build('other');
+      const outsider = await signIn(theirs.app, theirs.identity, {
+        email: 'ops-elsewhere@example.com',
+        storeId: otherStoreId,
+        staff: true,
+      });
+
+      const response = await adminInvoice(theirs.app, orderNumber, outsider.token);
+
+      expect(response.status).toBe(404);
+      expect(response.headers['content-type']).toMatch(/application\/json/);
+      expect(response.body.error.code).toBe('NOT_FOUND');
+    });
+
+    it('rejects a malformed order number', async () => {
+      const built = build();
+      const staff = await signIn(built.app, built.identity, {
+        email: 'ops@example.com',
+        staff: true,
+      });
+      expect((await adminInvoice(built.app, 'not-an-order', staff.token)).status).toBe(400);
+    });
+
+    it('returns 404 for an order that does not exist', async () => {
+      const built = build();
+      const staff = await signIn(built.app, built.identity, {
+        email: 'ops@example.com',
+        staff: true,
+      });
+      expect((await adminInvoice(built.app, 'ORD-20260907-ZZZZZZ', staff.token)).status).toBe(404);
+    });
+
+    /**
+     * The repository predicate, exercised directly.
+     *
+     * Through HTTP alone, dropping the `store_id` filter from `findStoreOrderByNumber` would
+     * still look correct, because the outsider's token would 404 on scope resolution long
+     * before the query ran. This kills that mutant.
+     */
+    it('scopes the repository query by store', async () => {
+      const { orderNumber } = await givenSomeonesOrder();
+      const repository = createOrdersRepository({ db: db() });
+
+      await expect(repository.findStoreOrderByNumber({ orderNumber, storeId })).resolves.toEqual(
+        expect.objectContaining({ orderNumber }),
+      );
+      await expect(
+        repository.findStoreOrderByNumber({ orderNumber, storeId: newId() }),
+      ).resolves.toBeUndefined();
+    });
+  });
 
   describe('the address snapshot', () => {
     it('copies every delivery field', async () => {

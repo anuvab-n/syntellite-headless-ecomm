@@ -2,6 +2,7 @@ import { and, eq, isNull, sql } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { appUser } from '../../db/schema/identity.js';
+import { uniqueViolationConstraint } from '../../db/errors.js';
 import { executor } from '../../db/transaction.js';
 import type { MappableUser } from './dto.js';
 
@@ -151,64 +152,20 @@ export type EditableUserFields = {
   acceptsMarketing?: boolean;
 };
 
-/**
- * PostgreSQL unique-violation SQLSTATE.
- *
- * Matched on the code, and on the specific constraint name, rather than on the message
- * text — messages are localised and reworded between server versions.
- */
-const UNIQUE_VIOLATION = '23505';
-
 /** The partial unique index on `(store_id, lower(email)) WHERE deleted_at IS NULL`. */
 export const EMAIL_UNIQUE_CONSTRAINT = 'uq_user_email_active';
 
 /** The partial unique index on `(store_id, phone) WHERE deleted_at IS NULL AND phone IS NOT NULL`. */
 export const PHONE_UNIQUE_CONSTRAINT = 'uq_user_phone_active';
 
-type PostgresError = { code?: unknown; constraint?: unknown; cause?: unknown };
-
 /**
- * How far to walk the `cause` chain.
+ * Re-exported so `identity.service.ts` keeps importing it from here, unchanged.
  *
- * Bounded so a self-referential `cause` cannot spin. Three is ample: Drizzle adds exactly
- * one wrapper today.
+ * The implementation moved to `db/errors.ts` once a second caller appeared — which is exactly
+ * what the note that used to sit here anticipated: *"a shared helper invented for a single
+ * caller is a guess about the second one."* There are four now.
  */
-const MAX_CAUSE_DEPTH = 3;
-
-/**
- * Identify a unique violation, and which constraint it hit.
- *
- * Walks the `cause` chain, which is not optional politeness — it is required. Drizzle does
- * not throw the driver's error: it wraps it in a `DrizzleQueryError` whose own properties are
- * `query`, `params`, and `cause`. The SQLSTATE and constraint name live on `cause`, so a
- * top-level check finds `undefined` and reports "not a unique violation" for something that
- * plainly is.
- *
- * That mattered: with the top-level check only, the pre-check path returned a clean 409 while
- * the RACE path — the one this exists for, and the one a pre-check cannot cover — returned a
- * 500. It looked correct in every sequential test.
- *
- * Kept local rather than promoted to shared infrastructure: one module needs it today, and a
- * shared helper invented for a single caller is a guess about the second one.
- */
-export function uniqueViolationConstraint(err: unknown): string | undefined {
-  let current: unknown = err;
-
-  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
-    if (typeof current !== 'object' || current === null) return undefined;
-
-    const candidate = current as PostgresError;
-    if (candidate.code === UNIQUE_VIOLATION) {
-      // `''` rather than undefined when the name is absent: the caller distinguishes "a
-      // unique violation on an unknown constraint" (rethrow) from "not a unique violation".
-      return typeof candidate.constraint === 'string' ? candidate.constraint : '';
-    }
-
-    current = candidate.cause;
-  }
-
-  return undefined;
-}
+export { uniqueViolationConstraint };
 
 export function createIdentityRepository(deps: { db: Database }) {
   const { db } = deps;

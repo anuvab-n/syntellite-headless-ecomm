@@ -27,6 +27,7 @@ import { createRazorpayGateway } from '../../../razorpay/gateway.js';
 import { createCartRepository } from '../../cart/cart.repository.js';
 import { createCartRoutes } from '../../cart/cart.routes.js';
 import { createCartService } from '../../cart/cart.service.js';
+import { createScopeGuards } from '../../../http/middleware/scope.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
@@ -91,6 +92,10 @@ describe('payments edge cases (integration)', () => {
 
   function build(options: { providerRef?: string } = {}) {
     const identityRepository = createIdentityRepository({ db: db() });
+    const scopeGuards = createScopeGuards({
+      loadSubject: async (params) => identityRepository.findSubjectById(params),
+      logger: silentLogger,
+    });
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const recorders = testRecorders(db());
 
@@ -135,7 +140,7 @@ describe('payments edge cases (integration)', () => {
        * Late-bound, exactly as `container.ts` does it: `payments` is constructed below and
        * needs `orders` through its own port, so the arrow defers the lookup to call time.
        */
-      payments: { statusForOrder: (input) => payments.statusForOrder(input) },
+      payments: { stateForOrder: (input) => payments.stateForOrder(input) },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -242,6 +247,7 @@ describe('payments edge cases (integration)', () => {
         orders,
         verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
         requireIdempotency: requireIdempotency({ store: idempotency, logger: silentLogger }),
+        requireStaff: scopeGuards.requireScope('staff'),
         logger: silentLogger,
       }),
     );

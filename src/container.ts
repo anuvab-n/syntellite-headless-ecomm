@@ -752,10 +752,11 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      * an eager reference here would be a `TypeError` at construction and a cycle
      * `dependency-cruiser` would rightly reject.
      *
-     * Orders asks for a status string; payments answers one. Neither names the other.
+     * Orders asks for a status and a method; payments answers with both. Neither names the
+     * other.
      */
     payments: {
-      statusForOrder: (input) => payments.statusForOrder(input),
+      stateForOrder: (input) => payments.stateForOrder(input),
     },
     db: db.db,
     audit,
@@ -908,6 +909,10 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
        * it read the authenticated user for the key scope.
        */
       requireIdempotency: requireIdempotency({ store: idempotency, logger }),
+      // For the ONE staff route in this module: the invoice for any order in the store. The
+      // guard is built against identity's authorization loader, which orders must not import,
+      // so it arrives pre-built exactly as the catalogue's and promotions' do.
+      requireStaff: scopeGuards.requireScope('staff'),
       logger,
     }),
   );

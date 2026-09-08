@@ -1,7 +1,16 @@
 import { z } from 'zod';
 
+import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
+
 import { STOCK_REASONS } from './inventory.repository.js';
 import type { StockLedgerRecord, StockRecord } from './inventory.repository.js';
+
+/**
+ * Re-exported, so a caller of this module needs one import rather than two.
+ *
+ * The shape lives in `shared/pagination.ts` — one definition for every list endpoint.
+ */
+export type { PaginationResponse };
 
 /**
  * The inventory module's wire contracts.
@@ -58,28 +67,6 @@ const deltaField = z
   .min(-MAX_ADJUSTMENT_DELTA)
   .max(MAX_ADJUSTMENT_DELTA)
   .refine((value) => value !== 0, { message: 'must not be zero' });
-
-/**
- * A digits-only query parameter, parsed then bounds-checked.
- *
- * The same helper shape the catalogue DTO uses, and restated for the same reason as
- * `skuCodeField`. NOT `z.coerce.number()`: `Number('')` is `0`, so `?offset=` would pass
- * validation and silently return the first page.
- */
-const boundedIntParam = (opts: { min: number; max?: number; default: number }) => {
-  const bounds =
-    opts.max === undefined
-      ? z.number().int().min(opts.min)
-      : z.number().int().min(opts.min).max(opts.max);
-
-  return z
-    .string()
-    .regex(/^\d+$/, 'must be a whole number')
-    .transform(Number)
-    .pipe(bounds)
-    .optional()
-    .transform((value) => value ?? opts.default);
-};
 
 export const INVENTORY_LIST_DEFAULT_LIMIT = 20;
 export const INVENTORY_LIST_MAX_LIMIT = 100;
@@ -227,13 +214,6 @@ export function toStockLedgerResponse(record: StockLedgerRecord): StockLedgerRes
     createdAt: record.createdAt.toISOString(),
   };
 }
-
-/** Pagination metadata, matching the catalogue list responses exactly. */
-export type PaginationResponse = {
-  limit: number;
-  offset: number;
-  total: number;
-};
 
 export type StockListResponse = {
   inventory: StockResponse[];

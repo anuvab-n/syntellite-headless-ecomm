@@ -1,8 +1,17 @@
 import { z } from 'zod';
 
+import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
+
 import { PAYMENT_METHODS } from './payments.repository.js';
 import type { PaymentEventRecord, PaymentRecord } from './payments.repository.js';
 import type { PaymentHandoff, PaymentView } from './payments.service.js';
+
+/**
+ * Re-exported, so a caller of this module needs one import rather than two.
+ *
+ * The shape lives in `shared/pagination.ts` — one definition for every list endpoint.
+ */
+export type { PaginationResponse };
 
 /**
  * The payments module's request and response contracts.
@@ -63,28 +72,6 @@ export type InitiatePaymentRequest = z.infer<typeof InitiatePaymentRequestSchema
 
 export const PAYMENT_LIST_DEFAULT_LIMIT = 20;
 export const PAYMENT_LIST_MAX_LIMIT = 100;
-
-/**
- * Pagination for the customer's payment list.
- *
- * Copied in shape from `ListOrdersQuerySchema` rather than invented: a customer paging their
- * payments and paging their orders should not need two different mental models. `strictObject`,
- * so an unknown query key is a `400` — a client mistyping `offset` as `ofset` learns immediately
- * instead of silently reading page one forever.
- */
-const boundedIntParam = (opts: { min: number; max?: number; default: number }) => {
-  const bounds =
-    opts.max === undefined
-      ? z.number().int().min(opts.min)
-      : z.number().int().min(opts.min).max(opts.max);
-  return z
-    .string()
-    .regex(/^\d+$/, 'must be a whole number')
-    .transform(Number)
-    .pipe(bounds)
-    .optional()
-    .transform((value) => value ?? opts.default);
-};
 
 export const ListPaymentsQuerySchema = z.strictObject({
   limit: boundedIntParam({
@@ -162,12 +149,6 @@ export function toPaymentResponse(view: PaymentView, orderNumber: string): Payme
     history: view.events.map(toEventResponse),
   };
 }
-
-export type PaginationResponse = {
-  limit: number;
-  offset: number;
-  total: number;
-};
 
 export type PaymentListResponse = {
   payments: PaymentResponse[];

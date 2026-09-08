@@ -190,6 +190,38 @@ describe('idempotency middleware (integration)', () => {
     return row;
   };
 
+  /**
+   * Retry an assertion until it holds, or give up.
+   *
+   * **Required for anything that reads the row after a request.** `captureResponse` records the
+   * completion or release AFTER the response has been sent and deliberately does not await that
+   * write — *"the response has already left, so making the client wait for bookkeeping would
+   * add latency to every successful request for no benefit to that request."* So a read taken
+   * the instant a response arrives is racing a write that has not happened yet.
+   *
+   * Sequentially that race is almost always won by the reader-after; under the parallel load of
+   * a full suite run it is lost often enough to make this file the single largest source of
+   * spurious failures. A deterministic assertion passes on the first attempt and costs nothing.
+   *
+   * Bounded, so a genuine regression still fails rather than hanging the run.
+   *
+   * Only the assertions that follow an un-awaited write use this. A read of a CLAIM is not
+   * wrapped: `claim()` runs in its own transaction and is awaited before the handler, so the
+   * row is committed by the time any response exists.
+   */
+  async function waitFor(assertion: () => Promise<void>, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        await assertion();
+        return;
+      } catch (err) {
+        if (Date.now() >= deadline) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
+
   /* ── The header is mandatory ───────────────────────────────────────────── */
 
   describe('key requirement', () => {
@@ -263,13 +295,15 @@ describe('idempotency middleware (integration)', () => {
 
       await post(built, '/create', KEY);
 
-      const row = await rowFor(KEY);
-      expect(row?.status).toBe('completed');
-      expect(row?.responseStatus).toBe(201);
-      expect(row?.responseBody).toEqual({ orderId: 'order-1', executions: 1 });
-      expect(row?.completedAt).not.toBeNull();
-      expect(row?.storeId).toBe(storeId);
-      expect(row?.endpoint).toContain('/create');
+      await waitFor(async () => {
+        const row = await rowFor(KEY);
+        expect(row?.status).toBe('completed');
+        expect(row?.responseStatus).toBe(201);
+        expect(row?.responseBody).toEqual({ orderId: 'order-1', executions: 1 });
+        expect(row?.completedAt).not.toBeNull();
+        expect(row?.storeId).toBe(storeId);
+        expect(row?.endpoint).toContain('/create');
+      });
     });
 
     it('does not replay across different keys', async () => {
@@ -536,7 +570,9 @@ describe('idempotency middleware (integration)', () => {
        * 500 as the completed answer would make a transient failure permanent for that key —
        * the client would retry correctly and be handed the error forever.
        */
-      expect(await rows()).toEqual([]);
+      await waitFor(async () => {
+        expect(await rows()).toEqual([]);
+      });
 
       const retry = await post(built, '/failing', KEY);
       expect(retry.status).toBe(500);
@@ -547,7 +583,9 @@ describe('idempotency middleware (integration)', () => {
       const built = build();
 
       expect((await post(built, '/rejects', KEY)).status).toBe(422);
-      expect(await rows()).toEqual([]);
+      await waitFor(async () => {
+        expect(await rows()).toEqual([]);
+      });
 
       expect((await post(built, '/rejects', KEY)).status).toBe(422);
       expect(built.executionCount()).toBe(2);
@@ -567,10 +605,12 @@ describe('idempotency middleware (integration)', () => {
        * also required a non-null body, so a 204 could neither complete (rejected) nor be
        * safely released (it had succeeded), and the key stayed pinned until expiry.
        */
-      const row = await rowFor(KEY);
-      expect(row?.status).toBe('completed');
-      expect(row?.responseStatus).toBe(204);
-      expect(row?.responseBody).toBeNull();
+      await waitFor(async () => {
+        const row = await rowFor(KEY);
+        expect(row?.status).toBe('completed');
+        expect(row?.responseStatus).toBe(204);
+        expect(row?.responseBody).toBeNull();
+      });
 
       const retry = await post(built, '/no-body', KEY);
       expect(retry.status).toBe(204);

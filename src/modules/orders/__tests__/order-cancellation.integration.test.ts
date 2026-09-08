@@ -28,6 +28,7 @@ import { createRazorpayGateway } from '../../../razorpay/gateway.js';
 import { createCartRepository } from '../../cart/cart.repository.js';
 import { createCartRoutes } from '../../cart/cart.routes.js';
 import { createCartService } from '../../cart/cart.service.js';
+import { createScopeGuards } from '../../../http/middleware/scope.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
 import { createIdentityService } from '../../identity/identity.service.js';
@@ -96,6 +97,10 @@ describe('order cancellation (integration)', () => {
 
   function build() {
     const identityRepository = createIdentityRepository({ db: db() });
+    const scopeGuards = createScopeGuards({
+      loadSubject: async (params) => identityRepository.findSubjectById(params),
+      logger: silentLogger,
+    });
     const tokens = createTokenService({ config: testDb.config, logger: silentLogger });
     const recorders = testRecorders(db());
 
@@ -148,7 +153,7 @@ describe('order cancellation (integration)', () => {
           }),
       },
       /** The REAL payment lookup, late-bound exactly as `container.ts` binds it. */
-      payments: { statusForOrder: (input) => payments.statusForOrder(input) },
+      payments: { stateForOrder: (input) => payments.stateForOrder(input) },
       db: db(),
       audit: recorders.audit,
       logger: silentLogger,
@@ -230,6 +235,7 @@ describe('order cancellation (integration)', () => {
         orders,
         verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
         requireIdempotency: requireIdempotency({ store: idempotency, logger: silentLogger }),
+        requireStaff: scopeGuards.requireScope('staff'),
         logger: silentLogger,
       }),
     );

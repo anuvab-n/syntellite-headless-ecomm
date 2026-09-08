@@ -1,6 +1,7 @@
 import { randomInt } from 'node:crypto';
 
 import type { Database } from '../../db/client.js';
+import { uniqueViolationConstraint } from '../../db/errors.js';
 import { withTransaction } from '../../db/transaction.js';
 import type { AuditActor, AuditTrail } from '../../shared/audit.js';
 import { BusinessRuleViolation, Conflict, NotFound } from '../../shared/errors.js';
@@ -153,15 +154,21 @@ export type CheckoutIdempotency = {
  * `container.ts` adapts one onto the other. `no-cross-module-imports` is satisfied by
  * construction rather than by an exception.
  *
- * Deliberately a STATUS rather than a payment. Cancellation needs to answer one question — has
- * money moved, or might it be moving — and handing this module a whole payment would let it
- * start reasoning about amounts and providers, which are not its business.
+ * Deliberately a STATUS and a METHOD, never a payment. Two callers need exactly this much:
+ * cancellation asks "has money moved, or might it be moving", and the invoice asks the same
+ * plus "is this cash on delivery" so it can word the document correctly. Handing this module a
+ * whole payment would let it start reasoning about amounts, providers and provider references,
+ * none of which are its business.
  *
- * `null` means no payment exists. That is a different answer from any status, and the
- * cancellation rule treats it differently, so it must not be collapsed into one.
+ * `null` means no payment exists at all. That is a different answer from any status — the
+ * cancellation rule permits it where it refuses `pending`, and the invoice renders it as a
+ * proforma — so it must not be collapsed into one.
  */
 export type OrderPayments = {
-  statusForOrder(params: { orderId: string; storeId: string }): Promise<string | null>;
+  stateForOrder(params: {
+    orderId: string;
+    storeId: string;
+  }): Promise<{ status: string; method: string } | null>;
 };
 
 /* ── Errors ──────────────────────────────────────────────────────────────── */
@@ -284,6 +291,33 @@ export function createOrdersService(deps: {
    * A store configured with a currency this build does not know is an OPERATOR error, so it
    * surfaces as a 500 — the same judgement the cart, catalogue and promotions services make.
    */
+  /**
+   * The lines and payment state an invoice needs, given an already-authorized order header.
+   *
+   * Shared by the customer and staff invoice methods so the two can never drift into rendering
+   * different documents for the same order. It takes the header rather than the lookup keys
+   * precisely so that **the caller owns the access predicate** — this function cannot widen or
+   * narrow it, and reading it tells you nothing about who is allowed to see what. That is
+   * deliberate: the scoping decision stays visible at the two call sites, one per audience.
+   *
+   * `undefined` in means `404` out, so an unknown order, another customer's and another
+   * store's stay indistinguishable at whichever boundary the caller enforced.
+   */
+  async function invoiceFor(
+    header: OrderRecord | undefined,
+    storeId: string,
+  ): Promise<{ view: OrderView; payment: { status: string | null; method: string | null } }> {
+    if (!header) throw new NotFound('order');
+
+    const lines = await repository.listOrderLines({ orderId: header.id, storeId });
+    const state = await payments.stateForOrder({ orderId: header.id, storeId });
+
+    return {
+      view: { order: header, lines },
+      payment: { status: state?.status ?? null, method: state?.method ?? null },
+    };
+  }
+
   function requireCurrency(storeId: string, value: string): Currency {
     if (!isCurrency(value)) {
       throw new Error(`store ${storeId} has an unsupported currency: ${value}`);
@@ -657,10 +691,12 @@ export function createOrdersService(deps: {
           );
         }
 
-        const paymentStatus = await payments.statusForOrder({
+        const paymentState = await payments.stateForOrder({
           orderId: header.id,
           storeId: params.storeId,
         });
+        /* `null` means no payment at all, which is the one case that permits cancellation. */
+        const paymentStatus = paymentState?.status ?? null;
 
         if (paymentStatus === 'succeeded') {
           logger.info(
@@ -751,6 +787,49 @@ export function createOrdersService(deps: {
       });
     },
 
+    /**
+     * One of this customer's orders, with the payment state the invoice needs.
+     *
+     * A separate method rather than a flag on `getOrder`, because the payment lookup is a
+     * cross-module call and every other reader of an order does not want to pay for it.
+     *
+     * The payment is looked up through the same port cancellation uses. `null` means no payment
+     * has been started, which the document renders as a proforma — a different and more useful
+     * statement than "unpaid".
+     */
+    async getOrderForInvoice(params: {
+      userId: string;
+      storeId: string;
+      orderNumber: string;
+    }): Promise<{ view: OrderView; payment: { status: string | null; method: string | null } }> {
+      /*
+       * The order is fetched here rather than by calling `getOrder`, which would need `this` —
+       * and `this` on a returned object literal breaks the moment a caller destructures the
+       * method. Nothing else in this file relies on it, and this should not be the exception.
+       */
+      return invoiceFor(await repository.findOwnedOrderByNumber(params), params.storeId);
+    },
+
+    /**
+     * ANY order in the store, with the payment state the invoice needs. Staff only.
+     *
+     * Same document, same renderer, one predicate wider: the customer method scopes by owner
+     * and tenant, this one by tenant alone. Staff answering "send me the invoice for that
+     * order" cannot be expected to first discover which customer placed it, and a support
+     * agent who has to impersonate a customer to print a receipt is a worse security posture
+     * than an audited staff route.
+     *
+     * The authorization boundary is entirely in the routes file (`auth → requireStaff`). This
+     * method assumes it has already been enforced, exactly as every other admin service method
+     * does — which is why its name says `Store` and not `Owned`.
+     */
+    async getStoreOrderForInvoice(params: {
+      storeId: string;
+      orderNumber: string;
+    }): Promise<{ view: OrderView; payment: { status: string | null; method: string | null } }> {
+      return invoiceFor(await repository.findStoreOrderByNumber(params), params.storeId);
+    },
+
     /** One of this customer's orders, or a `404` that reveals nothing. */
     async getOrder(params: {
       userId: string;
@@ -839,25 +918,4 @@ async function insertWithFreshOrderNumber(args: {
   throw lastError instanceof Error
     ? lastError
     : new Error('could not allocate a unique order number');
-}
-
-/**
- * The constraint name of a unique violation, or `undefined`.
- *
- * Walks the `cause` chain because Drizzle wraps the driver error in `DrizzleQueryError`: SQLSTATE
- * and the constraint name live on `cause`, and a top-level-only check is the trap §19 records —
- * it made a pre-check path return the right status while the RACE path returned 500, invisible
- * to every sequential test.
- */
-function uniqueViolationConstraint(err: unknown): string | undefined {
-  let current: unknown = err;
-
-  for (let depth = 0; depth < 5 && current !== null && current !== undefined; depth += 1) {
-    const candidate = current as { code?: unknown; constraint?: unknown; cause?: unknown };
-    if (candidate.code === '23505' && typeof candidate.constraint === 'string') {
-      return candidate.constraint;
-    }
-    current = candidate.cause;
-  }
-  return undefined;
 }
