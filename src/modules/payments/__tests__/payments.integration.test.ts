@@ -16,6 +16,10 @@ import { order, orderLine } from '../../../db/schema/orders.js';
 import { promotion } from '../../../db/schema/promotions.js';
 import { shipment, shipmentEvent } from '../../../db/schema/shipments.js';
 import { taxClass, taxRate } from '../../../db/schema/tax.js';
+import {
+  invoice as invoiceTable,
+  invoiceSeries as invoiceSeriesTable,
+} from '../../../db/schema/invoicing.js';
 import { outboxEvent } from '../../../db/schema/outbox.js';
 import { payment, paymentEvent } from '../../../db/schema/payments.js';
 import { store } from '../../../db/schema/store.js';
@@ -31,7 +35,7 @@ import {
 import { DEFAULT_SKU_ON_HAND, giveSku } from '../../../../tests/helpers/catalogue.ts';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 import { newId } from '../../../shared/id.js';
-import { fromDb, subtract, toDb } from '../../../shared/money.js';
+import { add, fromDb, subtract, toDb } from '../../../shared/money.js';
 import { createRazorpayGateway } from '../../../razorpay/gateway.js';
 import { createCartRepository } from '../../cart/cart.repository.js';
 import { createCartRoutes } from '../../cart/cart.routes.js';
@@ -55,6 +59,7 @@ import {
   createFulfilmentService,
 } from '../../fulfilment/index.js';
 import { createTaxRepository, createTaxRoutes, createTaxService } from '../../tax/index.js';
+import { createInvoicingRepository, createInvoicingService } from '../../invoicing/index.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
 import { createPaymentsRepository } from '../payments.repository.js';
 import { createPaymentsRoutes } from '../payments.routes.js';
@@ -235,6 +240,21 @@ describe('payments (integration)', () => {
       logger: silentLogger,
     });
 
+    /**
+     * A REAL invoicing service, not a stub.
+     *
+     * The numbering guarantees this increment claims — gapless, per-store, per-financial-year,
+     * released by a rollback — are properties of ONE PostgreSQL statement against a real row.
+     * A double handing back "INV/…/000001" would let all of them pass while nothing was
+     * exercised.
+     */
+    const invoicing = createInvoicingService({
+      repository: createInvoicingRepository({ db: db() }),
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
+
     const orders = createOrdersService({
       repository: createOrdersRepository({ db: db() }),
       cart: {
@@ -259,6 +279,10 @@ describe('payments (integration)', () => {
         releaseForOrder: (input) => inventory.releaseForOrder(input),
       },
       tax: { determineForCheckout: (input) => tax.determineForCheckout(input) },
+      invoicing: {
+        issueForOrder: (input) => invoicing.issueForOrder(input),
+        findForOrder: (input) => invoicing.findForOrder(input),
+      },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -5572,12 +5596,26 @@ describe('payments (integration)', () => {
         expect(response.text).toContain('SGST');
         expect(response.text).toContain('HSN 6109');
         expect(response.text).toContain(SELLER.gstin);
-        /* Intra-state, so IGST is omitted rather than printed as zero. */
-        expect(response.text).not.toContain('>IGST<');
 
-        /* **The disclaimer survives.** */
-        expect(response.text).toContain('NOT a statutory GST tax invoice');
-        expect(response.text).toContain('no sequential invoice number');
+        /*
+         * **Increment 39 changed what this document is.**
+         *
+         * This store has a GST profile, so its checkouts are now INVOICED — the document is a
+         * numbered tax invoice with an HSN/rate-wise summary, and that summary has an `IGST`
+         * column header whether or not the column has a value. So the old
+         * `not.toContain('>IGST<')` assertion no longer says what it meant; the intra-state
+         * property is asserted on the TOTALS rows instead, which is where a spurious IGST line
+         * would actually appear.
+         */
+        expect(response.text).toContain('Tax summary by HSN and rate');
+        expect(response.text).not.toContain('<th>IGST</th>\n              <td');
+
+        /* **The disclaimer survives, reworded to what is true now.** */
+        expect(response.text).toContain('not e-invoiced');
+        expect(response.text).toContain('no IRN');
+        /* Increment 39 gave it a number, so the old wording is no longer true. */
+        expect(response.text).not.toContain('no sequential invoice number');
+        expect(response.text).toMatch(/INV\/\d{4}-\d{2}\/\d{6}/u);
       });
 
       it('renders an untaxed order exactly as before, with no GST block', async () => {
@@ -5609,6 +5647,964 @@ describe('payments (integration)', () => {
 
       const events = await db().select().from(outboxEvent);
       expect(events.filter((e) => e.eventName.startsWith('tax.'))).toEqual([]);
+    });
+  });
+
+  /* ══ Statutory invoicing — Increment 39 ═══════════════════════════════════ */
+
+  /**
+   * Statutory invoice issuance, against real PostgreSQL with the REAL invoicing module behind
+   * the checkout port.
+   *
+   * Mounted in this harness for the reason the GST block records: issuance is a checkout
+   * concern, it depends on a real tax determination, a real order and real frozen lines, and it
+   * must be observed inside and outside a rolled-back transaction. This harness already builds
+   * that whole graph.
+   *
+   * Nine properties carry this block:
+   *
+   *  1. **The first number is 000001**, and the next is 000002.
+   *  2. **Concurrent checkouts in one store never share a number.** Real connections, real row
+   *     lock.
+   *  3. **Two stores number independently.** Both start at 000001.
+   *  4. **Two financial years number independently**, in the same store.
+   *  5. **A rolled-back checkout does not consume a number** — the counter is a row, not a
+   *     sequence, and that is the whole reason.
+   *  6. **One invoice per order**, enforced by the database.
+   *  7. **COD is invoiced**; no payment state is consulted.
+   *  8. **An unassessed order gets no invoice at all.**
+   *  9. **The document is historical**: change the live store, the rates and the customer's
+   *     registration, and the rendered invoice does not move.
+   */
+  describe('invoicing', () => {
+    const SELLER = {
+      legalName: 'Invoice Test Retail Private Limited',
+      gstin: '29AABCE1234F1Z5',
+      originLine1: '5th Floor, Prestige Tower',
+      originCity: 'Bengaluru',
+      originState: 'Karnataka',
+      originPostalCode: '560095',
+      originCountryCode: 'IN',
+    };
+
+    const TAX_CLASS = 'INV-GST-STD';
+
+    const authed = (req: request.Test, token: string) =>
+      req.set('authorization', `Bearer ${token}`);
+
+    /** A store configured to charge GST, with one classified, rated SKU. */
+    async function givenInvoicingStore(
+      harness: Harness,
+      options: { skuCode: string; price?: string },
+    ) {
+      const staff = await signIn(harness.app, harness.identity, {
+        email: `inv-staff-${nextSeq()}@example.com`,
+        staff: true,
+      });
+
+      const profile = await authed(
+        request(harness.app).put('/api/v1/admin/store/tax-profile'),
+        staff.token,
+      ).send(SELLER);
+      expect(profile.status, JSON.stringify(profile.body)).toBe(200);
+
+      const cls = await authed(
+        request(harness.app).post('/api/v1/admin/tax-classes'),
+        staff.token,
+      ).send({ code: TAX_CLASS, name: 'Invoice test standard rate' });
+      expect(cls.status, JSON.stringify(cls.body)).toBe(201);
+
+      const rate = await authed(
+        request(harness.app).post(`/api/v1/admin/tax-classes/${TAX_CLASS}/rates`),
+        staff.token,
+      ).send({
+        cgstRate: '9',
+        sgstRate: '9',
+        igstRate: '18',
+        effectiveFrom: new Date(Date.now() - 3_600_000).toISOString(),
+      });
+      expect(rate.status, JSON.stringify(rate.body)).toBe(201);
+
+      const sku = await givenSku({
+        code: options.skuCode,
+        ...(options.price === undefined ? {} : { price: options.price }),
+      });
+
+      const classified = await authed(
+        request(harness.app).put(`/api/v1/admin/skus/${sku.code}/tax`),
+        staff.token,
+      ).send({ taxClassCode: TAX_CLASS, hsnCode: '6109' });
+      expect(classified.status, JSON.stringify(classified.body)).toBe(200);
+
+      return { staff, sku };
+    }
+
+    /** Check out one already-created SKU. */
+    async function placeOrder(
+      harness: Harness,
+      options: {
+        token: string;
+        userId: string;
+        skuCode: string;
+        quantity?: number;
+        state?: string;
+      },
+    ): Promise<{ orderNumber: string; orderId: string }> {
+      const put = await authed(
+        request(harness.app).put(`/api/v1/users/me/cart/items/${options.skuCode}`),
+        options.token,
+      ).send({ quantity: options.quantity ?? 1 });
+      expect(put.status, JSON.stringify(put.body)).toBe(200);
+
+      const addr = await givenAddress(options.userId);
+      if (options.state !== undefined) {
+        await db().update(address).set({ state: options.state }).where(eq(address.id, addr.id));
+      }
+
+      const checkout = await authed(
+        request(harness.app).post('/api/v1/users/me/checkout'),
+        options.token,
+      )
+        .set('idempotency-key', `checkout-${newId()}`)
+        .send({ addressId: addr.id });
+      expect(checkout.status, JSON.stringify(checkout.body)).toBe(201);
+
+      const orderNumber = checkout.body.order.orderNumber as string;
+      const [row] = await db().select().from(order).where(eq(order.orderNumber, orderNumber));
+      return { orderNumber, orderId: row!.id };
+    }
+
+    const invoices = () => db().select().from(invoiceTable);
+    const series = () => db().select().from(invoiceSeriesTable);
+
+    /* ── Numbering ──────────────────────────────────────────────────────────── */
+
+    describe('numbering', () => {
+      it('issues INV/YYYY-YY/000001 for the first invoice, then 000002', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-A', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-buyer-${nextSeq()}@example.com`,
+        });
+
+        const first = await placeOrder(harness, { ...buyer, skuCode: 'INV-A' });
+
+        const afterFirst = await invoices();
+        expect(afterFirst).toHaveLength(1);
+        expect(afterFirst[0]!.sequenceNumber).toBe(1);
+        expect(afterFirst[0]!.invoiceNumber).toMatch(/^INV\/\d{4}-\d{2}\/000001$/u);
+        expect(afterFirst[0]!.orderId).toBe(first.orderId);
+
+        /* A second buyer, so the cart is fresh. */
+        const buyer2 = await signIn(harness.app, harness.identity, {
+          email: `inv-buyer-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer2, skuCode: 'INV-A' });
+
+        const both = (await invoices()).sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+        expect(both).toHaveLength(2);
+        expect(both.map((i) => i.sequenceNumber)).toEqual([1, 2]);
+        expect(both[1]!.invoiceNumber).toMatch(/\/000002$/u);
+
+        /* And the two share one series row, which now reads 2. */
+        const rows = await series();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.lastNumber).toBe(2);
+      });
+
+      it('numbers the invoice consistently with its own parts', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-B', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-buyer-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer, skuCode: 'INV-B' });
+
+        const [row] = await invoices();
+        expect(row!.invoiceNumber).toBe(
+          `INV/${row!.financialYear}/${String(row!.sequenceNumber).padStart(6, '0')}`,
+        );
+      });
+
+      /**
+       * **Concurrency, against real connections.**
+       *
+       * Two customers checking out at the same instant. The allocation is one
+       * `INSERT … ON CONFLICT DO UPDATE … RETURNING` statement, so the loser blocks on
+       * `uq_invoice_series` and then reads the winner's value — 1 and 2 in some order, never
+       * both 1.
+       *
+       * Two SEPARATE carts and users, because one cart cannot be checked out twice; the
+       * concurrency under test is the series counter, not the cart lock.
+       */
+      it('never issues one number twice under concurrent checkout', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-CONC', price: '1000.0000' });
+
+        const buyers = await Promise.all([
+          signIn(harness.app, harness.identity, { email: `inv-c1-${nextSeq()}@example.com` }),
+          signIn(harness.app, harness.identity, { email: `inv-c2-${nextSeq()}@example.com` }),
+          signIn(harness.app, harness.identity, { email: `inv-c3-${nextSeq()}@example.com` }),
+        ]);
+
+        /* Fill each cart and resolve each address first, so the race is the checkout itself. */
+        const prepared = [];
+        for (const buyer of buyers) {
+          const put = await authed(
+            request(harness.app).put('/api/v1/users/me/cart/items/INV-CONC'),
+            buyer.token,
+          ).send({ quantity: 1 });
+          expect(put.status).toBe(200);
+          const addr = await givenAddress(buyer.userId);
+          prepared.push({ token: buyer.token, addressId: addr.id });
+        }
+
+        const results = await Promise.all(
+          prepared.map((p) =>
+            authed(request(harness.app).post('/api/v1/users/me/checkout'), p.token)
+              .set('idempotency-key', `checkout-${newId()}`)
+              .send({ addressId: p.addressId }),
+          ),
+        );
+
+        for (const r of results) expect(r.status, JSON.stringify(r.body)).toBe(201);
+
+        const rows = (await invoices()).sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+        expect(rows).toHaveLength(3);
+        /* Sequential and GAPLESS. */
+        expect(rows.map((r) => r.sequenceNumber)).toEqual([1, 2, 3]);
+        /* Distinct numbers, and distinct orders. */
+        expect(new Set(rows.map((r) => r.invoiceNumber)).size).toBe(3);
+        expect(new Set(rows.map((r) => r.orderId)).size).toBe(3);
+
+        const [counter] = await series();
+        expect(counter!.lastNumber).toBe(3);
+      });
+
+      /**
+       * **A rolled-back checkout does not consume a number.**
+       *
+       * This is the property a PostgreSQL sequence could not provide, and the reason the counter
+       * is a row. The rollback is provoked by insufficient stock: the reservation step throws
+       * AFTER the invoice has been issued in the same transaction, so the increment is undone
+       * with everything else.
+       */
+      it('releases the number when the checkout rolls back', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-ROLL', price: '1000.0000' });
+
+        /* One unit in stock, and a cart asking for two. */
+        await db()
+          .update(stockItem)
+          .set({ onHand: 1, reserved: 0 })
+          .where(
+            eq(
+              stockItem.skuId,
+              (await db().select().from(skuTable).where(eq(skuTable.code, 'INV-ROLL')))[0]!.id,
+            ),
+          );
+
+        const doomed = await signIn(harness.app, harness.identity, {
+          email: `inv-roll-${nextSeq()}@example.com`,
+        });
+        const put = await authed(
+          request(harness.app).put('/api/v1/users/me/cart/items/INV-ROLL'),
+          doomed.token,
+        ).send({ quantity: 2 });
+        expect(put.status).toBe(200);
+        const addr = await givenAddress(doomed.userId);
+
+        const failed = await authed(
+          request(harness.app).post('/api/v1/users/me/checkout'),
+          doomed.token,
+        )
+          .set('idempotency-key', `checkout-${newId()}`)
+          .send({ addressId: addr.id });
+
+        expect(failed.status, JSON.stringify(failed.body)).toBe(409);
+
+        /* Nothing was written — not the order, not the invoice, and not the counter. */
+        expect(await invoices()).toEqual([]);
+        expect(await series()).toEqual([]);
+
+        /* And the NEXT order takes 000001, proving the number was not burned. */
+        await db()
+          .update(stockItem)
+          .set({ onHand: 50, reserved: 0 })
+          .where(
+            eq(
+              stockItem.skuId,
+              (await db().select().from(skuTable).where(eq(skuTable.code, 'INV-ROLL')))[0]!.id,
+            ),
+          );
+
+        const good = await signIn(harness.app, harness.identity, {
+          email: `inv-roll2-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...good, skuCode: 'INV-ROLL' });
+
+        const [issued] = await invoices();
+        expect(issued!.sequenceNumber).toBe(1);
+        expect(issued!.invoiceNumber).toMatch(/\/000001$/u);
+      });
+
+      /** And the committed number DOES advance — the other half of the same guarantee. */
+      it('advances the counter once a checkout commits', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-ADV', price: '1000.0000' });
+
+        for (const n of [1, 2, 3]) {
+          const buyer = await signIn(harness.app, harness.identity, {
+            email: `inv-adv-${nextSeq()}@example.com`,
+          });
+          await placeOrder(harness, { ...buyer, skuCode: 'INV-ADV' });
+          const [counter] = await series();
+          expect(counter!.lastNumber).toBe(n);
+        }
+      });
+
+      /**
+       * **Two stores number independently.** Both start at 000001.
+       *
+       * A single global series would let one merchant's volume push another's numbering, and a
+       * merchant cannot explain a gap caused by somebody else's sales.
+       */
+      it('numbers each store from its own series', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-S1', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-s1-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer, skuCode: 'INV-S1' });
+
+        const [mine] = await invoices();
+        expect(mine!.sequenceNumber).toBe(1);
+
+        /* A second store with its own series row at the same year, seeded directly. */
+        const otherStoreId = newId();
+        await db()
+          .insert(store)
+          .values({ id: otherStoreId, slug: `other-${nextSeq()}`, name: 'Other', currency: 'INR' });
+        await db().insert(invoiceSeriesTable).values({
+          id: newId(),
+          storeId: otherStoreId,
+          financialYear: mine!.financialYear,
+          lastNumber: 7,
+        });
+
+        /* This store's next invoice is 2, unaffected by the other store's 7. */
+        const buyer2 = await signIn(harness.app, harness.identity, {
+          email: `inv-s2-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer2, skuCode: 'INV-S1' });
+
+        const ours = (await invoices())
+          .filter((i) => i.storeId === storeId)
+          .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+        expect(ours.map((i) => i.sequenceNumber)).toEqual([1, 2]);
+
+        const theirs = (await series()).find((s) => s.storeId === otherStoreId);
+        expect(theirs!.lastNumber).toBe(7);
+      });
+
+      /**
+       * **Two financial years number independently**, in one store.
+       *
+       * Seeded directly: the alternative would be to place an order at a chosen instant, which
+       * an HTTP call cannot do. The point under test is that the counter is keyed by year, so a
+       * pre-existing series for a DIFFERENT year does not advance this one.
+       */
+      it('numbers each financial year from its own series', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-FY', price: '1000.0000' });
+
+        /* A series for a year that is definitely not the current one. */
+        await db().insert(invoiceSeriesTable).values({
+          id: newId(),
+          storeId,
+          financialYear: '2019-20',
+          lastNumber: 99,
+        });
+
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-fy-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer, skuCode: 'INV-FY' });
+
+        const [issued] = await invoices();
+        expect(issued!.sequenceNumber).toBe(1);
+        expect(issued!.financialYear).not.toBe('2019-20');
+
+        const old = (await series()).find((s) => s.financialYear === '2019-20');
+        expect(old!.lastNumber).toBe(99);
+      });
+    });
+
+    /* ── One per order ──────────────────────────────────────────────────────── */
+
+    describe('one invoice per order', () => {
+      it('refuses a second invoice for one order at the database level', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-ONE', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-one-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-ONE' });
+
+        const [existing] = await invoices();
+
+        await expectDbConstraint(
+          db()
+            .insert(invoiceTable)
+            .values({
+              id: newId(),
+              storeId,
+              orderId: placed.orderId,
+              invoiceNumber: `INV/${existing!.financialYear}/000999`,
+              financialYear: existing!.financialYear,
+              sequenceNumber: 999,
+              issuedAt: new Date(),
+              invoiceDate: existing!.invoiceDate,
+              taxableValue: '1000.0000',
+              taxTotal: '180.0000',
+              grandTotal: '1180.0000',
+            }),
+          'uq_invoice_order',
+        );
+      });
+
+      it('refuses a duplicate number within one store', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-DUP', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-dup-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer, skuCode: 'INV-DUP' });
+
+        const [existing] = await invoices();
+        const buyer2 = await signIn(harness.app, harness.identity, {
+          email: `inv-dup2-${nextSeq()}@example.com`,
+        });
+        const second = await placeOrder(harness, { ...buyer2, skuCode: 'INV-DUP' });
+
+        await expectDbConstraint(
+          db()
+            .update(invoiceTable)
+            .set({
+              invoiceNumber: existing!.invoiceNumber,
+              sequenceNumber: existing!.sequenceNumber,
+            })
+            .where(eq(invoiceTable.orderId, second.orderId)),
+          'uq_invoice',
+        );
+      });
+
+      /** The number must agree with the parts it is made of. */
+      it('refuses a number that disagrees with its sequence', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-MISMATCH', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-mm-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-MISMATCH' });
+
+        await expectDbConstraint(
+          db()
+            .update(invoiceTable)
+            .set({ sequenceNumber: 42 })
+            .where(eq(invoiceTable.orderId, placed.orderId)),
+          'ck_invoice_number_matches_parts',
+        );
+      });
+
+      it('refuses an invoice whose grand total does not foot', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-FOOT', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-foot-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-FOOT' });
+
+        await expectDbConstraint(
+          db()
+            .update(invoiceTable)
+            .set({ grandTotal: '9999.0000' })
+            .where(eq(invoiceTable.orderId, placed.orderId)),
+          'ck_invoice_grand_total_identity',
+        );
+      });
+    });
+
+    /* ── When an invoice is and is not issued ──────────────────────────────── */
+
+    describe('issuance conditions', () => {
+      /**
+       * **COD is invoiced. Requirement 2: no payment-success dependency.**
+       *
+       * A COD payment is created `pending` and no code path terminalises it, so waiting for
+       * money would leave every COD sale permanently uninvoiced.
+       */
+      it('invoices a COD order whose payment never succeeds', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-COD', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-cod-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-COD' });
+
+        /* The invoice exists BEFORE any payment. */
+        expect(await invoices()).toHaveLength(1);
+
+        const cod = await initiate(harness, {
+          token: buyer.token,
+          orderNumber: placed.orderNumber,
+          method: 'cod',
+          key: `pay-${newId()}`,
+        });
+        expect(cod.status, JSON.stringify(cod.body)).toBe(201);
+        expect(cod.body.payment.status).toBe('pending');
+
+        /* Still exactly one invoice, and the payment did not create or change it. */
+        const rows = await invoices();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.grandTotal).toBe(cod.body.payment.amount);
+      });
+
+      it('invoices an order with no payment at all', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-NOPAY', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-nopay-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...buyer, skuCode: 'INV-NOPAY' });
+
+        expect(await invoices()).toHaveLength(1);
+        expect(await db().select().from(payment)).toEqual([]);
+      });
+
+      /** Requirement 16. An unassessed order gets no number, not a zero-valued one. */
+      it('issues nothing for a store with no GST profile', async () => {
+        const harness = build();
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-unassessed-${nextSeq()}@example.com`,
+        });
+        const placed = await givenOrder(harness, { token: buyer.token, userId: buyer.userId });
+
+        const [row] = await db().select().from(order).where(eq(order.id, placed.orderId));
+        expect(row!.taxAt).toBeNull();
+
+        expect(await invoices()).toEqual([]);
+        expect(await series()).toEqual([]);
+      });
+
+      it('is B2B or B2C on the same series', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-B2B', price: '1000.0000' });
+
+        const b2c = await signIn(harness.app, harness.identity, {
+          email: `inv-b2c-${nextSeq()}@example.com`,
+        });
+        await placeOrder(harness, { ...b2c, skuCode: 'INV-B2B' });
+
+        const b2b = await signIn(harness.app, harness.identity, {
+          email: `inv-b2b-${nextSeq()}@example.com`,
+        });
+        const identity = await authed(
+          request(harness.app).put('/api/v1/users/me/tax-identity'),
+          b2b.token,
+        ).send({ gstin: '27AAACB1234C1ZX', legalName: 'Buyer Enterprises LLP' });
+        expect(identity.status).toBe(200);
+        const b2bOrder = await placeOrder(harness, { ...b2b, skuCode: 'INV-B2B' });
+
+        const rows = (await invoices()).sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+        expect(rows.map((r) => r.sequenceNumber)).toEqual([1, 2]);
+
+        /* Both invoiced; the customer category lives on the ORDER, not on the invoice. */
+        const [placed] = await db().select().from(order).where(eq(order.id, b2bOrder.orderId));
+        expect(placed!.customerTaxCategory).toBe('b2b');
+      });
+    });
+
+    /* ── Reconciliation ────────────────────────────────────────────────────── */
+
+    describe('reconciliation', () => {
+      it('stores totals that equal the order exactly', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-REC', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-rec-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-REC', quantity: 3 });
+
+        const [inv] = await invoices();
+        const [ord] = await db().select().from(order).where(eq(order.id, placed.orderId));
+
+        expect(inv!.taxableValue).toBe(ord!.total);
+        expect(inv!.taxTotal).toBe(ord!.taxTotal);
+        expect(inv!.grandTotal).toBe(ord!.grandTotal);
+      });
+
+      it('reconciles against the sum of the frozen lines', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-REC2', price: '333.3300' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-rec2-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-REC2', quantity: 3 });
+
+        const lines = await db()
+          .select()
+          .from(orderLine)
+          .where(eq(orderLine.orderId, placed.orderId));
+        const [inv] = await invoices();
+
+        const lineTax = lines.reduce(
+          (acc, l) => toDb(add(fromDb(acc, 'INR'), fromDb(l.taxTotal, 'INR'))),
+          '0.0000',
+        );
+        const lineTaxable = lines.reduce(
+          (acc, l) => toDb(add(fromDb(acc, 'INR'), fromDb(l.taxableValue, 'INR'))),
+          '0.0000',
+        );
+
+        expect(inv!.taxTotal).toBe(lineTax);
+        expect(inv!.taxableValue).toBe(lineTaxable);
+      });
+    });
+
+    /* ── The rendered document ─────────────────────────────────────────────── */
+
+    describe('the document', () => {
+      it('shows the statutory number, the HSN summary and the frozen seller', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-DOC', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-doc-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-DOC' });
+        const [inv] = await invoices();
+
+        const doc = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+
+        expect(doc.status).toBe(200);
+        expect(doc.text).toContain('Tax invoice');
+        expect(doc.text).toContain(inv!.invoiceNumber);
+        expect(doc.text).toContain(inv!.financialYear);
+        /* The HSN/rate-wise summary. */
+        expect(doc.text).toContain('Tax summary by HSN and rate');
+        expect(doc.text).toContain('6109');
+        /* The SELLER, from the frozen snapshot — and no hardcoded company. */
+        expect(doc.text).toContain(SELLER.legalName);
+        expect(doc.text).toContain(SELLER.gstin);
+        expect(doc.text).not.toContain('Syntellite');
+
+        /* Requirement 17: no fake IRN, no fake QR. */
+        expect(doc.text).not.toMatch(/\bIRN\b\s*[:=]/u);
+        expect(doc.text).not.toContain('Acknowledgement number');
+        expect(doc.text).not.toContain('<canvas');
+        expect(doc.text).not.toContain('qrcode');
+        expect(doc.text).toContain('not e-invoiced');
+
+        /* And the hardening survives. */
+        expect(doc.headers['content-security-policy']).toContain("default-src 'none'");
+        expect(doc.headers['cache-control']).toContain('no-store');
+      });
+
+      it('renders an unassessed order with no statutory number', async () => {
+        const harness = build();
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-plain-${nextSeq()}@example.com`,
+        });
+        const placed = await givenOrder(harness, { token: buyer.token, userId: buyer.userId });
+
+        const doc = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+
+        expect(doc.status).toBe(200);
+        expect(doc.text).toContain(placed.orderNumber);
+        expect(doc.text).not.toMatch(/INV\/\d{4}-\d{2}\/\d{6}/u);
+        expect(doc.text).not.toContain('Tax summary by HSN and rate');
+        expect(doc.text).toContain('not a GST tax invoice');
+      });
+
+      /** The staff route renders the identical document. */
+      it('serves the same document to staff', async () => {
+        const harness = build();
+        const { staff } = await givenInvoicingStore(harness, {
+          skuCode: 'INV-STAFF',
+          price: '1000.0000',
+        });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-staff2-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-STAFF' });
+
+        const asCustomer = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+        const asStaff = await authed(
+          request(harness.app).get(`/api/v1/admin/orders/${placed.orderNumber}/invoice`),
+          staff.token,
+        );
+
+        expect(asStaff.status).toBe(200);
+        expect(asStaff.text).toBe(asCustomer.text);
+      });
+
+      /**
+       * **The GET routes are READ-ONLY — requirement 15.**
+       *
+       * Fetching a document for an order that has no invoice must not issue one, however many
+       * times it is fetched. Backfilling on read would allocate numbers in the order people
+       * happened to look at documents, which is not a series.
+       */
+      it('issues nothing when a document is fetched repeatedly', async () => {
+        const harness = build();
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-ro-${nextSeq()}@example.com`,
+        });
+        const placed = await givenOrder(harness, { token: buyer.token, userId: buyer.userId });
+
+        for (let i = 0; i < 3; i++) {
+          const doc = await authed(
+            request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+            buyer.token,
+          );
+          expect(doc.status).toBe(200);
+        }
+
+        expect(await invoices()).toEqual([]);
+        expect(await series()).toEqual([]);
+      });
+
+      it('does not renumber an invoiced order on repeated reads', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-RO2', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-ro2-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-RO2' });
+        const [before] = await invoices();
+
+        for (let i = 0; i < 3; i++) {
+          await authed(
+            request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+            buyer.token,
+          );
+        }
+
+        const after = await invoices();
+        expect(after).toHaveLength(1);
+        expect(after[0]!.invoiceNumber).toBe(before!.invoiceNumber);
+        const [counter] = await series();
+        expect(counter!.lastNumber).toBe(1);
+      });
+
+      /**
+       * **Escaping. The security boundary, on the fields Increment 39 newly renders.**
+       *
+       * The seller legal name and the origin address now reach the document from the order's
+       * snapshot, and both originate in a staff-typed store profile. Unescaped, either is stored
+       * XSS.
+       */
+      it('escapes the newly rendered seller fields', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-XSS', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-xss-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-XSS' });
+
+        /*
+         * Injected on the ORDER's snapshot directly. The store-profile API would refuse this
+         * shape, and the point under test is the renderer rather than that validator.
+         */
+        const payload = '<script>alert(1)</script>';
+        await db()
+          .update(order)
+          .set({ sellerLegalName: payload, originCity: payload })
+          .where(eq(order.id, placed.orderId));
+
+        const doc = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+
+        expect(doc.status).toBe(200);
+        expect(doc.text).not.toContain('<script>alert(1)</script>');
+        expect(doc.text).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+      });
+    });
+
+    /* ── Historical immutability ───────────────────────────────────────────── */
+
+    describe('historical immutability', () => {
+      /**
+       * **Requirement F: change the live configuration, and the document does not move.**
+       *
+       * The rate, the tax class name, the SKU's HSN, the seller's GSTIN and legal name, the
+       * origin address and the customer's registration are ALL changed after the invoice is
+       * issued. The rendered document and the persisted row must be identical.
+       */
+      it('renders identically after every piece of live configuration changes', async () => {
+        const harness = build();
+        const { staff } = await givenInvoicingStore(harness, {
+          skuCode: 'INV-HIST',
+          price: '1000.0000',
+        });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-hist-${nextSeq()}@example.com`,
+        });
+        await authed(request(harness.app).put('/api/v1/users/me/tax-identity'), buyer.token).send({
+          gstin: '27AAACB1234C1ZX',
+          legalName: 'Buyer Enterprises LLP',
+        });
+
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-HIST' });
+
+        const before = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+        expect(before.status).toBe(200);
+        const [invBefore] = await invoices();
+
+        /* 1. Close the rate and add a very different one. */
+        const closeAt = new Date(Date.now() + 1000);
+        await db()
+          .update(taxRate)
+          .set({ effectiveTo: closeAt })
+          .where(eq(taxRate.storeId, storeId));
+        const newRate = await authed(
+          request(harness.app).post(`/api/v1/admin/tax-classes/${TAX_CLASS}/rates`),
+          staff.token,
+        ).send({
+          cgstRate: '14',
+          sgstRate: '14',
+          igstRate: '28',
+          effectiveFrom: closeAt.toISOString(),
+        });
+        expect(newRate.status, JSON.stringify(newRate.body)).toBe(201);
+
+        /* 2. Rename the tax class. 3. Reclassify the SKU. */
+        await authed(
+          request(harness.app).patch(`/api/v1/admin/tax-classes/${TAX_CLASS}`),
+          staff.token,
+        ).send({ name: 'Renamed after the fact' });
+        await authed(request(harness.app).put('/api/v1/admin/skus/INV-HIST/tax'), staff.token).send(
+          { taxClassCode: TAX_CLASS, hsnCode: '9999' },
+        );
+
+        /* 4. Move the seller to another state and rename it. */
+        await authed(request(harness.app).put('/api/v1/admin/store/tax-profile'), staff.token).send(
+          {
+            ...SELLER,
+            legalName: 'Renamed Retail Private Limited',
+            gstin: '27AABCE1234F1Z5',
+            originCity: 'Mumbai',
+            originState: 'Maharashtra',
+          },
+        );
+
+        /* 5. Change the customer's registration. 6. Change the store's timezone. */
+        await authed(request(harness.app).put('/api/v1/users/me/tax-identity'), buyer.token).send({
+          gstin: '07AAACB1234C1ZX',
+          legalName: 'Renamed Buyer LLP',
+        });
+        await db().update(store).set({ timezone: 'America/New_York' }).where(eq(store.id, storeId));
+
+        const after = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+
+        /* **Byte-identical.** */
+        expect(after.status).toBe(200);
+        expect(after.text).toBe(before.text);
+
+        /* And the persisted row did not move either. */
+        const [invAfter] = await invoices();
+        expect(invAfter).toEqual(invBefore);
+
+        /* Specifically: the OLD seller, the OLD HSN, the OLD rate. */
+        expect(after.text).toContain(SELLER.legalName);
+        expect(after.text).toContain(SELLER.gstin);
+        expect(after.text).toContain('6109');
+        expect(after.text).not.toContain('9999');
+        expect(after.text).not.toContain('Renamed Retail');
+      });
+
+      /**
+       * The document DATE comes from the stored `invoice_date`, not from a live timezone.
+       *
+       * Requirement 14. Changing `store.timezone` after issuance must not shift the date a
+       * statutory document bears.
+       */
+      it('keeps the invoice date after the store timezone changes', async () => {
+        const harness = build();
+        await givenInvoicingStore(harness, { skuCode: 'INV-TZ', price: '1000.0000' });
+        const buyer = await signIn(harness.app, harness.identity, {
+          email: `inv-tz-${nextSeq()}@example.com`,
+        });
+        const placed = await placeOrder(harness, { ...buyer, skuCode: 'INV-TZ' });
+
+        const [inv] = await invoices();
+        const storedDate = inv!.invoiceDate;
+
+        await db()
+          .update(store)
+          .set({ timezone: 'Pacific/Kiritimati' })
+          .where(eq(store.id, storeId));
+
+        const doc = await authed(
+          request(harness.app).get(`/api/v1/users/me/orders/${placed.orderNumber}/invoice`),
+          buyer.token,
+        );
+
+        const [unchanged] = await invoices();
+        expect(unchanged!.invoiceDate).toBe(storedDate);
+        expect(doc.status).toBe(200);
+      });
+    });
+
+    /* ── No events ─────────────────────────────────────────────────────────── */
+
+    it('publishes no domain event', async () => {
+      const harness = build();
+      await givenInvoicingStore(harness, { skuCode: 'INV-EVT', price: '1000.0000' });
+      const buyer = await signIn(harness.app, harness.identity, {
+        email: `inv-evt-${nextSeq()}@example.com`,
+      });
+      await placeOrder(harness, { ...buyer, skuCode: 'INV-EVT' });
+
+      const events = await db().select().from(outboxEvent);
+      expect(events.filter((e) => e.eventName.startsWith('invoice.'))).toEqual([]);
+    });
+
+    it('audits the issuance', async () => {
+      const harness = build();
+      await givenInvoicingStore(harness, { skuCode: 'INV-AUD', price: '1000.0000' });
+      const buyer = await signIn(harness.app, harness.identity, {
+        email: `inv-aud-${nextSeq()}@example.com`,
+      });
+      await placeOrder(harness, { ...buyer, skuCode: 'INV-AUD' });
+
+      const entries = await db()
+        .select()
+        .from(auditLog)
+        .where(eq(auditLog.action, 'invoice.issued'));
+
+      expect(entries).toHaveLength(1);
+      const [inv] = await invoices();
+      expect((entries[0]!.metadata as { invoiceNumber?: string }).invoiceNumber).toBe(
+        inv!.invoiceNumber,
+      );
     });
   });
 });

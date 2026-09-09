@@ -44,6 +44,7 @@ import { createPromotionsRepository } from '../../promotions/promotions.reposito
 import { createPromotionsService } from '../../promotions/promotions.service.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
 import { createTaxRepository, createTaxService } from '../../tax/index.js';
+import { createInvoicingRepository, createInvoicingService } from '../../invoicing/index.js';
 import { createOrdersRepository } from '../orders.repository.js';
 import { createOrdersRoutes } from '../orders.routes.js';
 import { toOrderResponse } from '../dto.js';
@@ -187,6 +188,21 @@ describe('orders (integration)', () => {
       logger: silentLogger,
     });
 
+    /**
+     * A REAL invoicing service, not a stub.
+     *
+     * The numbering guarantees this increment claims — gapless, per-store, per-financial-year,
+     * released by a rollback — are properties of ONE PostgreSQL statement against a real row.
+     * A double handing back "INV/…/000001" would let all of them pass while nothing was
+     * exercised.
+     */
+    const invoicing = createInvoicingService({
+      repository: createInvoicingRepository({ db: db() }),
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
+
     /** The three ports, wired exactly as `container.ts` wires them. */
     const orders = createOrdersService({
       repository: createOrdersRepository({ db: db() }),
@@ -221,6 +237,10 @@ describe('orders (integration)', () => {
        * that a property of the double rather than of the system.
        */
       tax: { determineForCheckout: (input) => tax.determineForCheckout(input) },
+      invoicing: {
+        issueForOrder: (input) => invoicing.issueForOrder(input),
+        findForOrder: (input) => invoicing.findForOrder(input),
+      },
       idempotency: {
         complete: (input) =>
           idempotency.complete({
@@ -1182,8 +1202,16 @@ describe('orders (integration)', () => {
       expect(response.status).toBe(200);
       expect(response.headers['content-type']).toMatch(/text\/html/);
       expect(response.text.startsWith('<!doctype html>')).toBe(true);
-      expect(response.text).toContain('Syntellite Innovation');
       expect(response.text).toContain(orderNumber);
+      /*
+       * **No seller identity, and that is Increment 39's requirement 13.**
+       *
+       * This suite's store has no GST profile, so the order is unassessed: it has no seller of
+       * record and no statutory number, and the renderer no longer carries a hardcoded company
+       * to put in the letterhead instead.
+       */
+      expect(response.text).not.toContain('Syntellite');
+      expect(response.text).not.toMatch(/INV\/\d{4}-\d{2}\/\d{6}/u);
       /* An unpaid order is a proforma, and the document says so. */
       expect(response.text).toContain('Proforma');
     });
@@ -1316,8 +1344,10 @@ describe('orders (integration)', () => {
       expect(response.status).toBe(200);
       expect(response.headers['content-type']).toMatch(/text\/html/);
       expect(response.text.startsWith('<!doctype html>')).toBe(true);
-      expect(response.text).toContain('Syntellite Innovation');
       expect(response.text).toContain(orderNumber);
+      /* Unassessed, so no seller identity and no statutory number. See requirement 13. */
+      expect(response.text).not.toContain('Syntellite');
+      expect(response.text).not.toMatch(/INV\/\d{4}-\d{2}\/\d{6}/u);
     });
 
     /**
@@ -2177,6 +2207,8 @@ describe('orders (integration)', () => {
         userId: built.userId,
         storeId,
         storeCurrency: 'INR',
+        /* The seeded store's timezone. Threaded here because the route is bypassed. */
+        storeTimezone: 'Asia/Kolkata',
         addressId: built.address.id,
         idempotency: { key: KEY, endpoint },
         actor: { type: 'customer', userId: built.userId },

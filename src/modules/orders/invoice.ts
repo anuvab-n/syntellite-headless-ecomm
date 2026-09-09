@@ -38,40 +38,45 @@ import type { OrderLineRecord, OrderRecord } from './orders.repository.js';
  *     Nothing may be fetched from the network, which is also why the logo is inlined rather
  *     than linked — see `invoice-logo.ts`.
  *
- * ## What this document is NOT
+ * ## Three documents, one renderer
  *
- * **Still NOT a statutory GST tax invoice, even now that tax is computed.**
+ * What this function produces depends entirely on what the ORDER carries, and the three cases
+ * are deliberately distinguishable on the page:
  *
- * Increment 38 gave the order a real determination — rates, per-line CGST/SGST/IGST, HSN codes,
- * place of supply, both parties' GSTIN — and this document now SHOWS them, because withholding
- * figures the customer has actually been charged would make it misleading in the other
- * direction. What it does not do is claim compliance.
+ * | Order | Number | Seller | Tax rows | HSN summary |
+ * | ----- | ------ | ------ | -------- | ----------- |
+ * | Unassessed (no GST profile, or pre-Increment-38) | order number | none | none | none |
+ * | Assessed, pre-Increment-39 | order number | frozen snapshot | yes | yes |
+ * | Assessed and invoiced | `INV/YYYY-YY/NNNNNN` | frozen snapshot | yes | yes |
  *
- * Three things a statutory invoice needs that this still has none of, and each is Increment 39:
+ * ## The seller is the STORE, from the order's frozen snapshot
  *
- *  1. **An invoice number.** A tax-compliant series is sequential, gapless and scoped to a
- *     financial year; choosing that scheme is a decision with legal consequences. The order
- *     number is used as the document reference instead — unique per store and immutable, but
- *     not a series.
- *  2. **An HSN-wise and rate-wise summary**, and the several other prescribed particulars.
- *  3. **IRN and QR**, where e-invoicing applies. Deferred by approved decision 18.
+ * There is no hardcoded company on this document any more. Increment 38's approved decision 2
+ * made the STORE the seller of record and the platform explicitly not; a constant in this file
+ * naming a company was the last place that decision was contradicted, and Increment 39's
+ * requirement 13 removed it.
  *
- * So the disclaimer stays, reworded to say what is true NOW rather than deleted. A document
- * that quietly stopped disclaiming the moment it grew a tax row would be the worst possible
- * outcome of this increment, and a test asserts the wording survives.
+ * So the letterhead reads `order.seller_legal_name` — a value frozen at checkout. A merchant
+ * who re-registers, renames or moves does not restate a single historical document, which is
+ * the whole point of snapshotting it. An UNASSESSED order has no seller snapshot and therefore
+ * shows no seller: it is not a statutory invoice, has no seller of record, and inventing one
+ * for the letterhead would be the same mistake in a smaller font.
  *
- * An order placed before this increment, or in a store with no GST profile, carries no
- * determination at all: it renders exactly as it did before, with no tax rows and no GSTIN.
- * That is not the same as showing zero — see `ck_order_tax_snapshot`.
+ * The logo survives because it is decorative — `alt=""`, and it makes no claim about who sold
+ * anything.
+ *
+ * ## What this document is STILL NOT
+ *
+ * **Not e-invoiced.** There is no IRN, no acknowledgement number and no signed QR code, because
+ * obtaining them means registering with the government portal and calling it — an integration,
+ * not a rendering change. Approved requirement 17 forbids inventing a plausible-looking
+ * substitute, and a test asserts none of those strings appears.
+ *
+ * The disclaimer therefore stays, and it is reworded a second time to say what is true now: the
+ * document carries a sequential number and an HSN summary, and it carries no IRN or QR. A
+ * document that quietly stopped disclaiming the moment it grew a number would be the worst
+ * possible outcome of this increment.
  */
-
-/** The issuing company. */
-const COMPANY = {
-  name: 'Syntellite Innovation',
-  tagline: 'Engineering that ships',
-  email: 'accounts@syntellite.com',
-  site: 'syntellite.com',
-} as const;
 
 /**
  * Escape text for HTML.
@@ -95,10 +100,56 @@ export type InvoicePaymentState = {
   readonly method: string | null;
 };
 
+/**
+ * One HSN/rate-wise summary row. Structurally the invoicing module's `SummaryRow`, restated
+ * here because `no-cross-module-imports` forbids reaching into that module for the type.
+ */
+export type InvoiceSummaryRow = {
+  readonly hsnCode: string;
+  readonly cgstRate: string;
+  readonly sgstRate: string;
+  readonly igstRate: string;
+  readonly cessRate: string;
+  readonly taxableValue: string;
+  readonly cgstAmount: string;
+  readonly sgstAmount: string;
+  readonly igstAmount: string;
+  readonly cessAmount: string;
+  readonly taxTotal: string;
+};
+
+/**
+ * The issued statutory invoice, or `null`.
+ *
+ * `null` covers two genuinely different orders — one never assessed for tax, and one assessed
+ * before Increment 39 existed — and both render the same way: with the order number as the
+ * document reference and no statutory series. Distinguishing them on the page would require the
+ * document to explain this system's release history, which is not a customer's concern.
+ */
+export type InvoiceDocumentRecord = {
+  readonly invoiceNumber: string;
+  readonly invoiceDate: string;
+  readonly issuedAt: Date;
+  readonly financialYear: string;
+  readonly summary: {
+    readonly rows: readonly InvoiceSummaryRow[];
+    readonly taxableValue: string;
+    readonly taxTotal: string;
+  };
+};
+
 export type InvoiceInput = {
   readonly order: OrderRecord;
   readonly lines: readonly OrderLineRecord[];
   readonly payment: InvoicePaymentState;
+  /**
+   * The issued invoice, or `null`.
+   *
+   * `undefined` is accepted alongside `null` so a caller that has no invoice concept — the
+   * unit tests render literal records — need not spell one out. Both mean the same thing:
+   * this order has no statutory number.
+   */
+  readonly invoice?: InvoiceDocumentRecord | null | undefined;
 };
 
 /**
@@ -192,6 +243,25 @@ function sumLineAmounts(
   );
 }
 
+/**
+ * `2026-09-07` → `7 September 2026`, from the STORED store-local date string.
+ *
+ * Deliberately parses the persisted `invoice_date` rather than re-deriving a local date from
+ * `issued_at`: requirement 14 is that historical values are not derived at render time, and the
+ * date printed on a statutory document is exactly the kind of value that must not shift when
+ * `store.timezone` is edited years later.
+ *
+ * Read as a UTC calendar date, which is safe because the string has no time part — so no
+ * timezone conversion can move it across a day boundary.
+ */
+function longDateFromIsoDate(value: string): string {
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new InvariantViolation(`stored invoice date is not a calendar date: ${value}`);
+  }
+  return longDate(parsed);
+}
+
 /** `2026-09-07` → `7 September 2026`. UTC, matching every other instant in this system. */
 function longDate(at: Date): string {
   return new Intl.DateTimeFormat('en-IN', {
@@ -211,9 +281,25 @@ function longDate(at: Date): string {
  */
 export function renderInvoice(input: InvoiceInput): string {
   const { order, lines, payment } = input;
+  const invoice = input.invoice ?? null;
   const currency = requireCurrency(order.currency);
   const money = (amount: string): string => esc(format(fromDb(amount, currency)));
   const state = documentState(order, payment);
+
+  /**
+   * The document's identity: its title, its reference and its date.
+   *
+   * An invoiced order is a **Tax invoice** bearing its statutory number and the date the number
+   * was allocated. Everything else keeps the pre-Increment-39 presentation — titled "Invoice",
+   * referenced by order number, dated by `placed_at`.
+   *
+   * The reference is the one field a customer quotes to support, so it changes only when there
+   * is genuinely a different identifier to quote.
+   */
+  const heading = invoice === null ? 'Invoice' : 'Tax invoice';
+  const reference = invoice === null ? order.orderNumber : invoice.invoiceNumber;
+  const documentDate =
+    invoice === null ? longDate(order.placedAt) : longDateFromIsoDate(invoice.invoiceDate);
 
   const address = [
     order.shipRecipientName,
@@ -297,6 +383,68 @@ export function renderInvoice(input: InvoiceInput): string {
         )
         .join('\n');
 
+  /**
+   * **The HSN-wise and rate-wise summary — approved requirement 10.**
+   *
+   * Rendered only when there is an issued invoice, because that is when the document claims to
+   * be a tax invoice; an assessed-but-uninvoiced order shows its per-line tax and stops there.
+   *
+   * Every figure comes from the summary the invoicing module derived from the order's FROZEN
+   * line snapshots and reconciled against the order's stored totals before the number was
+   * allocated. Nothing here is recomputed, and nothing reads master data — so a rate change or
+   * a reclassification cannot alter a summary printed years later.
+   *
+   * The rate columns show the components that apply and a dash for the ones that do not: an
+   * intra-state supply has no IGST at all, and printing "0" invites the reader to wonder
+   * whether it was charged and refunded.
+   */
+  const rate = (value: string): string => {
+    const asMoney = fromDb(value === '' ? '0' : value, currency);
+    return asMoney.amount === ZERO_AT_STORAGE_SCALE ? '—' : `${esc(value)}%`;
+  };
+
+  const summaryTable =
+    invoice === null || invoice.summary.rows.length === 0
+      ? ''
+      : `
+      <h2 class="section">Tax summary by HSN and rate</h2>
+      <table class="summary">
+        <thead>
+          <tr>
+            <th>HSN/SAC</th>
+            <th class="num">Taxable value</th>
+            <th class="num">CGST</th>
+            <th class="num">SGST</th>
+            <th class="num">IGST</th>
+            <th class="num">Cess</th>
+            <th class="num">Total tax</th>
+          </tr>
+        </thead>
+        <tbody>
+${invoice.summary.rows
+  .map(
+    (row) => `          <tr>
+            <td class="num">${esc(row.hsnCode)}</td>
+            <td class="num">${money(row.taxableValue)}</td>
+            <td class="num">${rate(row.cgstRate)}<div class="muted">${money(row.cgstAmount)}</div></td>
+            <td class="num">${rate(row.sgstRate)}<div class="muted">${money(row.sgstAmount)}</div></td>
+            <td class="num">${rate(row.igstRate)}<div class="muted">${money(row.igstAmount)}</div></td>
+            <td class="num">${rate(row.cessRate)}<div class="muted">${money(row.cessAmount)}</div></td>
+            <td class="num">${money(row.taxTotal)}</td>
+          </tr>`,
+  )
+  .join('\n')}
+        </tbody>
+        <tfoot>
+          <tr>
+            <th>Total</th>
+            <th class="num">${money(invoice.summary.taxableValue)}</th>
+            <th class="num" colspan="4"></th>
+            <th class="num">${money(invoice.summary.taxTotal)}</th>
+          </tr>
+        </tfoot>
+      </table>`;
+
   const grandRow = !assessed
     ? ''
     : `            <tr class="grand">
@@ -311,10 +459,9 @@ export function renderInvoice(input: InvoiceInput): string {
    * current registration — that is the whole point of snapshotting them, and reading either
    * here would restate a historical invoice the next time one changed.
    *
-   * `COMPANY` above is still the letterhead and is deliberately NOT presented as the seller of
-   * record: approved decision 2 makes the STORE the seller, and this block is what names it.
-   * Reconciling the letterhead with the seller identity belongs to Increment 39, alongside the
-   * invoice series.
+   * The letterhead now reads the SAME snapshot — Increment 39's requirement 13 removed the
+   * hardcoded company that used to sit there — so this block no longer has to explain that the
+   * name at the top is not the seller. It is.
    */
   const gstBlock =
     !assessed || order.sellerGstin === null || order.sellerLegalName === null
@@ -334,6 +481,16 @@ export function renderInvoice(input: InvoiceInput): string {
           <div class="row"><span class="muted">Supply type</span><span>${esc(
             order.supplyType === 'intra_state' ? 'Intra-state' : 'Inter-state',
           )}</span></div>${
+            invoice === null
+              ? ''
+              : `
+          <div class="row"><span class="muted">Invoice number</span><span class="num">${esc(
+            invoice.invoiceNumber,
+          )}</span></div>
+          <div class="row"><span class="muted">Financial year</span><span class="num">${esc(
+            invoice.financialYear,
+          )}</span></div>`
+          }${
             order.customerGstin === null
               ? ''
               : `
@@ -348,7 +505,7 @@ export function renderInvoice(input: InvoiceInput): string {
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Invoice ${esc(order.orderNumber)} · ${esc(COMPANY.name)}</title>
+    <title>${esc(heading)} ${esc(reference)}</title>
     <style>
       :root {
         --ink: #14161a;
@@ -489,6 +646,23 @@ export function renderInvoice(input: InvoiceInput): string {
         padding-top: 12px; margin-top: 4px;
         font-size: 18px; font-weight: 700; color: var(--ink);
       }
+      /* The HSN/rate-wise summary. Scrolls in its own container so a six-column table on a
+         narrow screen never makes the page itself scroll sideways. */
+      .section {
+        margin: 0 36px 10px;
+        font-size: 12px; font-weight: 600; letter-spacing: .06em;
+        text-transform: uppercase; color: var(--muted);
+      }
+      table.summary { margin-bottom: 28px; font-size: 13px; }
+      table.summary th, table.summary td { padding: 8px 12px; }
+      table.summary thead th {
+        font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted);
+      }
+      table.summary tfoot th {
+        border-top: 2px solid var(--ink);
+        font-weight: 700; color: var(--ink);
+      }
+      table.summary .muted { font-size: 12px; }
       .note {
         margin: 0 36px 28px;
         padding: 13px 16px;
@@ -527,15 +701,23 @@ export function renderInvoice(input: InvoiceInput): string {
             width="44"
             height="44"
             alt=""
-          />
+          />${
+            order.sellerLegalName === null
+              ? ''
+              : `
           <div>
-            <div class="company">${esc(COMPANY.name)}</div>
-            <div class="tagline">${esc(COMPANY.tagline)}</div>
-          </div>
+            <div class="company">${esc(order.sellerLegalName)}</div>${
+              order.sellerGstin === null
+                ? ''
+                : `
+            <div class="tagline">GSTIN ${esc(order.sellerGstin)}</div>`
+            }
+          </div>`
+          }
         </div>
         <div class="doc">
-          <h1>Invoice</h1>
-          <div class="ref">${esc(order.orderNumber)}</div>
+          <h1>${esc(heading)}</h1>
+          <div class="ref">${esc(reference)}</div>
           <span class="badge ${state.tone}">${esc(state.label)}</span>
         </div>
       </header>
@@ -549,7 +731,9 @@ export function renderInvoice(input: InvoiceInput): string {
         </div>
         <div>
           <h2>Details</h2>
-          <div class="row"><span class="muted">Order date</span><span>${esc(longDate(order.placedAt))}</span></div>
+          <div class="row"><span class="muted">${
+            invoice === null ? 'Order date' : 'Invoice date'
+          }</span><span>${esc(documentDate)}</span></div>
           <div class="row"><span class="muted">Order number</span><span class="num">${esc(order.orderNumber)}</span></div>
           <div class="row"><span class="muted">Order status</span><span>${esc(order.status)}</span></div>
           <div class="row"><span class="muted">Payment</span><span>${esc(
@@ -592,19 +776,41 @@ ${grandRow}
         </table>
       </div>
 
+${summaryTable}
+
       <p class="note">${esc(state.note)}</p>
 
       <footer>
-        <div>
-          <div>${esc(COMPANY.name)}</div>
-          <div>${esc(COMPANY.email)} · ${esc(COMPANY.site)}</div>
+        <div>${
+          order.sellerLegalName === null
+            ? ''
+            : `
+          <div>${esc(order.sellerLegalName)}</div>`
+        }${
+          order.originLine1 === null
+            ? ''
+            : `
+          <div class="muted">${esc(
+            [
+              order.originLine1,
+              order.originLine2,
+              order.originCity,
+              order.originState,
+              order.originPostalCode,
+            ]
+              .filter((part) => part !== null && part.trim().length > 0)
+              .join(', '),
+          )}</div>`
+        }
         </div>
         <div style="max-width: 46ch">
           <div class="disclaimer">
             ${
-              assessed
-                ? 'This document is NOT a statutory GST tax invoice. The tax shown was calculated and charged, but the document carries no sequential invoice number, no HSN-wise summary, and no IRN or QR code.'
-                : 'This document shows the goods total only. It is not a GST tax invoice: no tax has been calculated or charged, and no GSTIN, HSN/SAC code or place of supply is stated.'
+              invoice !== null
+                ? 'Issued under a sequential, financial-year-scoped invoice series, with an HSN/SAC and rate-wise tax summary. **This document is not e-invoiced**: it carries no IRN, no acknowledgement number and no signed QR code, because this system is not registered with the Invoice Registration Portal.'
+                : assessed
+                  ? 'This document is NOT a statutory GST tax invoice. The tax shown was calculated and charged, but the document carries no invoice-series number and no HSN-wise summary.'
+                  : 'This document shows the goods total only. It is not a GST tax invoice: no tax has been calculated or charged, and no GSTIN, HSN/SAC code or place of supply is stated.'
             }
             Amounts are in ${esc(order.currency)}.
           </div>

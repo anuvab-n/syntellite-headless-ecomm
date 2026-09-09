@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { renderInvoice, type InvoiceInput } from '../invoice.js';
+import { add, fromDb, toDb } from '../../../shared/money.js';
+import { renderInvoice, type InvoiceDocumentRecord, type InvoiceInput } from '../invoice.js';
 import type { OrderLineRecord, OrderRecord } from '../orders.repository.js';
 
 /**
@@ -115,14 +116,263 @@ describe('invoice document', () => {
       ...overrides,
     });
 
-  /* ══ The company ═══════════════════════════════════════════════════════ */
+  /* ══ The seller of record ══════════════════════════════════════════════ */
 
-  it('is issued by Syntellite Innovation', () => {
+  /**
+   * An ASSESSED order, with a frozen seller snapshot and an issued invoice.
+   *
+   * Built from `ORDER` rather than replacing it, so the two fixtures differ in exactly the
+   * fields Increment 39 turns on and nothing else.
+   */
+  const TAXED_ORDER: OrderRecord = {
+    ...ORDER,
+    taxTotal: '404.5950',
+    grandTotal: '2652.3450',
+    taxAt: new Date('2026-09-07T10:30:00.000Z'),
+    supplyType: 'intra_state',
+    placeOfSupplyState: 'karnataka',
+    placeOfSupplyBasis: 'delivery_destination',
+    sellerGstin: '29AABCE1234F1Z5',
+    sellerLegalName: 'Example Retail Private Limited',
+    originLine1: '5th Floor, Prestige Tower',
+    originLine2: '',
+    originCity: 'Bengaluru',
+    originState: 'Karnataka',
+    originPostalCode: '560095',
+    originCountryCode: 'IN',
+    customerTaxCategory: 'b2c',
+    customerGstin: null,
+    customerLegalName: null,
+  };
+
+  /** One taxed line, at 9/9 on HSN 6109. */
+  const taxed = (
+    lineTotal: string,
+    discountAmount: string,
+    taxableValue: string,
+    cgst: string,
+  ) => ({
+    lineTotal,
+    discountAmount,
+    taxableValue,
+    hsnCode: '6109',
+    taxClassCode: 'GST-STD',
+    taxClassName: 'Standard rate',
+    cgstRate: '9.000000',
+    cgstAmount: cgst,
+    sgstRate: '9.000000',
+    sgstAmount: cgst,
+    igstRate: '0.000000',
+    igstAmount: '0.0000',
+    cessRate: '0.000000',
+    cessAmount: '0.0000',
+    taxTotal: toDb(add(fromDb(cgst, 'INR'), fromDb(cgst, 'INR'))),
+  });
+
+  const TAXED_LINES: readonly OrderLineRecord[] = [
+    { ...LINES[0]!, ...taxed('1598.0000', '159.8000', '1438.2000', '129.4380') },
+    { ...LINES[1]!, ...taxed('899.5000', '89.9500', '809.5500', '72.8595') },
+  ];
+
+  const ISSUED: InvoiceDocumentRecord = {
+    invoiceNumber: 'INV/2026-27/000001',
+    invoiceDate: '2026-09-07',
+    issuedAt: new Date('2026-09-07T10:30:00.000Z'),
+    financialYear: '2026-27',
+    summary: {
+      rows: [
+        {
+          hsnCode: '6109',
+          cgstRate: '9.000000',
+          sgstRate: '9.000000',
+          igstRate: '0.000000',
+          cessRate: '0.000000',
+          taxableValue: '2247.7500',
+          cgstAmount: '202.2975',
+          sgstAmount: '202.2975',
+          igstAmount: '0.0000',
+          cessAmount: '0.0000',
+          taxTotal: '404.5950',
+        },
+      ],
+      taxableValue: '2247.7500',
+      taxTotal: '404.5950',
+    },
+  };
+
+  const renderTaxed = (overrides: Partial<InvoiceInput> = {}): string =>
+    renderInvoice({
+      order: TAXED_ORDER,
+      lines: TAXED_LINES,
+      payment: { status: 'succeeded', method: 'online' },
+      invoice: ISSUED,
+      ...overrides,
+    });
+
+  /**
+   * **Increment 39's requirement 13: there is no hardcoded seller any more.**
+   *
+   * Increment 38's approved decision 2 made the STORE the seller of record and the platform
+   * explicitly not; a constant in the renderer naming a company was the last place that
+   * decision was contradicted. This test is the guard against it coming back.
+   */
+  it('names no hardcoded company anywhere', () => {
+    for (const html of [render(), renderTaxed()]) {
+      expect(html).not.toContain('Syntellite');
+      expect(html).not.toContain('accounts@syntellite.com');
+      expect(html).not.toContain('syntellite.com');
+    }
+  });
+
+  it('takes the seller from the order’s frozen snapshot', () => {
+    const html = renderTaxed();
+
+    expect(html).toContain('Example Retail Private Limited');
+    expect(html).toContain('29AABCE1234F1Z5');
+    /* And the premises, from the same snapshot. */
+    expect(html).toContain('Bengaluru');
+    expect(html).toContain('560095');
+  });
+
+  /**
+   * An UNASSESSED order shows NO seller.
+   *
+   * It is not a statutory invoice, so it has no seller of record — and inventing one for the
+   * letterhead would be the same mistake the hardcoded constant was, in a smaller font.
+   */
+  it('shows no seller for an order that was never assessed', () => {
     const html = render();
-    expect(html).toContain('Syntellite Innovation');
-    expect(html).toContain('accounts@syntellite.com');
-    /* Appears in the title too, so a printed page and a browser tab both identify it. */
-    expect(html).toContain('<title>Invoice ORD-20260907-7QK4M2 · Syntellite Innovation</title>');
+
+    expect(html).not.toContain('Example Retail Private Limited');
+    expect(html).not.toContain('29AABCE1234F1Z5');
+    expect(html).toContain('<title>Invoice ORD-20260907-7QK4M2</title>');
+  });
+
+  /* ══ The statutory number and the HSN summary ══════════════════════════ */
+
+  describe('an issued invoice', () => {
+    it('is titled a tax invoice and referenced by its statutory number', () => {
+      const html = renderTaxed();
+
+      expect(html).toContain('<title>Tax invoice INV/2026-27/000001</title>');
+      expect(html).toContain('<h1>Tax invoice</h1>');
+      expect(html).toContain('INV/2026-27/000001');
+      expect(html).toContain('2026-27');
+    });
+
+    /** Requirement 14: the date comes from the STORED value, not from a live timezone. */
+    it('prints the stored invoice date', () => {
+      const html = renderTaxed();
+
+      expect(html).toContain('Invoice date');
+      expect(html).toContain('7 September 2026');
+    });
+
+    it('renders the HSN and rate-wise summary', () => {
+      const html = renderTaxed();
+
+      expect(html).toContain('Tax summary by HSN and rate');
+      expect(html).toContain('6109');
+      expect(html).toContain('9.000000%');
+      /* A component that does not apply is a dash, not a zero. */
+      expect(html).toContain('—');
+    });
+
+    it('foots the summary to the same totals the order carries', () => {
+      const html = renderTaxed();
+
+      /* Indian grouping, as the money formatter produces it. */
+      expect(html).toContain('2,247.75');
+      expect(html).toContain('404.60');
+    });
+
+    /** Requirement 17. No IRN, no acknowledgement number, no QR — real or fake. */
+    it('carries no IRN and no QR code, and says so', () => {
+      const html = renderTaxed();
+
+      expect(html).not.toMatch(/\bIRN\b\s*[:=]/u);
+      expect(html).not.toContain('Acknowledgement number');
+      expect(html).not.toContain('<canvas');
+      expect(html).not.toContain('qrcode');
+      expect(html).not.toContain('data:image/svg');
+      expect(html).toContain('not e-invoiced');
+      expect(html).toContain('no IRN');
+    });
+
+    /** The escaping boundary, on the fields this increment newly renders. */
+    it('escapes the seller name and the origin address', () => {
+      const html = renderInvoice({
+        order: {
+          ...TAXED_ORDER,
+          sellerLegalName: '<script>alert(1)</script>',
+          originCity: '"><img src=x onerror=alert(1)>',
+        },
+        lines: TAXED_LINES,
+        payment: { status: 'succeeded', method: 'online' },
+        invoice: ISSUED,
+      });
+
+      expect(html).not.toContain('<script>alert(1)</script>');
+      expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+      expect(html).not.toContain('<img src=x onerror=alert(1)>');
+      expect(html).toContain('&quot;&gt;&lt;img src=x onerror=alert(1)&gt;');
+    });
+
+    it('escapes the invoice number itself', () => {
+      const html = renderInvoice({
+        order: TAXED_ORDER,
+        lines: TAXED_LINES,
+        payment: { status: 'succeeded', method: 'online' },
+        invoice: { ...ISSUED, invoiceNumber: 'INV/<script>/000001' },
+      });
+
+      expect(html).not.toContain('INV/<script>/000001');
+      expect(html).toContain('INV/&lt;script&gt;/000001');
+    });
+  });
+
+  /**
+   * An ASSESSED order with NO invoice — the pre-Increment-39 shape.
+   *
+   * Still renders, still shows its tax, and carries neither a statutory number nor a summary.
+   * This is the case that proves the read path issues nothing.
+   */
+  describe('an assessed but uninvoiced order', () => {
+    const renderAssessedOnly = (): string =>
+      renderInvoice({
+        order: TAXED_ORDER,
+        lines: TAXED_LINES,
+        payment: { status: 'succeeded', method: 'online' },
+        invoice: null,
+      });
+
+    it('is titled Invoice and referenced by its order number', () => {
+      const html = renderAssessedOnly();
+
+      expect(html).toContain('<h1>Invoice</h1>');
+      expect(html).toContain('ORD-20260907-7QK4M2');
+      expect(html).not.toMatch(/INV\/\d{4}-\d{2}\/\d{6}/u);
+    });
+
+    it('shows the tax but no HSN summary', () => {
+      const html = renderAssessedOnly();
+
+      expect(html).toContain('CGST');
+      expect(html).not.toContain('Tax summary by HSN and rate');
+      expect(html).toContain('NOT a statutory GST tax invoice');
+    });
+
+    /** An absent field and an explicit null mean the same thing: no statutory number. */
+    it('treats an absent invoice field the same as null', () => {
+      const withNull = renderAssessedOnly();
+      const withAbsent = renderInvoice({
+        order: TAXED_ORDER,
+        lines: TAXED_LINES,
+        payment: { status: 'succeeded', method: 'online' },
+      });
+
+      expect(withAbsent).toBe(withNull);
+    });
   });
 
   it('is a complete, self-contained HTML document', () => {

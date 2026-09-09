@@ -24,4 +24,5 @@ export * from './cart.js';
 export * from './promotions.js';
 export * from './orders.js';
 export * from './payments.js';
+export * from './invoicing.js';
 export * from './shipments.js';

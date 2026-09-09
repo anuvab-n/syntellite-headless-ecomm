@@ -300,6 +300,89 @@ export type CheckoutTaxDetermination =
  * onto. The tax service asserts that itself rather than trusting a caller to remember, exactly
  * as `lockCartForCheckout` and `reserve` do.
  */
+/**
+ * One HSN/rate-wise summary row, as the invoice document renders it. Structurally the
+ * invoicing module's `SummaryRow`.
+ */
+export type OrderInvoiceSummaryRow = {
+  readonly hsnCode: string;
+  readonly cgstRate: string;
+  readonly sgstRate: string;
+  readonly igstRate: string;
+  readonly cessRate: string;
+  readonly taxableValue: string;
+  readonly cgstAmount: string;
+  readonly sgstAmount: string;
+  readonly igstAmount: string;
+  readonly cessAmount: string;
+  readonly taxTotal: string;
+};
+
+/** The whole summary, with its own totals. Structurally `InvoiceSummary`. */
+export type OrderInvoiceSummary = {
+  readonly rows: readonly OrderInvoiceSummaryRow[];
+  readonly taxableValue: string;
+  readonly cgstAmount: string;
+  readonly sgstAmount: string;
+  readonly igstAmount: string;
+  readonly cessAmount: string;
+  readonly taxTotal: string;
+};
+
+/** An issued statutory invoice. Structurally the invoicing module's `IssuedInvoice`. */
+export type OrderInvoice = {
+  readonly invoice: {
+    readonly invoiceNumber: string;
+    readonly financialYear: string;
+    readonly sequenceNumber: number;
+    readonly issuedAt: Date;
+    readonly invoiceDate: string;
+    readonly taxableValue: string;
+    readonly taxTotal: string;
+    readonly grandTotal: string;
+  };
+  readonly summary: OrderInvoiceSummary;
+};
+
+/**
+ * **Invoicing, as orders needs it — declared HERE, implemented by the invoicing module.**
+ *
+ * `no-cross-module-imports` forbids `modules/orders` from importing `modules/invoicing` and
+ * forbids the reverse just as firmly, so the CONSUMER declares the port and `container.ts`
+ * adapts the invoicing service onto it — the same pattern `CheckoutTax`, `OrderReservations`
+ * and `OrderFulfilment` use. Structurally typed, so neither module names the other.
+ *
+ * **Two operations, and the asymmetry is the design.** `issueForOrder` allocates a number and
+ * may only be called from inside the checkout transaction; `findForOrder` is a pure read used
+ * by the invoice document routes. There is deliberately no way through this port to allocate a
+ * number outside checkout, to renumber, or to delete an invoice.
+ */
+export type OrderInvoicing = {
+  issueForOrder(input: {
+    storeId: string;
+    order: {
+      id: string;
+      orderNumber: string;
+      currency: string;
+      total: string;
+      taxTotal: string;
+      grandTotal: string;
+      taxAt: Date | null;
+    };
+    lines: readonly OrderLineRecord[];
+    storeTimezone: string;
+    at: Date;
+    actor: AuditActor;
+  }): Promise<OrderInvoice | null>;
+
+  findForOrder(input: {
+    storeId: string;
+    orderId: string;
+    currency: string;
+    lines: readonly OrderLineRecord[];
+  }): Promise<OrderInvoice | null>;
+};
+
 export type CheckoutTax = {
   determineForCheckout(input: {
     storeId: string;
@@ -430,6 +513,7 @@ export function createOrdersService(deps: {
   reservations: OrderReservations;
   fulfilment: OrderFulfilment;
   tax: CheckoutTax;
+  invoicing: OrderInvoicing;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
@@ -443,6 +527,7 @@ export function createOrdersService(deps: {
     reservations,
     fulfilment,
     tax,
+    invoicing,
     db,
     audit,
     logger,
@@ -467,15 +552,37 @@ export function createOrdersService(deps: {
   async function invoiceFor(
     header: OrderRecord | undefined,
     storeId: string,
-  ): Promise<{ view: OrderView; payment: { status: string | null; method: string | null } }> {
+  ): Promise<{
+    view: OrderView;
+    payment: { status: string | null; method: string | null };
+    invoice: OrderInvoice | null;
+  }> {
     if (!header) throw new NotFound('order');
 
     const lines = await repository.listOrderLines({ orderId: header.id, storeId });
     const state = await payments.stateForOrder({ orderId: header.id, storeId });
 
+    /**
+     * The issued invoice, if there is one. **A read — nothing is issued here.**
+     *
+     * Requirement 15 keeps these routes read-only, so an order without an invoice stays
+     * without one however often the document is fetched. Backfilling on read would allocate
+     * numbers in the order people happened to look at documents, which is not a series.
+     *
+     * `null` for an unassessed order and for any order placed before Increment 39. The
+     * renderer treats that as "no statutory number" rather than as an error.
+     */
+    const issued = await invoicing.findForOrder({
+      storeId,
+      orderId: header.id,
+      currency: header.currency,
+      lines,
+    });
+
     return {
       view: { order: header, lines },
       payment: { status: state?.status ?? null, method: state?.method ?? null },
+      invoice: issued,
     };
   }
 
@@ -524,6 +631,15 @@ export function createOrdersService(deps: {
       userId: string;
       storeId: string;
       storeCurrency: string;
+      /**
+       * The store's IANA timezone, for the invoice's financial year and document date.
+       *
+       * Threaded from the RESOLVED store, exactly as `storeCurrency` is. It reaches invoicing
+       * and nothing else: the financial year runs 1 April to 31 March in the store's own
+       * timezone, and computing it in UTC would misfile an order placed just after midnight on
+       * 1 April into the year that closed half an hour earlier.
+       */
+      storeTimezone: string;
       addressId: string;
       /** The claim this request already holds, completed inside the transaction below. */
       idempotency: { key: string; endpoint: string };
@@ -878,6 +994,45 @@ export function createOrdersService(deps: {
           orderId,
           storeId: params.storeId,
         });
+
+        /**
+         * 17b. **Issue the statutory invoice — Increment 39.**
+         *
+         * Here, and the position is fixed by three things:
+         *
+         *  - **After the lines exist**, because the HSN/rate-wise summary is derived from their
+         *    frozen tax snapshots and reconciled against the order's stored totals. There is
+         *    nothing to summarise before this point.
+         *  - **After the reservation**, so an order that fails on insufficient stock never
+         *    reaches the counter. A number consumed by a rolled-back checkout would be a gap.
+         *  - **Inside this transaction**, which is what makes the rollback release the number.
+         *    The counter is a ROW, not a sequence, precisely so that it can be un-incremented.
+         *
+         * `null` for an unassessed order — a store with no GST profile issues no statutory
+         * number, and that is requirement 16 rather than an omission. **No payment state is
+         * consulted**: requirement 2 makes issuance a consequence of the supply being recorded,
+         * not of money arriving, so a COD order is invoiced like any other.
+         *
+         * An `InvariantViolation` from the reconciliation rolls this whole transaction back: a
+         * numbered invoice that does not foot to its order is never written.
+         */
+        await invoicing.issueForOrder({
+          storeId: params.storeId,
+          order: {
+            id: orderId,
+            orderNumber: header.orderNumber,
+            currency: header.currency,
+            total: header.total,
+            taxTotal: header.taxTotal,
+            grandTotal: header.grandTotal,
+            taxAt: header.taxAt,
+          },
+          lines,
+          storeTimezone: params.storeTimezone,
+          at,
+          actor: params.actor,
+        });
+
         const view: OrderView = { order: header, lines };
 
         /**
@@ -1152,7 +1307,12 @@ export function createOrdersService(deps: {
       userId: string;
       storeId: string;
       orderNumber: string;
-    }): Promise<{ view: OrderView; payment: { status: string | null; method: string | null } }> {
+    }): Promise<{
+      view: OrderView;
+      payment: { status: string | null; method: string | null };
+      /** The issued statutory invoice, or `null`. Read only — see `invoiceFor`. */
+      invoice: OrderInvoice | null;
+    }> {
       /*
        * The order is fetched here rather than by calling `getOrder`, which would need `this` —
        * and `this` on a returned object literal breaks the moment a caller destructures the
@@ -1222,10 +1382,12 @@ export function createOrdersService(deps: {
      * method assumes it has already been enforced, exactly as every other admin service method
      * does — which is why its name says `Store` and not `Owned`.
      */
-    async getStoreOrderForInvoice(params: {
-      storeId: string;
-      orderNumber: string;
-    }): Promise<{ view: OrderView; payment: { status: string | null; method: string | null } }> {
+    async getStoreOrderForInvoice(params: { storeId: string; orderNumber: string }): Promise<{
+      view: OrderView;
+      payment: { status: string | null; method: string | null };
+      /** The issued statutory invoice, or `null`. Read only — see `invoiceFor`. */
+      invoice: OrderInvoice | null;
+    }> {
       return invoiceFor(await repository.findStoreOrderByNumber(params), params.storeId);
     },
 

@@ -4443,7 +4443,7 @@ source. Everything statutory is data a merchant supplies; everything in code is 
 | 14  | Snapshot                             | Tax facts frozen at the transaction boundary                                |
 | 15  | Currency                             | **INR only**                                                                |
 | 16  | COD                                  | Tax authoritative WITHOUT payment success. COD state machine untouched      |
-| 17  | Invoice numbering                    | FY-scoped series per store — **deferred to Increment 39**                   |
+| 17  | Invoice numbering                    | FY-scoped series per store — **delivered in §48**                           |
 | 18  | E-invoice / e-way bill               | Deferred                                                                    |
 | 19  | Returns, refunds, credit/debit notes | Deferred                                                                    |
 | 20  | Master data                          | Engineering invents none of it                                              |
@@ -4835,6 +4835,8 @@ returns · GSTR-1/3B export and reconciliation · reverse charge · composition 
 and zero-rating as first-class concepts · multi-location origin · shipping tax (shipping is free,
 so there is nothing to tax) · multi-currency GST · a GST state-code catalogue · a GSTIN checksum
 · rate correction in place.
+_(Invoice numbering, the FY-scoped series and the HSN/rate-wise summary were delivered in §48.
+Everything else in this list still stands, e-invoicing and IRN/QR included.)_
 
 **Still open from earlier increments, and untouched:** a COD payment never terminalises · a
 payment can still succeed against a cancelled order · `store_setting` and `feature_flag` remain
@@ -4843,3 +4845,331 @@ dead tables.
 **The one thing accounting must ratify:** that an unconfigured store assesses no tax, and that a
 configured store REFUSES an unclassified line rather than assessing it at zero. Everything else
 in this section was decided before implementation.
+
+---
+
+## 48. Phase 3 increment 39 — statutory invoice issuance
+
+The increment that gives the document a number. Two tables, one new module, no new route — and
+the first thing in this project whose defining property is that it must have **no gaps**.
+
+### The approved requirements
+
+| #   | Requirement                                             | How it landed                                               |
+| --- | ------------------------------------------------------- | ----------------------------------------------------------- |
+| 1   | Issuance inside the existing checkout transaction       | Step 17b, after the lines and the reservation               |
+| 2   | **No payment-success dependency**; COD invoiced too     | No payment state is read on the issuance path at all        |
+| 3   | Dedicated invoice persistence                           | `invoice` — immutable, one per order                        |
+| 4   | Dedicated store + FY series counter                     | `invoice_series` — one row per store per year               |
+| 5   | FY = 1 April to 31 March in `store.timezone`            | `financial-year.ts`, via `Intl` with an explicit IANA zone  |
+| 6   | Format exactly `INV/YYYY-YY/NNNNNN`                     | One formatter, and a CHECK that re-derives it in SQL        |
+| 7   | Sequential and gapless                                  | The counter row, and the rollback that releases it          |
+| 8   | Transactional allocation; **no sequence, no `MAX()+1`** | One `INSERT … ON CONFLICT DO UPDATE … RETURNING`            |
+| 9   | One invoice per order, in the database                  | `uq_invoice_order`                                          |
+| 10  | HSN/rate-wise summary from frozen line snapshots        | `invoice-summary.ts`, a pure module                         |
+| 11  | Exact monetary reconciliation                           | `reconcile()`, before the number is allocated               |
+| 12  | Historical seller identity from the order's snapshot    | The renderer reads `order.seller_*` and nothing else        |
+| 13  | Remove the hardcoded seller from the renderer           | `COMPANY` deleted; a test guards against its return         |
+| 14  | Persist invoice date / `issued_at`                      | Both columns, and the date is parsed rather than re-derived |
+| 15  | The GET routes stay read-only                           | `findForOrder` has no allocation path                       |
+| 16  | Unassessed orders get no statutory number               | `issueForOrder` answers `null`                              |
+| 17  | No fake IRN/QR, no IRP integration                      | Nothing to hold one; the disclaimer says so                 |
+| 18  | Preserve escaping / CSP / `no-store`                    | Unchanged, and re-asserted on the new fields                |
+| 19  | Preserve architecture and depcruise boundaries          | A new module behind a consumer-declared port                |
+| 20  | Update the documentation                                | This section, and the README                                |
+
+None of these was chosen here; all were approved before implementation.
+
+### Why the counter is a ROW and not a sequence
+
+This is the whole increment in one decision.
+
+**`nextval()` produces gaps, and a gap is the one thing a statutory series may not have.** A
+PostgreSQL sequence is deliberately non-transactional: it advances even when the transaction
+that called it rolls back, because that is exactly what makes it fast and lock-free. For a
+surrogate key that is right. Here it is fatal — a checkout that fails on insufficient stock
+would burn a number, and the books would read 000001, 000003, 000004 with nothing to account
+for the one in between.
+
+A counter **row** increments inside the caller's transaction, so a rollback un-increments it and
+the number goes to the next order instead. A test provokes exactly that: it starves the stock,
+watches the checkout fail with a `409`, asserts that neither the invoice nor the series row
+exists, then restocks and places a good order — which takes **000001**.
+
+**`MAX(sequence_number) + 1` is wrong for the more familiar reason.** Under READ COMMITTED two
+concurrent readers see the same maximum and both write it. One would lose `uq_invoice_number`
+and a customer would get a 500 on a successful order.
+
+### The allocation: one statement
+
+```sql
+INSERT INTO invoice_series (id, store_id, financial_year, last_number)
+VALUES ($1, $2, $3, 1)
+ON CONFLICT (store_id, financial_year)
+  DO UPDATE SET last_number = invoice_series.last_number + 1, updated_at = now()
+RETURNING last_number;
+```
+
+First call returns 1, every later call returns the next. Concurrency, exactly: two transactions
+issuing the first invoice of a year both attempt the INSERT; one wins `uq_invoice_series`, the
+other **blocks on that index** until the winner commits or rolls back, then takes the
+`DO UPDATE` branch and reads the committed value. So the two allocations are 1 and 2, in some
+order, and never both 1.
+
+`FOR UPDATE` appears nowhere: `DO UPDATE` takes the row lock itself.
+
+**Two-statement shapes were considered and rejected.** `INSERT … DO NOTHING` followed by an
+`UPDATE` has a real failure mode, not a theoretical one: if the transaction that inserted the
+series row then rolls back, a concurrent transaction that had already decided to "do nothing"
+finds no row to update and allocates nothing. `DO UPDATE` has no such window — the row either
+arrives from this statement or is locked and incremented by it.
+
+A test fires three concurrent checkouts on real connections and asserts the sequences are
+exactly `[1, 2, 3]`, the numbers are distinct, and the counter reads 3.
+
+### The financial year, and why the timezone is load-bearing
+
+1 April to 31 March, in **`store.timezone`** — approved requirement 5.
+
+The timezone is not decoration. `2027-03-31T20:00:00Z` is already 1 April in Kolkata and still
+31 March in UTC, so computing the year in UTC would file an Indian store's first invoice of the
+new year into the series that closed four hours earlier. A misfiled statutory document, and one
+only a tax audit would ever find. A test asserts that one instant lands in two different years
+for two stores in different zones.
+
+`Intl.DateTimeFormat.formatToParts` with an explicit `timeZone`, rather than arithmetic on the
+`Date`: the platform's own IANA database handles every historical offset change and DST rule,
+and the parts come back separately so nothing has to parse a formatted string back apart. An
+invalid zone is an OPERATOR error — `store.timezone` is configuration — so it raises rather than
+guessing.
+
+The label's second half is the closing year modulo 100, zero-padded, so the century turn is
+`2099-00`. A test pins that so nobody "fixes" it into `2099-100`.
+
+### Where issuance sits, and why nowhere else would do
+
+```
+15. the order header            <- the number needs an order to attach to
+16. the lines                   <- the summary is derived from their frozen snapshots
+16b. the reservation            <- a stock failure must not burn a number
+17. the first history row
+17b. ISSUE THE INVOICE          <- Increment 39
+18. audit
+19. complete the idempotency claim
+```
+
+After the lines, because there is nothing to summarise before them. After the reservation, so an
+order that fails on stock never reaches the counter. Inside the transaction, which is what makes
+the rollback release the number. `issueForOrder` asserts it is in a transaction rather than
+trusting the caller — the same assertion `lockCartForCheckout`, `reserveForOrder` and
+`determineForCheckout` all make.
+
+**No payment state is consulted anywhere on this path.** Requirement 2 makes issuance a
+consequence of the supply being recorded, not of money arriving — which is forced rather than
+chosen: §44–§46 record that a COD payment is created `pending` and no code path terminalises it,
+so waiting for payment would leave every COD sale permanently uninvoiced. A test asserts the
+invoice exists _before_ any payment is created, and again after a COD payment is created
+`pending`.
+
+### The two tables
+
+**`invoice_series`** — the only row in this schema meant to change. `last_number` is named for
+what it holds rather than `next_number`, which would make the row's meaning depend on whether
+you read it before or after an allocation.
+
+**`invoice`** — immutable. No `UPDATE` path, no `deleted_at`, no revision column. §3 #15 ties
+order retention to tax law and it applies with more force here: a gapless series is only gapless
+if nothing can remove a number from the middle of it.
+
+**What `invoice` deliberately does NOT duplicate:** the seller's identity, the place of supply,
+the supply type, both parties' GSTIN, and every per-line rate and amount. All of those are
+already frozen on `order` and `order_line` by §47. Requirement 12 makes the order's snapshot the
+source of historical seller identity, and a second copy would be a second thing that could
+disagree with the first — the failure §43 avoided by deriving `discount_total` from the allocated
+parts rather than computing it twice.
+
+What IS stored is what the order cannot answer: the number, the series it came from, the date the
+document bears, and the money totals as they stood when the number was allocated.
+
+### Five CHECKs worth naming
+
+| Constraint                        | What it stops                                           |
+| --------------------------------- | ------------------------------------------------------- |
+| `ck_invoice_number_matches_parts` | A printed number that disagrees with its own sequence   |
+| `ck_invoice_grand_total_identity` | An invoice that does not foot, checkable without a join |
+| `ck_invoice_number_shape`         | Anything that is not `INV/YYYY-YY/NNNNNN`               |
+| `ck_invoice_sequence_positive`    | A number nobody issued                                  |
+| `uq_invoice_sequence`             | Two invoices claiming one place in a series             |
+
+`ck_invoice_number_matches_parts` re-derives the string in SQL —
+`'INV/' || financial_year || '/' || lpad(sequence_number::text, 6, '0')` — so a change to the
+formatter that was not mirrored in the constraint fails at the database rather than on a printed
+document. It is the single worst defect this table could carry, and one no reader would spot.
+
+### The HSN/rate-wise summary
+
+Derived, not stored. The inputs are already immutable — `order_line`'s frozen tax snapshots — so
+a stored copy would only be a second thing that could disagree with them. A rate change, a
+reclassification or a renamed tax class cannot alter a summary computed years later, and a test
+proves it by changing all three and re-rendering.
+
+**The grouping key has five parts:** `(hsn_code, cgst_rate, sgst_rate, igst_rate, cess_rate)`.
+Two lines share a row only when they share the code AND every rate. Grouping by HSN alone would
+merge two lines carrying the same code under different rates — producing a row whose "rate"
+column is a lie about one of them, and the first thing an assessing officer would query. A test
+asserts the split.
+
+Ordering is deterministic — by HSN then by rate — because the summary is PRINTED: two renders of
+one invoice must be byte-identical, and `Map` insertion order would make the layout depend on the
+order rows came back from the database in.
+
+A line with no classification is SKIPPED, not bucketed under a placeholder. Inventing an
+`UNCLASSIFIED` HSN row would print a code no catalogue contains.
+
+### Reconciliation happens BEFORE the number is allocated
+
+Three exact equalities — requirement 11:
+
+```
+Σ summary taxable value = order.total
+Σ summary tax           = order.tax_total
+taxable + tax           = order.grand_total
+```
+
+Plus a fourth: the four components must foot to the summary's own tax total, which is the check
+that would catch a future grouping change dropping one.
+
+Compared with `equals()` on `Money`, never string equality — `'324.00'` and `'324.0000'` are the
+same amount and different strings, and a reconciliation that failed on formatting would be worse
+than none at all.
+
+It raises an `InvariantViolation` rather than returning a verdict, because the caller has no
+useful recovery: it is inside the checkout transaction, and the right answer to "the invoice does
+not foot" is to write no invoice and no order.
+
+### The hardcoded seller is gone
+
+§47 left one contradiction standing. Approved decision 2 had made the STORE the seller of record
+and the platform explicitly not — and the renderer still carried:
+
+```ts
+const COMPANY = { name: 'Syntellite Innovation', tagline: …, email: …, site: … };
+```
+
+presenting a constant as the issuer on every document. Requirement 13 removed it. The letterhead
+now reads `order.seller_legal_name` and `order.seller_gstin`, both frozen at checkout, and the
+footer carries the origin address from the same snapshot. A merchant who re-registers, renames or
+moves does not restate a single historical document.
+
+**An unassessed order shows no seller at all.** It is not a statutory invoice, has no seller of
+record, and inventing one for the letterhead would be the same mistake in a smaller font. A test
+asserts that no document — assessed or not — contains the old constant.
+
+The logo survives, because it is decorative (`alt=""`) and makes no claim about who sold
+anything.
+
+### Three documents, one renderer
+
+| Order                      | Title           | Reference            | Seller          | Tax rows | HSN summary |
+| -------------------------- | --------------- | -------------------- | --------------- | -------- | ----------- |
+| Unassessed                 | Invoice         | order number         | none            | none     | none        |
+| Assessed, pre-Increment-39 | Invoice         | order number         | frozen snapshot | yes      | none        |
+| Assessed and invoiced      | **Tax invoice** | `INV/YYYY-YY/NNNNNN` | frozen snapshot | yes      | **yes**     |
+
+The middle row matters: an order placed before this increment renders exactly as it did, which is
+the proof that the read path issues nothing. Requirement 15, and two tests — one fetches an
+uninvoiced document three times and asserts no invoice and no series row appear, the other
+fetches an invoiced one three times and asserts the number and the counter do not move.
+
+### Still not e-invoiced, and the disclaimer says so
+
+No IRN, no acknowledgement number, no signed QR code — real or fake. Requirement 17 forbids
+inventing a plausible-looking substitute, and there is nowhere to put one: `invoice` has no
+column for it. A test asserts the rendered document contains no `IRN:`, no
+`Acknowledgement number`, no `<canvas>` and no `qrcode`.
+
+So the disclaimer is reworded a second time rather than deleted:
+
+> _"Issued under a sequential, financial-year-scoped invoice series, with an HSN/SAC and
+> rate-wise tax summary. This document is not e-invoiced: it carries no IRN, no acknowledgement
+> number and no signed QR code, because this system is not registered with the Invoice
+> Registration Portal."_
+
+A document that quietly stopped disclaiming the moment it grew a number would be the worst
+possible outcome of this increment.
+
+### No route, and no event
+
+**Zero new endpoints.** The document is served by the two existing orders routes; issuance is a
+consequence of checkout. The API stays at **79 operations across 55 paths**, and the drift guard
+needed no change — which is the clearest possible statement that this increment added capability
+rather than surface.
+
+**No domain event.** §39's rule holds for the eleventh increment. `invoice.issued` is the most
+event-worthy thing here — "email the customer their invoice" is what every shop sends, and the
+mail infrastructure already exists — which is exactly why it must not get a speculative one. A
+test asserts no `invoice.*` event reaches the outbox.
+
+One audit action, `invoice.issued`, because a gapless series is an auditable artefact: "which
+order took number 000042, and when" must be answerable without reading the invoice table.
+
+### The migration, and the fault that did NOT appear
+
+Migration 22, `20260909064622_slim_luminals.sql`, 9 statements, one transaction.
+
+**No manual correction was needed, and that is worth recording.** Eight prior increments hit the
+same drizzle-kit fault — a FOREIGN KEY emitted before the unique index it references (§43 the
+fifth, §44 the sixth, §46 the seventh, §47 the eighth). This migration is clean as generated,
+because all three of its FK targets already exist: `fk_invoice_order_store` points at
+`order(id, store_id)` via `uq_order_id_store`, and the two store references point at a primary
+key. Nothing here references an index created by this migration. Verified by applying it, not
+assumed.
+
+One thing WAS corrected before generating: the first draft carried both
+`uq_invoice_sequence` and a plain `ix_invoice_series_sequence` on the identical three columns in
+the identical order. The unique index already serves the series audit read, so the plain one was
+dead weight the planner would never choose. Removed, and the schema comment says why.
+
+Additive and non-destructive: two `CREATE TABLE`s, three FKs, four unique indexes, no `DROP` of
+any kind, no column added to an existing table, and **no backfill**. An order placed before this
+migration simply has no invoice row. Backfilling would mean allocating numbers to historical
+orders in whatever sequence a query returned them, which is not a series.
+
+### Verification
+
+| Check                                         | Result                                        |
+| --------------------------------------------- | --------------------------------------------- |
+| Financial year + number format (unit)         | 24 passed                                     |
+| HSN summary + reconciliation (unit)           | 17 passed                                     |
+| Invoice document (unit)                       | 41 passed                                     |
+| Invoicing integration (real PostgreSQL)       | 27 passed                                     |
+| Full suite                                    | see the increment report                      |
+| `format:check` · `lint` · `typecheck`         | exit 0                                        |
+| `depcruise`                                   | exit 0 — **0 violations, 177 modules**        |
+| `build` · `db:generate` · `drizzle-kit check` | exit 0, no drift                              |
+| Live Neon                                     | 35 tables, 22 migrations                      |
+| Dependencies                                  | **unchanged** — 17 production, 21 development |
+
+### What this increment does NOT do
+
+**Deferred, explicitly:** IRP integration · real IRN generation · statutory QR generation ·
+e-way bills · returns and refunds · credit and debit notes · GSTR exports · reverse charge ·
+composition · exemptions and zero-rating · multi-location GST · multi-currency GST · a GST
+state-code catalogue · a GSTIN checksum · tax-rate correction in place · any payment or COD state
+redesign.
+
+**Still open from earlier increments, and untouched:** a COD payment never terminalises · a
+payment can still succeed against a cancelled order · state matching for place of supply is free
+text, so two spellings of one state still produce IGST where CGST+SGST was due · `store_setting`
+and `feature_flag` remain dead tables.
+
+**Two limitations this increment introduces, both stated rather than hidden:**
+
+An invoice **cannot be cancelled or amended**. There is no credit note, so an order that is
+cancelled after being invoiced keeps its number and its document — which is correct for a series
+that must not have gaps, and incomplete until credit notes exist. The document already shows
+`Cancelled` in its status badge, so it does not misrepresent the order.
+
+The series width is **six digits**, so a store may issue 999,999 invoices in one financial year
+before the format must widen. `formatInvoiceNumber` refuses a wider number loudly rather than
+producing a document the CHECK would reject.

@@ -93,6 +93,11 @@ import {
   createTaxService,
   type TaxService,
 } from './modules/tax/index.js';
+import {
+  createInvoicingRepository,
+  createInvoicingService,
+  type InvoicingService,
+} from './modules/invoicing/index.js';
 import { createDefaultStoreResolver, createStoreRepository } from './modules/stores/index.js';
 import { createRazorpayGateway, createUnconfiguredGateway } from './razorpay/gateway.js';
 import type { HandlerRegistry } from './db/outbox/publisher.js';
@@ -281,6 +286,14 @@ export type AppContainer = {
    * The one place a tax figure is computed. Every other module receives one already resolved.
    */
   tax: TaxService;
+  /**
+   * Statutory invoice issuance: the FY-scoped numbering series and the issued invoice.
+   *
+   * Exposed for completeness and for operator reconciliation. It mounts NO routes of its own —
+   * the invoice document is served by the two existing orders routes, and issuance happens
+   * inside checkout.
+   */
+  invoicing: InvoicingService;
   /**
    * Authorization guards for privileged routes.
    *
@@ -775,6 +788,27 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * checkout may do. Orders cannot resolve a coupon code, list promotions, mutate a cart line,
    * or claim an idempotency key — none of those reach it through these objects.
    */
+  /**
+   * The invoicing module.
+   *
+   * Takes `audit` because allocating a statutory number is a recordable act — "which order took
+   * number 000042, and when" must be answerable without reading the invoice table. It takes no
+   * `events`: nothing consumes `invoice.issued`, the handler registry is still empty, and
+   * §39's rule holds for the eleventh increment.
+   *
+   * Constructed BEFORE orders, because orders depends on it through the `OrderInvoicing` port it
+   * declares. A direct reference rather than a late binding: invoicing depends on nothing here.
+   *
+   * It takes the primary handle because `issueForOrder` runs inside the checkout transaction —
+   * and it is the rollback of that transaction that keeps the series gapless.
+   */
+  const invoicing = createInvoicingService({
+    repository: createInvoicingRepository({ db: db.db }),
+    db: db.db,
+    audit,
+    logger,
+  });
+
   const orders = createOrdersService({
     repository: createOrdersRepository({ db: db.db }),
     cart: {
@@ -840,6 +874,20 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      */
     tax: {
       determineForCheckout: (input) => tax.determineForCheckout(input),
+    },
+    /**
+     * Invoicing, adapted to the port orders declared.
+     *
+     * Not a late binding: `invoicing` is constructed above and depends on nothing here.
+     *
+     * Two operations, and the asymmetry is deliberate. `issueForOrder` allocates a number and is
+     * reachable only from inside the checkout transaction; `findForOrder` is a read for the
+     * document routes. Orders cannot renumber, cannot delete an invoice, and cannot read the
+     * series counter through this object — the numbering scheme stays the property of one module.
+     */
+    invoicing: {
+      issueForOrder: (input) => invoicing.issueForOrder(input),
+      findForOrder: (input) => invoicing.findForOrder(input),
     },
     /**
      * Whether a shipment blocks cancellation.
@@ -1286,6 +1334,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     paymentExpirySweeper,
     fulfilment,
     tax,
+    invoicing,
     scopeGuards,
     app,
     warmUp,

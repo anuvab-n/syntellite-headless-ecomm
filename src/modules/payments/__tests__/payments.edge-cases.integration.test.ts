@@ -44,6 +44,7 @@ import { createPromotionsRoutes } from '../../promotions/promotions.routes.js';
 import { createPromotionsService } from '../../promotions/promotions.service.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
 import { createTaxRepository, createTaxService } from '../../tax/index.js';
+import { createInvoicingRepository, createInvoicingService } from '../../invoicing/index.js';
 import { createPaymentsRepository } from '../payments.repository.js';
 import { createPaymentsRoutes } from '../payments.routes.js';
 import { createPaymentsService } from '../payments.service.js';
@@ -157,6 +158,21 @@ describe('payments edge cases (integration)', () => {
       logger: silentLogger,
     });
 
+    /**
+     * A REAL invoicing service, not a stub.
+     *
+     * The numbering guarantees this increment claims — gapless, per-store, per-financial-year,
+     * released by a rollback — are properties of ONE PostgreSQL statement against a real row.
+     * A double handing back "INV/…/000001" would let all of them pass while nothing was
+     * exercised.
+     */
+    const invoicing = createInvoicingService({
+      repository: createInvoicingRepository({ db: db() }),
+      db: db(),
+      audit: recorders.audit,
+      logger: silentLogger,
+    });
+
     const orders = createOrdersService({
       repository: createOrdersRepository({ db: db() }),
       cart: {
@@ -187,6 +203,10 @@ describe('payments edge cases (integration)', () => {
        * that a property of the double rather than of the system.
        */
       tax: { determineForCheckout: (input) => tax.determineForCheckout(input) },
+      invoicing: {
+        issueForOrder: (input) => invoicing.issueForOrder(input),
+        findForOrder: (input) => invoicing.findForOrder(input),
+      },
       idempotency: {
         complete: (input) =>
           idempotency.complete({

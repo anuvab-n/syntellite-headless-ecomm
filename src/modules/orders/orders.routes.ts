@@ -6,7 +6,7 @@ import { requireStore } from '../../http/middleware/store.js';
 import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
 import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
-import { renderInvoice, type InvoiceInput } from './invoice.js';
+import { renderInvoice, type InvoiceDocumentRecord, type InvoiceInput } from './invoice.js';
 import type { OrdersService } from './orders.service.js';
 import {
   CheckoutRequestSchema,
@@ -79,12 +79,19 @@ export function createOrdersRoutes(deps: {
   });
 
   /** The owner, the tenant and the currency — none of them from the request. */
-  const scope = (req: Request): { userId: string; storeId: string; storeCurrency: string } => {
+  const scope = (
+    req: Request,
+  ): { userId: string; storeId: string; storeCurrency: string; storeTimezone: string } => {
     const user = requireUser(req);
     return {
       userId: user.id,
       storeId: user.storeId,
       storeCurrency: requireStore(req).currency,
+      /*
+       * The store's IANA timezone, for the invoice's financial year and document date. From the
+       * RESOLVED store, exactly as the currency is — never from a header or a body.
+       */
+      storeTimezone: requireStore(req).timezone,
     };
   };
 
@@ -112,8 +119,27 @@ export function createOrdersRoutes(deps: {
     result: {
       view: { order: InvoiceInput['order']; lines: InvoiceInput['lines'] };
       payment: InvoiceInput['payment'];
+      /**
+       * The issued statutory invoice, or `null`.
+       *
+       * Read by the service, never issued here: requirement 15 keeps these routes read-only, so
+       * fetching a document allocates nothing.
+       */
+      invoice: {
+        invoice: Omit<InvoiceDocumentRecord, 'summary'>;
+        summary: InvoiceDocumentRecord['summary'];
+      } | null;
     },
   ): void => {
+    /*
+     * The service returns the invoice ROW and its summary as two fields; the renderer takes one
+     * flattened record. Mapped here rather than reshaped in the service, so the document type
+     * stays the renderer's own and the service is not coupled to how a page is laid out.
+     */
+    const document =
+      result.invoice === null
+        ? null
+        : { ...result.invoice.invoice, summary: result.invoice.summary };
     res
       .status(200)
       .type('html')
@@ -127,6 +153,7 @@ export function createOrdersRoutes(deps: {
           order: result.view.order,
           lines: result.view.lines,
           payment: result.payment,
+          invoice: document,
         }),
       );
   };

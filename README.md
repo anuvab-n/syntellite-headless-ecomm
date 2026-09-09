@@ -14,7 +14,7 @@ are JSON APIs, not a UI.
 | ------------- | -------------------------------------------------------- |
 | **Endpoints** | 79 operations across 55 paths, all documented in OpenAPI |
 | **Tests**     | 1,855 passing across 59 files                            |
-| **Database**  | PostgreSQL 18.6 (Neon), 33 tables, 21 migrations         |
+| **Database**  | PostgreSQL 18.6 (Neon), 35 tables, 22 migrations         |
 | **Language**  | TypeScript (strict, NodeNext) on Node 22                 |
 
 ---
@@ -53,7 +53,8 @@ book · cart with server-computed totals · coupon codes · checkout into an imm
 customers and for staff · **stock reservation at checkout** · **manual shipping and fulfilment**
 (staff raise a shipment, ship it, mark it delivered; the customer sees carrier and tracking) ·
 **GST** (configurable effective-dated rates, per-SKU HSN/tax class, CGST/SGST vs IGST by place of
-supply, B2B/B2C, and an immutable tax snapshot on every order).
+supply, B2B/B2C, and an immutable tax snapshot on every order) · **numbered tax invoices**
+(a sequential, gapless, financial-year-scoped series per store, with an HSN/rate-wise summary).
 
 ### Implemented but never run against the real provider
 
@@ -66,9 +67,10 @@ one real payment and one real webhook have been observed.
 ### Not built
 
 No shipping provider, carrier API or calculated shipping rates (shipping is free and fulfilment is
-manual) · no partial or multi-parcel shipments · **no statutory GST invoice** (tax is calculated
-and charged, but there is no invoice-number series, no HSN-wise summary and no IRN/QR — see
-below) · no e-way bills · no credit or debit notes · no GSTR export · no refunds or returns · no
+manual) · no partial or multi-parcel shipments · **no e-invoicing** (invoices carry a statutory
+number and an HSN summary, but no IRN, no acknowledgement number and no signed QR code — this
+system is not registered with the Invoice Registration Portal) · no e-way bills · no credit or
+debit notes · no invoice cancellation or amendment · no GSTR export · no refunds or returns · no
 admin order list or payment visibility beyond the fulfilment queue · no staff-management endpoints
 · no email verification · no product images · no payment retry · no guest checkout · no reporting.
 
@@ -160,7 +162,7 @@ already taken.
 ### 4. Create the schema and the first store
 
 ```bash
-pnpm db:migrate   # applies all 21 migrations
+pnpm db:migrate   # applies all 22 migrations
 pnpm db:seed      # creates the store named by DEFAULT_STORE_SLUG
 ```
 
@@ -487,6 +489,17 @@ scope · `Signed` is verified by provider signature instead of a login.
 | `GET`  | `/users/me/orders/:orderNumber/invoice` | Customer                           |
 | `GET`  | `/admin/orders/:orderNumber/invoice`    | **Staff** · any order in the store |
 
+**The two invoice routes are READ-ONLY.** A statutory invoice is issued once, inside the checkout
+transaction, for an order that carries a GST determination — fetching the document never
+allocates a number, however many times it is fetched. An assessed order's document is titled
+**Tax invoice** and bears `INV/YYYY-YY/NNNNNN`; an unassessed one is titled **Invoice** and is
+referenced by its order number.
+
+The financial year runs 1 April to 31 March **in the store's own timezone**, and the series is
+per store and per year — two stores both start at `000001`, and so does each new year. The
+numbering is gapless: the counter is a row incremented inside the checkout transaction, so a
+checkout that rolls back releases its number instead of burning it.
+
 ### Payments — 4
 
 | Method | Path                                     | Access                             |
@@ -612,7 +625,7 @@ src/
 ├── container.ts             Composition root — the ONLY place adapters are wired
 ├── config.ts                Reads process.env once, validates with Zod
 ├── db/
-│   ├── schema/              Drizzle table definitions (16 files, 33 tables)
+│   ├── schema/              Drizzle table definitions (17 files, 35 tables)
 │   ├── migrations/          17 plain .sql files — the real source of truth
 │   ├── outbox/              Transactional outbox: dispatcher, publisher, queues
 │   ├── migrate.ts           pnpm db:migrate
@@ -632,6 +645,7 @@ src/
 │   ├── payments/            payment state machine, webhook handling
 │   ├── fulfilment/          shipments, the fulfilment queue, stock fulfilment
 │   ├── tax/                 GST: classes, effective-dated rates, the calculation
+│   ├── invoicing/           the FY-scoped invoice series and the issued invoice
 │   └── stores/              tenant resolution
 ├── razorpay/                The ONLY file that names Razorpay
 ├── mail/                    SMTP adapter + the password-reset consumer
@@ -719,16 +733,26 @@ Beyond the three in [What works and what doesn't](#what-works-and-what-doesnt):
   them.
 - **A 100%-off coupon produces a `total` of 0**, which can be placed but never paid, because the
   payment amount must be positive. It can still be cancelled.
-- **The invoice is still not a STATUTORY GST tax invoice**, and says so on its face. It now shows
-  the tax that was calculated and charged, with the per-component breakdown, HSN codes and both
-  parties' GSTIN — but it carries no sequential invoice-number series, no HSN-wise summary and no
-  IRN/QR code, and it uses the order number as its reference. Increment 39.
+- **The invoice is numbered but not e-invoiced.** An assessed order now gets a sequential,
+  gapless, financial-year-scoped number (`INV/2026-27/000001`) with an HSN/rate-wise summary and
+  the seller identity frozen at checkout — but **no IRN, no acknowledgement number and no signed
+  QR code**, because this system is not registered with the Invoice Registration Portal. The
+  document says so on its face.
+- **An invoice cannot be cancelled or amended.** There are no credit or debit notes, so an order
+  cancelled AFTER being invoiced keeps its number and its document — which is correct for a
+  series that must not have gaps, and incomplete until credit notes exist. The document shows
+  `Cancelled` in its status badge, so it does not misrepresent the order.
+- **The invoice series is six digits**, so a store may issue 999,999 invoices in one financial
+  year before the format has to widen. A wider number is refused loudly rather than truncated.
+- **Orders placed before the invoicing increment have no invoice number**, and none is
+  backfilled: allocating numbers to historical orders in whatever order a query returned them
+  would not be a series. Those documents render as they always did, referenced by order number.
 - **`/health/ready` gives each dependency 2,000 ms**, hardcoded. A Neon database that has scaled to
   zero takes longer to wake, so the first probe after an idle period reports `unavailable` and the
   next succeeds. Either keep the database warm or make the timeout configurable before deploying.
-- **`docs/DECISIONS.md` stops at Increment 30 for some subjects.** Increments 35–38 are
-  documented in §44–§47; the reasoning for payments, password reset, cancellation and invoicing
-  still lives only in source file headers.
+- **`docs/DECISIONS.md` stops at Increment 30 for some subjects.** Increments 35–39 are
+  documented in §44–§48; the reasoning for payments, password reset and cancellation still lives
+  only in source file headers.
 - **A COD payment never leaves `pending`.** There is no delivery-settlement step, so a COD order
   can be shipped and delivered while its payment row still reads `pending`, and it stays
   uncancellable. The money is not tracked anywhere.
