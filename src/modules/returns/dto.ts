@@ -118,6 +118,36 @@ export const ListReturnsQuerySchema = z.strictObject({
 
 export type ListReturnsQuery = z.infer<typeof ListReturnsQuerySchema>;
 
+/* ── Staff ───────────────────────────────────────────────────────────────── */
+
+/**
+ * The staff decision body. An optional note, and that is all.
+ *
+ * `strictObject`, so note what a client therefore CANNOT send: a status, a refund amount, a
+ * quantity, an approval timestamp, a store or a user. Approval agrees to a return exactly as
+ * the customer raised it — it never edits one. Each of those is a `400` naming the field.
+ */
+export const StaffReturnDecisionSchema = z.strictObject({
+  staffNote: z.string().trim().max(500).optional(),
+});
+
+export type StaffReturnDecisionRequest = z.infer<typeof StaffReturnDecisionSchema>;
+
+/** The staff work-queue filter. One optional status, plus the shared paging contract. */
+export const StaffListReturnsQuerySchema = z.strictObject({
+  status: z
+    .enum(['requested', 'approved', 'received', 'inspected', 'completed', 'rejected', 'cancelled'])
+    .optional(),
+  limit: boundedIntParam({
+    min: 1,
+    max: RETURN_LIST_MAX_LIMIT,
+    default: RETURN_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+});
+
+export type StaffListReturnsQuery = z.infer<typeof StaffListReturnsQuerySchema>;
+
 /* ── Responses ───────────────────────────────────────────────────────────── */
 
 /**
@@ -227,5 +257,45 @@ export function toReturnResponse(view: {
     requestedAt: view.header.requestedAt.toISOString(),
     closedAt: view.header.closedAt === null ? null : view.header.closedAt.toISOString(),
     lines: view.lines.map(toReturnLineResponse),
+  };
+}
+
+/**
+ * A return as STAFF see it: everything the customer sees, plus the internal fields.
+ *
+ * Two additions, and both are staff-only for a reason.
+ *
+ * `staffNote` is the merchant’s rationale, written for colleagues — publishing it would
+ * turn every refusal into an argument with the customer.
+ *
+ * The per-line inspection counts say how many units were judged resellable versus written
+ * off. That is a warehouse decision and changes nothing about what the customer is owed, so
+ * it stays out of the customer response and belongs in the one staff use.
+ */
+export type StaffReturnLineResponse = ReturnLineResponse & {
+  restockQuantity: number;
+  writeOffQuantity: number;
+};
+
+export type StaffReturnResponse = Omit<ReturnResponse, 'lines'> & {
+  staffNote: string;
+  lines: StaffReturnLineResponse[];
+};
+
+export function toStaffReturnResponse(view: {
+  readonly header: MappableReturn & { readonly staffNote: string };
+  readonly lines: readonly (MappableReturnLine & {
+    readonly restockQuantity: number;
+    readonly writeOffQuantity: number;
+  })[];
+}): StaffReturnResponse {
+  return {
+    ...toReturnResponse(view),
+    staffNote: view.header.staffNote,
+    lines: view.lines.map((line) => ({
+      ...toReturnLineResponse(line),
+      restockQuantity: line.restockQuantity,
+      writeOffQuantity: line.writeOffQuantity,
+    })),
   };
 }

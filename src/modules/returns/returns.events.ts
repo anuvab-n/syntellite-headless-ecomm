@@ -16,6 +16,8 @@ export const RETURN_RESOURCE = 'return';
 export const RETURN_AUDIT = {
   requested: 'return.requested',
   cancelled: 'return.cancelled',
+  approved: 'return.approved',
+  rejected: 'return.rejected',
 } as const;
 
 export type ReturnAuditAction = (typeof RETURN_AUDIT)[keyof typeof RETURN_AUDIT];

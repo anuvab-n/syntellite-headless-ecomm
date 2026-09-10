@@ -1542,6 +1542,39 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             refundTotal: { type: 'string', description: 'taxableValue + taxTotal.' },
           },
         },
+        StaffReturn: {
+          allOf: [
+            { $ref: '#/components/schemas/Return' },
+            {
+              type: 'object',
+              description:
+                'The staff view: everything the customer sees, plus the internal fields. ' +
+                'staffNote is the merchant’s rationale, written for colleagues — publishing ' +
+                'it would turn every refusal into an argument. The per-line inspection counts ' +
+                'are a warehouse decision and change nothing the customer is owed.',
+              required: ['staffNote'],
+              properties: {
+                staffNote: { type: 'string', maxLength: 500 },
+                lines: {
+                  type: 'array',
+                  items: {
+                    allOf: [
+                      { $ref: '#/components/schemas/ReturnLine' },
+                      {
+                        type: 'object',
+                        required: ['restockQuantity', 'writeOffQuantity'],
+                        properties: {
+                          restockQuantity: { type: 'integer', minimum: 0 },
+                          writeOffQuantity: { type: 'integer', minimum: 0 },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          ],
+        },
         Return: {
           type: 'object',
           description:
@@ -4414,6 +4447,258 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'AUTHENTICATION_REQUIRED',
             ),
             ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/returns': {
+        get: {
+          tags: ['Returns'],
+          summary: 'The store return queue (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Every return in the staff member’s own store, newest first, optionally filtered',
+            'by status.',
+            '',
+            'Store-scoped and **not** owner-scoped: staff act for a tenant, so a colleague’s',
+            'case is theirs to see. The store comes from the verified token, so one tenant’s',
+            'staff can never reach another’s returns.',
+            '',
+            'The response carries `staffNote` and the per-line inspection counts, neither of',
+            'which appears on the customer-facing endpoints.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              schema: {
+                type: 'string',
+                enum: [
+                  'requested',
+                  'approved',
+                  'received',
+                  'inspected',
+                  'completed',
+                  'rejected',
+                  'cancelled',
+                ],
+              },
+              description: 'Narrow the queue to one state.',
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of returns.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['returns', 'total', 'limit', 'offset'],
+                    properties: {
+                      returns: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/StaffReturn' },
+                      },
+                      total: { type: 'integer' },
+                      limit: { type: 'integer' },
+                      offset: { type: 'integer' },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('An invalid status, limit or offset.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/{returnNumber}': {
+        get: {
+          tags: ['Returns'],
+          summary: 'Read one return (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'One return in the staff member’s own store.',
+            '',
+            'Another tenant’s return is a `404` — the same answer an unknown number gets, so',
+            'the response cannot be used to probe other stores.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The return, with staff-only fields.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/StaffReturn' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed return number.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/{returnNumber}/approve': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Approve a requested return (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Agrees to a return exactly as the customer raised it.',
+            '',
+            '**Only `requested` → `approved`.** Every other state is a `409` naming both ends',
+            'of the refused move: an already-approved, received, inspected, completed, rejected',
+            'or cancelled return cannot be approved.',
+            '',
+            '### Approval cannot edit the return',
+            '',
+            'The body is an optional `staffNote` and nothing else. A client cannot send a',
+            'status, a quantity, a refund amount, an approval timestamp, a store or a user —',
+            'each is a `400` naming the field. The frozen refund snapshot taken when the return',
+            'was created is left exactly as it was.',
+            '',
+            '### No Idempotency-Key',
+            '',
+            'The status predicate on the update IS the idempotency: a second approval matches no',
+            'row and answers `409`. That is the honest result — a client receiving `200` twice',
+            'could not tell whether it approved something or nothing.',
+            '',
+            'Concurrent approve and reject attempts resolve to exactly one transition, one',
+            'history row and one audit record.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: { staffNote: { type: 'string', maxLength: 500 } },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The approved return.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/StaffReturn' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed number or an unknown field.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The return is not in a state that can be approved.',
+              'RETURN_NOT_TRANSITIONABLE',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/{returnNumber}/reject': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Reject a return (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Refuses a return. **No refund is made and nothing is restocked.**',
+            '',
+            '`requested` → `rejected` today. `received` → `rejected` becomes reachable once',
+            'Increment 40e adds receipt and inspection.',
+            '',
+            'A rejected return **releases its quantity** back to the returnable pool: nothing',
+            'came back and no money moved, so the customer may raise another return for the',
+            'same units.',
+            '',
+            'The body is an optional `staffNote`, which is internal and never shown to the',
+            'customer.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: { staffNote: { type: 'string', maxLength: 500 } },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The rejected return.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/StaffReturn' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed number or an unknown field.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The return is not in a state that can be rejected.',
+              'RETURN_NOT_TRANSITIONABLE',
+            ),
           },
         },
       },

@@ -1220,6 +1220,8 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     createReturnsRoutes({
       returns,
       verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
+      // The staff guard, built against identity's authorization loader.
+      requireStaff: scopeGuards.requireScope('staff'),
       /**
        * The idempotency guard, built here because the store is cross-cutting infrastructure
        * the module must not reach for. Mounted by the ROUTE after `requireAuth`, which is

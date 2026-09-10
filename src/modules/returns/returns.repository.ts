@@ -370,6 +370,99 @@ export function createReturnsRepository(deps: { db: Database }) {
       };
     },
 
+    /**
+     * One return in this STORE, whoever raised it. Staff read, no lock.
+     *
+     * Scoped by store and nothing else: staff act for a tenant, not for a customer, so the
+     * owner predicate the customer read carries would wrongly hide a colleague’s case.
+     * The store predicate is still absolute — staff of one tenant never see another’s.
+     */
+    async findStoreReturnByNumber(params: {
+      returnNumber: string;
+      storeId: string;
+    }): Promise<(ReturnRecord & { orderNumber: string }) | undefined> {
+      const [row] = await executor(db)
+        .select({ ...RETURN_COLUMNS, orderNumber: order.orderNumber })
+        .from(returnRequest)
+        .innerJoin(
+          order,
+          and(eq(returnRequest.orderId, order.id), eq(returnRequest.storeId, order.storeId)),
+        )
+        .where(
+          and(
+            eq(returnRequest.returnNumber, params.returnNumber),
+            eq(returnRequest.storeId, params.storeId),
+          ),
+        )
+        .limit(1);
+      return row === undefined ? undefined : { ...toReturn(row), orderNumber: row.orderNumber };
+    },
+
+    /**
+     * Lock one return by number for a STAFF transition. Store-scoped, no owner predicate.
+     *
+     * `FOR UPDATE` because the decision that follows spans statements — read the status,
+     * apply the CAS, append the event, write the audit — and a second staff member must not
+     * interleave with any of it.
+     */
+    async lockStoreReturnByNumber(params: {
+      returnNumber: string;
+      storeId: string;
+    }): Promise<ReturnRecord | undefined> {
+      const [row] = await executor(db)
+        .select(RETURN_COLUMNS)
+        .from(returnRequest)
+        .where(
+          and(
+            eq(returnRequest.returnNumber, params.returnNumber),
+            eq(returnRequest.storeId, params.storeId),
+          ),
+        )
+        .limit(1)
+        .for('update');
+      return row === undefined ? undefined : toReturn(row);
+    },
+
+    /**
+     * The staff work queue: every return in the store, newest first, optionally by status.
+     *
+     * The page and the total share ONE predicate, so a caller on the last page is never told
+     * about rows it cannot reach.
+     */
+    async listStoreReturns(params: {
+      storeId: string;
+      status?: ReturnStatus;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: (ReturnRecord & { orderNumber: string })[]; total: number }> {
+      const predicate =
+        params.status === undefined
+          ? eq(returnRequest.storeId, params.storeId)
+          : and(eq(returnRequest.storeId, params.storeId), eq(returnRequest.status, params.status));
+
+      const rows = await executor(db)
+        .select({ ...RETURN_COLUMNS, orderNumber: order.orderNumber })
+        .from(returnRequest)
+        .innerJoin(
+          order,
+          and(eq(returnRequest.orderId, order.id), eq(returnRequest.storeId, order.storeId)),
+        )
+        .where(predicate)
+        .orderBy(desc(returnRequest.requestedAt), desc(returnRequest.returnNumber))
+        .limit(params.limit)
+        .offset(params.offset);
+
+      const [counted] = await executor(db)
+        .select({ total: sql<string>`count(*)` })
+        .from(returnRequest)
+        .where(predicate);
+
+      return {
+        items: rows.map((r) => ({ ...toReturn(r), orderNumber: r.orderNumber })),
+        total: Number(counted?.total ?? 0),
+      };
+    },
+
     /** Every line of one return, ordered so a response is stable across reads. */
     async listReturnLines(params: {
       returnId: string;

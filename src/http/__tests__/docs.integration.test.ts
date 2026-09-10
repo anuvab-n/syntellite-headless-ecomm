@@ -69,6 +69,18 @@ describe('API documentation', () => {
     apiRouter.post('/users/me/password', (_req, res) => {
       res.status(204).send();
     });
+    apiRouter.get('/admin/returns', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.get('/admin/returns/:returnNumber', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/returns/:returnNumber/approve', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/returns/:returnNumber/reject', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
     apiRouter.post('/users/me/orders/:orderNumber/returns', (_req, res) => {
       res.status(201).json({ ok: true });
     });
@@ -432,6 +444,10 @@ describe('API documentation', () => {
         '/api/v1/admin/products/{slug}/skus',
         '/api/v1/admin/promotions',
         '/api/v1/admin/promotions/{code}',
+        '/api/v1/admin/returns',
+        '/api/v1/admin/returns/{returnNumber}',
+        '/api/v1/admin/returns/{returnNumber}/approve',
+        '/api/v1/admin/returns/{returnNumber}/reject',
         '/api/v1/admin/shipments/{id}',
         '/api/v1/admin/shipments/{id}/deliver',
         '/api/v1/admin/shipments/{id}/ship',

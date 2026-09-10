@@ -7,12 +7,17 @@ import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
 import {
   CreateReturnRequestSchema,
+  StaffListReturnsQuerySchema,
+  StaffReturnDecisionSchema,
+  toStaffReturnResponse,
   ListReturnsQuerySchema,
   ReturnNumberParamsSchema,
   toReturnResponse,
   type CreateReturnRequest,
   type ListReturnsQuery,
   type ReturnNumberParams,
+  type StaffListReturnsQuery,
+  type StaffReturnDecisionRequest,
 } from './dto.js';
 import type { ReturnsService } from './returns.service.js';
 
@@ -36,11 +41,18 @@ export function createReturnsRoutes(deps: {
   returns: ReturnsService;
   verifyAccessToken: AccessTokenVerifier;
   requireIdempotency: RequestHandler;
+  /**
+   * The `staff` scope guard, pre-built by the composition root.
+   *
+   * Passed in because the privilege check belongs to identity; this file only declares
+   * which privilege a route requires.
+   */
+  requireStaff: RequestHandler;
   logger: Logger;
   // Annotated rather than inferred: without it `tsc` cannot name the router type portably
   // under pnpm's nested `node_modules`. Every other routes file does the same.
 }): Router {
-  const { returns, requireIdempotency, logger } = deps;
+  const { returns, requireIdempotency, requireStaff, logger } = deps;
 
   const router = Router();
   const auth: RequestHandler = requireAuth({
@@ -58,6 +70,14 @@ export function createReturnsRoutes(deps: {
     type: 'customer',
     userId: requireUser(req).id,
   });
+
+  const staffActor = (req: Request): AuditActor => ({
+    type: 'staff',
+    userId: requireUser(req).id,
+  });
+
+  /** The tenant a staff member acts for. From the verified token, never the request. */
+  const staffStore = (req: Request): string => requireUser(req).storeId;
 
   const claimOf = (req: Request): { key: string; endpoint: string } => ({
     key: (req.get('idempotency-key') ?? '').trim(),
@@ -179,6 +199,122 @@ export function createReturnsRoutes(deps: {
       });
 
       res.status(200).json({ return: toReturnResponse(view) });
+    }),
+  );
+
+  /* ── Staff ────────────────────────────────────────────────────────────── */
+
+  /**
+   * `GET /admin/returns`
+   *
+   * 200 with the store’s return queue, newest first, optionally filtered by status.
+   *
+   * Store-scoped and NOT owner-scoped: staff act for a tenant, so a colleague’s case is
+   * theirs to see. The store comes from the verified token, so one tenant’s staff can never
+   * reach another’s returns.
+   */
+  router.get(
+    '/admin/returns',
+    auth,
+    requireStaff,
+    validate({ query: StaffListReturnsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const { status, limit, offset } = validatedQuery<StaffListReturnsQuery>(req);
+      const page = await returns.listStoreReturns({
+        storeId: staffStore(req),
+        ...(status === undefined ? {} : { status }),
+        limit,
+        offset,
+      });
+
+      res.status(200).json({
+        returns: page.items.map(toStaffReturnResponse),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+      });
+    }),
+  );
+
+  /**
+   * `GET /admin/returns/{returnNumber}`
+   *
+   * 200 with one return in the store. `404` for another tenant’s — the same answer an
+   * unknown number gets, so the response cannot be used to probe other stores.
+   */
+  router.get(
+    '/admin/returns/:returnNumber',
+    auth,
+    requireStaff,
+    validate({ params: ReturnNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const view = await returns.getStoreReturn({
+        storeId: staffStore(req),
+        returnNumber: returnNumberOf(req),
+      });
+
+      res.status(200).json({ return: toStaffReturnResponse(view) });
+    }),
+  );
+
+  /**
+   * `POST /admin/returns/{returnNumber}/approve`
+   *
+   * 200 with the approved return. **Only `requested -> approved`**; every other state is a
+   * `409` naming both ends of the refused move.
+   *
+   * Approval agrees to the return exactly as it was raised. The body is an optional note and
+   * nothing else — no quantity, no amount, no status — so approval can never silently edit
+   * what the customer asked for or what they are owed. The frozen refund snapshot taken at
+   * creation is left untouched.
+   *
+   * No `Idempotency-Key`. The status predicate on the update is the idempotency: a second
+   * approval matches no row and answers `409`, which is the honest result — a client that
+   * received `200` twice could not tell whether it approved something or nothing.
+   */
+  router.post(
+    '/admin/returns/:returnNumber/approve',
+    auth,
+    requireStaff,
+    validate({ params: ReturnNumberParamsSchema, body: StaffReturnDecisionSchema }),
+    asyncHandler(async (req, res) => {
+      const body = validatedBody<StaffReturnDecisionRequest>(req);
+      const view = await returns.approveReturn({
+        storeId: staffStore(req),
+        returnNumber: returnNumberOf(req),
+        actor: staffActor(req),
+        ...(body.staffNote === undefined ? {} : { staffNote: body.staffNote }),
+      });
+
+      res.status(200).json({ return: toStaffReturnResponse(view) });
+    }),
+  );
+
+  /**
+   * `POST /admin/returns/{returnNumber}/reject`
+   *
+   * 200 with the rejected return. `requested -> rejected` today; `received -> rejected`
+   * becomes reachable when 40e adds receipt.
+   *
+   * A rejected return refunds nothing and restocks nothing, and it **releases its quantity**
+   * back to the returnable pool — nothing came back and no money moved, so the customer may
+   * raise another return for the same units.
+   */
+  router.post(
+    '/admin/returns/:returnNumber/reject',
+    auth,
+    requireStaff,
+    validate({ params: ReturnNumberParamsSchema, body: StaffReturnDecisionSchema }),
+    asyncHandler(async (req, res) => {
+      const body = validatedBody<StaffReturnDecisionRequest>(req);
+      const view = await returns.rejectReturn({
+        storeId: staffStore(req),
+        returnNumber: returnNumberOf(req),
+        actor: staffActor(req),
+        ...(body.staffNote === undefined ? {} : { staffNote: body.staffNote }),
+      });
+
+      res.status(200).json({ return: toStaffReturnResponse(view) });
     }),
   );
 

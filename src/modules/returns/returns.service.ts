@@ -23,7 +23,7 @@ import {
   type ReturnsRepository,
   type ReturnStatus,
 } from './returns.repository.js';
-import { canTransition, isCustomerCancellable } from './return.state.js';
+import { canTransition, isCustomerCancellable, isTerminal } from './return.state.js';
 
 /* ── Ports ───────────────────────────────────────────────────────────────── */
 
@@ -124,6 +124,15 @@ export type ReturnView = {
   readonly header: ReturnRecord & { readonly orderNumber: string };
   readonly lines: readonly ReturnLineRecord[];
 };
+
+/**
+ * What STAFF see. The customer view plus the fields written for colleagues.
+ *
+ * `staffNote` is here and absent from the customer response deliberately: it is the
+ * merchant’s internal rationale for approving or refusing, written to be read by other
+ * staff, and publishing it would turn every refusal into an argument.
+ */
+export type StaffReturnView = ReturnView;
 
 export type ReturnsService = ReturnType<typeof createReturnsService>;
 
@@ -506,6 +515,184 @@ export function createReturnsService(deps: {
       offset: number;
     }> {
       const page = await repository.listOwnedReturns(params);
+      const lines = await repository.listLinesForReturns({
+        returnIds: page.items.map((r) => r.id),
+        storeId: params.storeId,
+      });
+
+      const byReturn = new Map<string, ReturnLineRecord[]>();
+      for (const line of lines) {
+        const bucket = byReturn.get(line.returnId) ?? [];
+        bucket.push(line);
+        byReturn.set(line.returnId, bucket);
+      }
+
+      return {
+        items: page.items.map((header) => ({
+          header,
+          lines: byReturn.get(header.id) ?? [],
+        })),
+        total: page.total,
+        limit: params.limit,
+        offset: params.offset,
+      };
+    },
+
+    /**
+     * Move a return to a new status on a STAFF decision. The one place 40d transitions.
+     *
+     * Shared by approve and reject because the two differ only in the target status and the
+     * audit action — everything that makes the transition safe is identical, and two copies
+     * would be two places for the lock, the CAS or the history write to drift.
+     *
+     * The sequence is fixed:
+     *
+     *  1. Lock the return row, store-scoped. Staff act for a tenant, so there is no owner
+     *     predicate — but the store predicate is absolute.
+     *  2. Check the transition table. An illegal move is a `409`, never a silent no-op.
+     *  3. CAS on the status. If it matches nothing, a concurrent actor won the race and this
+     *     request throws rather than recording a transition that did not happen.
+     *  4. Append the event, write the audit — both inside the same transaction, so a
+     *     rollback leaves neither.
+     *
+     * **The frozen refund snapshot is never touched.** Approval does not recompute, reprice
+     * or re-apportion anything: the amounts were fixed when the return was raised and staff
+     * agreeing to it cannot change what the customer is owed.
+     */
+    async transitionByStaff(params: {
+      returnNumber: string;
+      storeId: string;
+      toStatus: ReturnStatus;
+      actor: AuditActor;
+      auditAction: string;
+      staffNote?: string;
+    }): Promise<ReturnView> {
+      return withTransaction(db, logger, async () => {
+        const locked = await repository.lockStoreReturnByNumber({
+          returnNumber: params.returnNumber,
+          storeId: params.storeId,
+        });
+        if (!locked) throw new NotFound('return');
+
+        if (!canTransition(locked.status, params.toStatus)) {
+          throw new ReturnNotTransitionable(locked.status, params.toStatus);
+        }
+
+        const closedAt = isTerminal(params.toStatus) ? now() : null;
+
+        const moved = await repository.transitionStatus({
+          returnId: locked.id,
+          storeId: params.storeId,
+          fromStatus: locked.status,
+          toStatus: params.toStatus,
+          closedAt,
+          ...(params.staffNote === undefined ? {} : { staffNote: params.staffNote }),
+        });
+        /*
+         * The CAS matched nothing, which under the row lock means a concurrent transition
+         * committed first. Throwing rolls this back, so no event or audit records a change
+         * that did not happen.
+         */
+        if (!moved) throw new ReturnNotTransitionable(locked.status, params.toStatus);
+
+        await repository.insertEvent({
+          returnId: locked.id,
+          storeId: params.storeId,
+          fromStatus: locked.status,
+          toStatus: params.toStatus,
+          actorType: 'staff',
+          actorUserId: params.actor.type === 'staff' ? (params.actor.userId ?? null) : null,
+          ...(params.staffNote === undefined ? {} : { note: params.staffNote }),
+        });
+
+        await audit.record({
+          storeId: params.storeId,
+          actor: params.actor,
+          action: params.auditAction,
+          resourceType: RETURN_RESOURCE,
+          resourceId: locked.id,
+          metadata: {
+            returnNumber: locked.returnNumber,
+            fromStatus: locked.status,
+            toStatus: params.toStatus,
+          },
+        });
+
+        logger.info(
+          {
+            storeId: params.storeId,
+            returnNumber: locked.returnNumber,
+            fromStatus: locked.status,
+            toStatus: params.toStatus,
+          },
+          'return_transitioned_by_staff',
+        );
+
+        return this.getStoreReturn({
+          returnNumber: params.returnNumber,
+          storeId: params.storeId,
+        });
+      });
+    },
+
+    /** Approve a requested return. Only `requested -> approved`. */
+    async approveReturn(params: {
+      returnNumber: string;
+      storeId: string;
+      actor: AuditActor;
+      staffNote?: string;
+    }): Promise<ReturnView> {
+      return this.transitionByStaff({
+        ...params,
+        toStatus: 'approved',
+        auditAction: RETURN_AUDIT.approved,
+      });
+    },
+
+    /**
+     * Refuse a return. `requested -> rejected`, and later `received -> rejected`.
+     *
+     * A rejected return refunds nothing and restocks nothing, and it RELEASES its quantity
+     * back to the returnable pool — the customer may raise another for the same units.
+     */
+    async rejectReturn(params: {
+      returnNumber: string;
+      storeId: string;
+      actor: AuditActor;
+      staffNote?: string;
+    }): Promise<ReturnView> {
+      return this.transitionByStaff({
+        ...params,
+        toStatus: 'rejected',
+        auditAction: RETURN_AUDIT.rejected,
+      });
+    },
+
+    /** One return in the store, whoever raised it. Staff read. */
+    async getStoreReturn(params: { returnNumber: string; storeId: string }): Promise<ReturnView> {
+      const header = await repository.findStoreReturnByNumber(params);
+      if (!header) throw new NotFound('return');
+
+      const lines = await repository.listReturnLines({
+        returnId: header.id,
+        storeId: params.storeId,
+      });
+      return { header, lines };
+    },
+
+    /** The staff work queue: every return in the store, newest first, optionally by status. */
+    async listStoreReturns(params: {
+      storeId: string;
+      status?: ReturnStatus;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly ReturnView[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listStoreReturns(params);
       const lines = await repository.listLinesForReturns({
         returnIds: page.items.map((r) => r.id),
         storeId: params.storeId,
