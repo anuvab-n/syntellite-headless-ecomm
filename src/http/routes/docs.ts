@@ -1508,6 +1508,100 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
       schemas: {
+        ReturnLine: {
+          type: 'object',
+          description:
+            'One returned SKU, with the money apportioned from the FROZEN order line. Nothing ' +
+            'here is recalculated from the current price, tax configuration or promotion. The ' +
+            'inspection counts are deliberately absent: whether a unit was resold or written ' +
+            'off is a warehouse decision and changes nothing the customer is owed.',
+          required: [
+            'skuCode',
+            'quantity',
+            'lineTotal',
+            'discountAmount',
+            'taxableValue',
+            'cgstAmount',
+            'sgstAmount',
+            'igstAmount',
+            'cessAmount',
+            'taxTotal',
+            'refundTotal',
+          ],
+          properties: {
+            skuCode: { type: 'string', example: 'AURORA-TEE-S' },
+            quantity: { type: 'integer', minimum: 1, example: 2 },
+            lineTotal: { type: 'string', description: 'Gross for the returned units.' },
+            discountAmount: { type: 'string', description: 'Their share of the promotion.' },
+            taxableValue: { type: 'string', description: 'lineTotal minus discountAmount.' },
+            cgstAmount: { type: 'string' },
+            sgstAmount: { type: 'string' },
+            igstAmount: { type: 'string' },
+            cessAmount: { type: 'string' },
+            taxTotal: { type: 'string', description: 'CGST + SGST + IGST + CESS.' },
+            refundTotal: { type: 'string', description: 'taxableValue + taxTotal.' },
+          },
+        },
+        Return: {
+          type: 'object',
+          description:
+            'A return request. staffNote and every internal identifier are absent — the ' +
+            'note is the merchant’s internal rationale, written for colleagues.',
+          required: [
+            'returnNumber',
+            'orderNumber',
+            'status',
+            'reason',
+            'customerNote',
+            'currency',
+            'refundTaxableValue',
+            'refundTaxTotal',
+            'refundTotal',
+            'requestedAt',
+            'closedAt',
+            'lines',
+          ],
+          properties: {
+            returnNumber: { type: 'string', example: 'RET-20260910-K3M7QP' },
+            orderNumber: { type: 'string', example: 'ORD-20260901-A2B4C6' },
+            status: {
+              type: 'string',
+              enum: [
+                'requested',
+                'approved',
+                'received',
+                'inspected',
+                'completed',
+                'rejected',
+                'cancelled',
+              ],
+            },
+            reason: {
+              type: 'string',
+              enum: [
+                'damaged_in_transit',
+                'defective',
+                'wrong_item_received',
+                'not_as_described',
+                'no_longer_needed',
+              ],
+            },
+            customerNote: { type: 'string', maxLength: 500 },
+            currency: { type: 'string', example: 'INR' },
+            refundTaxableValue: { type: 'string' },
+            refundTaxTotal: { type: 'string' },
+            refundTotal: { type: 'string' },
+            requestedAt: { type: 'string', format: 'date-time' },
+            closedAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'Set exactly when the return reaches a terminal state.',
+            },
+            lines: { type: 'array', items: { $ref: '#/components/schemas/ReturnLine' } },
+          },
+        },
+
         ErrorEnvelope: ERROR_ENVELOPE,
         User: USER,
         Address: ADDRESS,
@@ -4320,6 +4414,271 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'AUTHENTICATION_REQUIRED',
             ),
             ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/users/me/orders/{orderNumber}/returns': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Request a return for a delivered order',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Raises a return for some or all of a delivered order’s units.',
+            '',
+            '### Everything monetary is server-derived',
+            '',
+            'The body is a reason, an optional note, and `{ skuCode, quantity }` lines. Every',
+            'amount is apportioned INSIDE the transaction from the FROZEN `order_line`',
+            'snapshot — never from the current SKU price, the current tax configuration or the',
+            'current promotion. A client cannot supply a price, a tax amount, a discount, a',
+            'refund total, a status, a delivery timestamp, a store id or a user id: each is a',
+            '`400` naming the field.',
+            '',
+            '### Eligibility',
+            '',
+            'The order must belong to the caller, must not be cancelled, must have a DELIVERED',
+            'shipment, and the delivery must be within the 7-day return window. The delivery',
+            'instant comes from `shipment.delivered_at` and nowhere else.',
+            '',
+            '### Quantity',
+            '',
+            'Partial lines and partial quantities are both allowed, and a line may be returned',
+            'across several requests. The cumulative quantity across all non-rejected returns',
+            'can never exceed what was ordered: the order row is locked for the duration, so',
+            'two concurrent requests for the last unit produce one `201` and one `422`.',
+            '',
+            '### `Idempotency-Key` is REQUIRED',
+            '',
+            'A retry that never saw the response would otherwise consume a second slice of the',
+            'returnable quantity for goods sent back once. Same key and same body replays the',
+            'original `201` verbatim; same key with a different body is a `422`.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              description: 'The order being returned against.',
+            },
+            {
+              name: 'Idempotency-Key',
+              in: 'header',
+              required: true,
+              schema: { type: 'string', minLength: 1, maxLength: 255 },
+              description: 'Required. Scoped to the authenticated user, store and endpoint.',
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  required: ['reason', 'lines'],
+                  properties: {
+                    reason: {
+                      type: 'string',
+                      enum: [
+                        'damaged_in_transit',
+                        'defective',
+                        'wrong_item_received',
+                        'not_as_described',
+                        'no_longer_needed',
+                      ],
+                      description: 'A closed list. Free text belongs in customerNote.',
+                    },
+                    customerNote: { type: 'string', maxLength: 500 },
+                    lines: {
+                      type: 'array',
+                      minItems: 1,
+                      maxItems: 100,
+                      description: 'Each SKU may appear at most once; combine the quantities.',
+                      items: {
+                        type: 'object',
+                        additionalProperties: false,
+                        required: ['skuCode', 'quantity'],
+                        properties: {
+                          skuCode: { type: 'string', maxLength: 64 },
+                          quantity: { type: 'integer', minimum: 1, maximum: 999 },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The created return, with its frozen line amounts.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/Return' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse(
+              'Validation failed, or the Idempotency-Key header is missing.',
+              'VALIDATION_ERROR',
+            ),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '404': errorResponse(
+              'The order is unknown, another customer’s, or another store’s.',
+              'NOT_FOUND',
+            ),
+            '409': errorResponse(
+              'The same Idempotency-Key is still in flight.',
+              'IDEMPOTENCY_CONFLICT',
+            ),
+            '422': errorResponse(
+              'Not returnable (cancelled, undelivered, window closed, unknown SKU), the quantity is unavailable, or the key was reused with a different body.',
+              'ORDER_NOT_RETURNABLE',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/users/me/returns': {
+        get: {
+          tags: ['Returns'],
+          summary: 'List my returns',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of the caller’s returns, newest first, each with its lines.',
+            '',
+            'The page and the total share one predicate, so a caller on the last page is never',
+            'told about rows it cannot reach. An over-limit page is a `400` rather than being',
+            'silently clamped.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of returns.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['returns', 'total', 'limit', 'offset'],
+                    properties: {
+                      returns: { type: 'array', items: { $ref: '#/components/schemas/Return' } },
+                      total: { type: 'integer' },
+                      limit: { type: 'integer' },
+                      offset: { type: 'integer' },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('An out-of-range limit or offset.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+          },
+        },
+      },
+
+      '/api/v1/users/me/returns/{returnNumber}': {
+        get: {
+          tags: ['Returns'],
+          summary: 'Read one of my returns',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'One return the caller owns.',
+            '',
+            'Another customer’s return is a `404`, the same answer a number that does not exist',
+            'gets, so the response cannot be used to discover which numbers are real.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+              description: 'The return number, exactly as it was issued.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The return.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/Return' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed return number.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '404': errorResponse('Unknown, or another customer’s or store’s.', 'NOT_FOUND'),
+          },
+        },
+      },
+
+      '/api/v1/users/me/returns/{returnNumber}/cancel': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Cancel one of my returns',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Withdraws a return the merchant has approved but not yet received.',
+            '',
+            '**Only from `approved`.** Once the goods are in the merchant’s hands the decision',
+            'is theirs, not the customer’s, so any other state is a `409`.',
+            '',
+            'Deliberately NOT idempotent: a second cancellation is a `409` rather than a repeat',
+            '`200`, because a client that gets the same answer twice cannot tell whether it',
+            'cancelled something or nothing. Order cancellation made the same choice.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+              description: 'The return number, exactly as it was issued.',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The cancelled return.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/Return' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed return number.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '404': errorResponse('Unknown, or another customer’s or store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The return is not in a state a customer may cancel from.',
+              'RETURN_NOT_TRANSITIONABLE',
+            ),
           },
         },
       },

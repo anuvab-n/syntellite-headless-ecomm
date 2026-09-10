@@ -192,9 +192,28 @@ export const silentLogger: typeof bootstrapLogger = pino({ level: 'silent' });
  * `resetConfigCache()` first, because `loadConfig` memoises: without it the second caller in
  * a run silently receives the first caller's database URL.
  */
-export function buildTestConfig(args: { databaseUrl: string; redisUrl?: string }): Config {
+export function buildTestConfig(args: {
+  databaseUrl: string;
+  redisUrl?: string;
+  /**
+   * Extra environment, layered OVER the defaults above.
+   *
+   * For the few settings a suite must control rather than inherit: the E2E journey configures
+   * Razorpay credentials (the container builds the real gateway only when all three are
+   * present, and answers `503` otherwise) and raises the auth rate limits, which default to
+   * 10 requests per IP per minute and would otherwise reject a long sequential journey's own
+   * logins as an attack.
+   *
+   * Optional and additive, so every existing caller gets exactly the environment it got
+   * before.
+   */
+  extraEnv?: NodeJS.ProcessEnv;
+}): Config {
   resetConfigCache();
-  const config = loadConfig(testEnvironment(args.databaseUrl, args.redisUrl));
+  const config = loadConfig({
+    ...testEnvironment(args.databaseUrl, args.redisUrl),
+    ...args.extraEnv,
+  });
   // Cleared again so the memo does not leak into the next test file.
   resetConfigCache();
   return config;

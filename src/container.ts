@@ -79,6 +79,12 @@ import {
   type FulfilmentService,
 } from './modules/fulfilment/index.js';
 import {
+  createReturnsRepository,
+  createReturnsRoutes,
+  createReturnsService,
+  type ReturnsService,
+} from './modules/returns/index.js';
+import {
   createPaymentsRepository,
   createPaymentsRoutes,
   createPaymentsService,
@@ -273,6 +279,13 @@ export type AppContainer = {
    * safe to build in every role — constructing it starts nothing.
    */
   paymentExpirySweeper: PaymentExpirySweeper;
+  /**
+   * The returns module.
+   *
+   * Exposed for the same reason as the others: an integration test drives a return without
+   * going through HTTP, and a future operator tool will need it.
+   */
+  returns: ReturnsService;
   /**
    * Manual fulfilment: raising a shipment, shipping it, recording delivery.
    *
@@ -1115,6 +1128,55 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    *     `/health/ready` require a seeded store, and a fresh deployment could then never
    *     report ready long enough to be seeded — a genuine deadlock.
    */
+  /**
+   * Returns.
+   *
+   * Built after `orders` and `fulfilment` because it consumes both — and consumes them as
+   * PORTS, because `no-cross-module-imports` forbids the module reaching for either. The two
+   * adapters below are the whole coupling.
+   *
+   * The lock order is stated once, here: **the order row first, then the return row.**
+   * Creation takes the order lock and touches no existing return; every state change takes
+   * the return lock alone. Nothing takes them in the opposite order, so the two paths cannot
+   * deadlock against each other.
+   */
+  const returns = createReturnsService({
+    repository: createReturnsRepository({ db: db.db }),
+    /**
+     * The ORDER lock plus the frozen lines, adapted from the orders module.
+     *
+     * The lock is what makes the cumulative return-quantity cap hold: two concurrent returns
+     * for the last unit serialise on the order row, so the second reads the first's line.
+     */
+    orders: {
+      lockOwnedOrderForReturn: (input) => orders.lockOwnedOrderForReturn(input),
+    },
+    /**
+     * The delivery instant, adapted from fulfilment.
+     *
+     * The ONLY source of it. No request body carries a delivery timestamp, which is what
+     * stops a customer reopening a closed window by claiming an earlier delivery.
+     */
+    fulfilment: {
+      deliveredAtForOrder: (input) => fulfilment.deliveredAtForOrder(input),
+    },
+    /* The same store every other module completes its claim against. */
+    idempotency: {
+      complete: (input) =>
+        idempotency.complete({
+          storeId: input.storeId,
+          userId: input.userId,
+          key: input.key,
+          endpoint: input.endpoint,
+          status: input.status,
+          ...(input.body === undefined ? {} : { body: input.body as never }),
+        }),
+    },
+    db: db.db,
+    audit,
+    logger,
+  });
+
   const apiRouter = Router();
   apiRouter.use(resolveStore({ resolver: storeResolver, logger }));
   apiRouter.use(
@@ -1154,6 +1216,20 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       logger,
     }),
   );
+  apiRouter.use(
+    createReturnsRoutes({
+      returns,
+      verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
+      /**
+       * The idempotency guard, built here because the store is cross-cutting infrastructure
+       * the module must not reach for. Mounted by the ROUTE after `requireAuth`, which is
+       * what lets it read the authenticated user for the key scope.
+       */
+      requireIdempotency: requireIdempotency({ store: idempotency, logger }),
+      logger,
+    }),
+  );
+
   apiRouter.use(
     createFulfilmentRoutes({
       fulfilment,
@@ -1333,6 +1409,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     payments,
     paymentExpirySweeper,
     fulfilment,
+    returns,
     tax,
     invoicing,
     scopeGuards,

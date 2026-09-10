@@ -1339,6 +1339,37 @@ export function createOrdersService(deps: {
       return row ?? null;
     },
 
+    /**
+     * Find and LOCK one order the CUSTOMER owns, with its frozen lines.
+     *
+     * Exposed so the returns module can hold the ORDER lock — the head of its lock order —
+     * without importing this module. It declares `ReturnOrders.lockOwnedOrderForReturn` and
+     * the composition root adapts this onto it, exactly as fulfilment's lock is adapted.
+     *
+     * The lines carry `skuId` because a return line references it; every monetary field is
+     * the frozen snapshot and nothing here is recomputed.
+     */
+    async lockOwnedOrderForReturn(params: {
+      orderNumber: string;
+      userId: string;
+      storeId: string;
+    }) {
+      if (!isInTransaction()) {
+        throw new InvariantViolation(
+          'lockOwnedOrderForReturn must be called inside the caller transaction; a row lock ' +
+            'does not outlive one, and the cumulative return-quantity check depends on holding it',
+        );
+      }
+      const header = await repository.lockOwnedOrderByNumber(params);
+      if (!header) return null;
+
+      const lines = await repository.listOrderLinesWithSkuId({
+        orderId: header.id,
+        storeId: params.storeId,
+      });
+      return { order: header, lines };
+    },
+
     /** The same lock, by id, for the ship and deliver paths. */
     async lockForFulfilmentById(params: { orderId: string; storeId: string }) {
       if (!isInTransaction()) {

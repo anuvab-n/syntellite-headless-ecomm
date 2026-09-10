@@ -230,6 +230,28 @@ export function createFulfilmentRepository(deps: { db: Database }) {
      * passed rather than defaulted so the caller's single `at` is used throughout one
      * transaction.
      */
+    /**
+     * When this order was delivered, or `null`.
+     *
+     * No lock: the returns module reads this to decide eligibility and already holds the
+     * ORDER lock — the head of the global lock order. Taking a shipment lock here would add
+     * a second lock in the wrong order and invite a deadlock against the ship and deliver
+     * paths. A delivery instant is immutable once set, so there is nothing to race with.
+     *
+     * Whole-order shipments remain the v1 model, so at most one row can match.
+     */
+    async findDeliveredAtByOrderId(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<Date | null> {
+      const [row] = await executor(db)
+        .select({ deliveredAt: shipment.deliveredAt })
+        .from(shipment)
+        .where(and(eq(shipment.orderId, params.orderId), eq(shipment.storeId, params.storeId)))
+        .limit(1);
+      return row?.deliveredAt ?? null;
+    },
+
     async applyTransition(params: {
       shipmentId: string;
       storeId: string;

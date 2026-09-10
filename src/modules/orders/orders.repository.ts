@@ -512,6 +512,46 @@ export function createOrdersRepository(deps: { db: Database }) {
     },
 
     /** The lines of one order, in the sequence they were written. */
+    /**
+     * The frozen lines, with the SKU id the customer-facing projection deliberately omits.
+     *
+     * `OrderLineRecord` publishes `skuCode` because an id is never part of the API contract.
+     * A return LINE references `sku_id` though, so returns needs both — and widening the
+     * public record for one internal caller would leak the id into every order response.
+     */
+    async listOrderLinesWithSkuId(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<(OrderLineRecord & { skuId: string })[]> {
+      return executor(db)
+        .select({
+          skuId: orderLine.skuId,
+          skuCode: orderLine.skuCode,
+          skuName: orderLine.skuName,
+          productName: orderLine.productName,
+          quantity: orderLine.quantity,
+          unitPrice: orderLine.unitPrice,
+          lineTotal: orderLine.lineTotal,
+          discountAmount: orderLine.discountAmount,
+          taxableValue: orderLine.taxableValue,
+          hsnCode: orderLine.hsnCode,
+          taxClassCode: orderLine.taxClassCode,
+          taxClassName: orderLine.taxClassName,
+          cgstRate: orderLine.cgstRate,
+          cgstAmount: orderLine.cgstAmount,
+          sgstRate: orderLine.sgstRate,
+          sgstAmount: orderLine.sgstAmount,
+          igstRate: orderLine.igstRate,
+          igstAmount: orderLine.igstAmount,
+          cessRate: orderLine.cessRate,
+          cessAmount: orderLine.cessAmount,
+          taxTotal: orderLine.taxTotal,
+        })
+        .from(orderLine)
+        .where(and(eq(orderLine.orderId, params.orderId), eq(orderLine.storeId, params.storeId)))
+        .orderBy(orderLine.skuCode);
+    },
+
     async listOrderLines(params: { orderId: string; storeId: string }): Promise<OrderLineRecord[]> {
       return executor(db)
         .select({

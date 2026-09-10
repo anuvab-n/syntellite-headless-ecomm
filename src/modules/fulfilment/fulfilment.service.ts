@@ -766,6 +766,21 @@ export function createFulfilmentService(deps: {
      * change state while cancellation holds it. A second lock would add contention for no
      * additional guarantee.
      */
+    /**
+     * When this order was delivered, or `null` if it has not been.
+     *
+     * Exposed so the returns module can decide eligibility without importing this one — it
+     * declares `ReturnFulfilment.deliveredAtForOrder` and the composition root adapts this
+     * onto it. **This is the only source of the delivery instant**: no request body carries
+     * one, which is what stops a customer from claiming an earlier delivery to reopen a
+     * closed return window.
+     *
+     * Whole-order shipments remain the v1 model, so at most one shipment can be delivered.
+     */
+    async deliveredAtForOrder(params: { orderId: string; storeId: string }): Promise<Date | null> {
+      return repository.findDeliveredAtByOrderId(params);
+    },
+
     async hasBlockingShipment(params: { orderId: string; storeId: string }): Promise<boolean> {
       const status = await repository.findStatusByOrderId(params);
       return status === undefined ? false : hasLeftFulfilment(status);

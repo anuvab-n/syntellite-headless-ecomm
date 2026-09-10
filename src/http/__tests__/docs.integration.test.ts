@@ -69,6 +69,18 @@ describe('API documentation', () => {
     apiRouter.post('/users/me/password', (_req, res) => {
       res.status(204).send();
     });
+    apiRouter.post('/users/me/orders/:orderNumber/returns', (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    apiRouter.get('/users/me/returns', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.get('/users/me/returns/:returnNumber', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/users/me/returns/:returnNumber/cancel', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
     apiRouter.get('/users/me/cart', (_req, res) => {
       res.status(200).json({ ok: true });
     });
@@ -451,9 +463,13 @@ describe('API documentation', () => {
         '/api/v1/users/me/orders/{orderNumber}/invoice',
         '/api/v1/users/me/orders/{orderNumber}/payment',
         '/api/v1/users/me/orders/{orderNumber}/payments',
+        '/api/v1/users/me/orders/{orderNumber}/returns',
         '/api/v1/users/me/orders/{orderNumber}/shipments',
         '/api/v1/users/me/password',
         '/api/v1/users/me/payments',
+        '/api/v1/users/me/returns',
+        '/api/v1/users/me/returns/{returnNumber}',
+        '/api/v1/users/me/returns/{returnNumber}/cancel',
         '/api/v1/users/me/tax-identity',
         '/api/v1/webhooks/razorpay',
         '/health/live',
