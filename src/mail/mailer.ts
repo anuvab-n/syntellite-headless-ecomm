@@ -46,7 +46,36 @@ export type MailerConfig = {
   readonly port: number;
   /** The `From` header. A deployment concern, never a per-message argument. */
   readonly from: string;
+  /**
+   * SMTP credentials. Both optional, and they travel together — see `authOf`.
+   *
+   * Absent is the local shape (MailHog accepts mail from anyone). Present is every hosted
+   * provider, none of which will relay without AUTH.
+   */
+  readonly user?: string | undefined;
+  readonly password?: string | undefined;
+  /**
+   * Implicit TLS from the first byte (SMTPS, conventionally port 465).
+   *
+   * `false` means start in the clear and upgrade via STARTTLS when offered — what port 587
+   * and MailHog both want. Explicit rather than inferred from the port, because guessing from
+   * `465` silently does the wrong thing for a provider that puts implicit TLS elsewhere.
+   */
+  readonly secure?: boolean | undefined;
 };
+
+/**
+ * The `auth` block nodemailer should receive, or nothing at all.
+ *
+ * **Both halves or neither.** A username with no password makes nodemailer attempt AUTH and
+ * fail the whole send; passing a half-configured pair would turn a deployment typo into a
+ * silent, total delivery outage. Omitting `auth` entirely is the documented way to say
+ * "unauthenticated relay", which is exactly what the local MailHog setup is.
+ */
+function authOf(config: MailerConfig): { user: string; pass: string } | undefined {
+  if (config.user === undefined || config.password === undefined) return undefined;
+  return { user: config.user, pass: config.password };
+}
 
 export function createSmtpMailer(deps: {
   config: MailerConfig;
@@ -59,22 +88,50 @@ export function createSmtpMailer(deps: {
   /**
    * Created once and reused, so a burst of mail does not open a connection per message.
    *
-   * `secure: false` with no auth is correct for the configured default (port 1025, MailHog) and
-   * for an in-cluster relay. A deployment terminating TLS or requiring credentials configures
-   * that at the relay rather than here — which keeps SMTP credentials out of this codebase
-   * entirely, and is why `config.ts` has no `SMTP_USER` or `SMTP_PASSWORD` to leak.
+   * Both `secure` and `auth` come from configuration rather than being fixed here. The
+   * unauthenticated cleartext shape — port 1025, MailHog, or an in-cluster relay that does its
+   * own TLS — is still the DEFAULT and needs no new variables: omit `SMTP_USER`/`SMTP_PASS`
+   * and leave `SMTP_SECURE` unset and this builds exactly the transport it always did.
+   *
+   * What changed is that a hosted provider is now expressible. SES, SendGrid and Postmark all
+   * refuse to relay without AUTH, so a build that could not send credentials could not send
+   * mail at all in production.
    */
+  const auth = authOf(config);
   const transport =
     deps.transport ??
     nodemailer.createTransport({
       host: config.host,
       port: config.port,
-      secure: false,
+      secure: config.secure ?? false,
+      /*
+       * Spread, never `auth: undefined`. Nodemailer treats the key's PRESENCE as a request to
+       * authenticate, so an explicit `undefined` is not the same as omitting it.
+       */
+      ...(auth === undefined ? {} : { auth }),
       /* A mail that hangs must not hold a worker indefinitely. */
       connectionTimeout: 10_000,
       greetingTimeout: 10_000,
       socketTimeout: 20_000,
     });
+
+  /*
+   * One line at startup so an operator can see WHICH shape was built without reading the
+   * environment — the single most useful fact when mail silently stops.
+   *
+   * `authenticated` is a boolean, never the username, and the password is not referenced here
+   * at all. Nothing in this file logs either, and `shared/logger.ts` redacts `password` as a
+   * second line of defence.
+   */
+  logger.info(
+    {
+      host: config.host,
+      port: config.port,
+      secure: config.secure ?? false,
+      authenticated: auth !== undefined,
+    },
+    'mailer_configured',
+  );
 
   return {
     async send(message) {

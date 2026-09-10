@@ -431,7 +431,14 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * tests do, to assert on delivery without SMTP.
    */
   const mailer = createSmtpMailer({
-    config: { host: config.smtpHost, port: config.smtpPort, from: config.mailFrom },
+    config: {
+      host: config.smtpHost,
+      port: config.smtpPort,
+      from: config.mailFrom,
+      user: config.smtpUser,
+      password: config.smtpPassword,
+      secure: config.smtpSecure,
+    },
     logger,
   });
 

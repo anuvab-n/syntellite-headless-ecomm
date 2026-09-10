@@ -132,6 +132,28 @@ const ConfigSchema = z
     /* ── Email ─────────────────────────────────────────────────────────── */
     smtpHost: z.string().min(1),
     smtpPort: z.coerce.number().int().positive().default(1025),
+    /**
+     * SMTP credentials. **Both optional, and they travel together.**
+     *
+     * Absent is the local shape: MailHog on port 1025 accepts mail from anyone, and sending a
+     * username to it would fail rather than help. Present is every hosted provider — SES,
+     * SendGrid, Postmark — none of which will relay without AUTH.
+     *
+     * Not required in production by the guards below, deliberately: a deployment may still
+     * relay through an authenticated in-cluster smarthost, and forcing credentials here would
+     * make that valid topology unconfigurable.
+     */
+    smtpUser: z.string().min(1).optional(),
+    smtpPassword: z.string().min(1).optional(),
+    /**
+     * Implicit TLS from the first byte (SMTPS, conventionally port 465).
+     *
+     * `false` — the default, and what port 587 and MailHog both want — means the connection
+     * starts in the clear and upgrades via STARTTLS when the server offers it. Explicit rather
+     * than inferred from the port number: guessing from `465` would silently do the wrong
+     * thing for a provider that puts implicit TLS somewhere else.
+     */
+    smtpSecure: booleanish.default(false),
     /** The `From` header on every message. */
     mailFrom: z.string().min(1).default('no-reply@localhost'),
     /**
@@ -304,6 +326,9 @@ function readEnvironment(env: NodeJS.ProcessEnv): Record<string, unknown> {
 
     smtpHost: env['SMTP_HOST'],
     smtpPort: env['SMTP_PORT'],
+    smtpUser: env['SMTP_USER'],
+    smtpPassword: env['SMTP_PASS'],
+    smtpSecure: env['SMTP_SECURE'],
     mailFrom: env['MAIL_FROM'],
     passwordResetUrlBase: env['PASSWORD_RESET_URL_BASE'],
 
