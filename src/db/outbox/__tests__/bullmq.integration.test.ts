@@ -24,7 +24,16 @@ import { createOutboxSubsystem, type OutboxSubsystem } from '../outbox.module.js
  * source of truth. The last test flushes Redis entirely and shows the event still gets
  * delivered.
  */
-describe('outbox over BullMQ (integration)', () => {
+/**
+ * SKIPPED: BullMQ is commented out for now.
+ *
+ * Every case here constructs `createOutboxSubsystem({ transport: 'queue' })`, and that branch
+ * now throws by design — see `outbox.module.ts` and `queues.ts`. The suite is skipped rather
+ * than deleted because the implementation it covers is likewise commented rather than deleted:
+ * re-enabling the queue transport should re-enable its tests in the same commit, and a deleted
+ * suite is one nobody remembers to write again.
+ */
+describe.skip('outbox over BullMQ (integration)', () => {
   let testDb: TestDatabase;
   let redis: TestRedis;
   let subsystem: OutboxSubsystem | undefined;

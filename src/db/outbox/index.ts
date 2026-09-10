@@ -19,10 +19,10 @@ export {
   createIdempotentDispatchPublisher,
   type Dispatcher,
 } from './dispatcher.js';
+// BullMQ is disabled for now (see queues.ts and outbox.module.ts): the factory functions
+// that built it are gone, and only the types they used still re-export, since nothing about
+// the shape of `OutboxSubsystem` changed.
 export {
-  createEventQueues,
-  createEventWorkers,
-  createQueueEventPublisher,
   QUEUE_NAMES,
   type EventQueues,
   type EventWorkers,

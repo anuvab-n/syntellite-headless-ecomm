@@ -53,12 +53,16 @@ describe('composition root (integration)', () => {
     await testDb.truncate();
   });
 
-  function build(role: 'api' | 'worker' = 'api'): AppContainer {
+  function build(
+    role: 'api' | 'worker' = 'api',
+    opts: { transport?: 'in-process' | 'queue' } = {},
+  ): AppContainer {
     const container = buildContainer({
       role,
       config: buildTestConfig({ databaseUrl: testDb.connectionUri, redisUrl: redis.url }),
       // Fast poll so a test that drains does not wait a second per batch.
       drainer: { pollIntervalMs: 50 },
+      ...(opts.transport ? { transport: opts.transport } : {}),
     });
     built.push(container);
     return container;
@@ -93,19 +97,38 @@ describe('composition root (integration)', () => {
       expect(container.outbox.workers).toBeUndefined();
     });
 
-    it('runs job workers in a worker container', () => {
-      const container = build('worker');
+    // SKIPPED: BullMQ is commented out for now (outbox.module.ts, queues.ts). transport:
+    // 'queue' now throws by design, so this test — specifically about the queue path —
+    // cannot pass. Re-enable alongside the queue branch.
+    it.skip('runs job workers in a worker container using the queue transport', () => {
+      const container = build('worker', { transport: 'queue' });
 
       expect(container.outbox.workers).toBeDefined();
       expect(container.outbox.workers?.workers.length).toBeGreaterThan(0);
     });
 
-    it('creates the queue infrastructure the outbox needs', () => {
-      const container = build();
+    it('runs no job workers in a worker container using the default (in-process) transport', () => {
+      // The in-process transport has no BullMQ workers to run at all — the drainer runs
+      // handlers itself. Asserted so a change that silently brings BullMQ back as the
+      // default is caught here, not discovered in production Redis usage.
+      const container = build('worker');
+
+      expect(container.outbox.workers).toBeUndefined();
+    });
+
+    // SKIPPED: BullMQ is commented out for now — see the note above.
+    it.skip('creates the queue infrastructure the outbox needs, when the queue transport is chosen', () => {
+      const container = build('api', { transport: 'queue' });
 
       // Owned by the outbox subsystem, not by the container — one owner, one shutdown.
       expect(container.outbox.queues).toBeDefined();
       expect(container.outbox.queues?.queues.default).toBeDefined();
+    });
+
+    it('creates no queue infrastructure under the default (in-process) transport', () => {
+      const container = build();
+
+      expect(container.outbox.queues).toBeUndefined();
     });
   });
 
@@ -455,8 +478,9 @@ describe('composition root (integration)', () => {
       expect(await container.db.db.select().from(store)).toHaveLength(0);
     });
 
-    it('drains a committed event to the queue through the container drainer', async () => {
-      const container = build();
+    // SKIPPED: BullMQ is commented out for now — see the note above.
+    it.skip('drains a committed event to the queue through the container drainer', async () => {
+      const container = build('api', { transport: 'queue' });
 
       await withTransaction(container.db.db, container.logger, async (tx) => {
         const id = newId();

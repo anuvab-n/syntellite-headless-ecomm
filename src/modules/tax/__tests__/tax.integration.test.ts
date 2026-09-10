@@ -21,7 +21,6 @@ describe('tax (integration)', () => {
   let storeId = '';
   let staffToken = '';
   let customerToken = '';
-  let customerId = '';
 
   const PASSWORD = 'a-sufficiently-long-password';
   const SKU_CODE = 'TAX-SKU-1';
@@ -67,11 +66,10 @@ describe('tax (integration)', () => {
 
     // Register customer user
     const customerEmail = `customer.tax.${newId()}@example.com`;
-    const customerUser = await container.identity.registerCustomer({
+    await container.identity.registerCustomer({
       storeId,
       input: { email: customerEmail, password: PASSWORD, firstName: 'Alice', lastName: 'Smith' },
     });
-    customerId = customerUser.id;
 
     const customerLogin = await api()
       .post('/api/v1/auth/login')
@@ -136,35 +134,29 @@ describe('tax (integration)', () => {
     });
 
     it('rejects malformed seller tax profile (bad GSTIN)', async () => {
-      const res = await api()
-        .put('/api/v1/admin/store/tax-profile')
-        .set(asStaff())
-        .send({
-          legalName: 'Test Seller Inc',
-          gstin: 'NOT_A_VALID_GSTIN',
-          originLine1: '123 Tech Park',
-          originCity: 'Bengaluru',
-          originState: 'Karnataka',
-          originPostalCode: '560001',
-          originCountryCode: 'IN',
-        });
+      const res = await api().put('/api/v1/admin/store/tax-profile').set(asStaff()).send({
+        legalName: 'Test Seller Inc',
+        gstin: 'NOT_A_VALID_GSTIN',
+        originLine1: '123 Tech Park',
+        originCity: 'Bengaluru',
+        originState: 'Karnataka',
+        originPostalCode: '560001',
+        originCountryCode: 'IN',
+      });
 
       expect(res.status).toBe(400);
     });
 
     it('sets and retrieves seller tax profile', async () => {
-      const putRes = await api()
-        .put('/api/v1/admin/store/tax-profile')
-        .set(asStaff())
-        .send({
-          legalName: 'Test Retail Pvt Ltd',
-          gstin: SELLER_GSTIN,
-          originLine1: '4th Floor, MG Road',
-          originCity: 'Bengaluru',
-          originState: 'Karnataka',
-          originPostalCode: '560001',
-          originCountryCode: 'IN',
-        });
+      const putRes = await api().put('/api/v1/admin/store/tax-profile').set(asStaff()).send({
+        legalName: 'Test Retail Pvt Ltd',
+        gstin: SELLER_GSTIN,
+        originLine1: '4th Floor, MG Road',
+        originCity: 'Bengaluru',
+        originState: 'Karnataka',
+        originPostalCode: '560001',
+        originCountryCode: 'IN',
+      });
 
       expect(putRes.status).toBe(200);
       expect(putRes.body.taxProfile).toMatchObject({
@@ -183,14 +175,11 @@ describe('tax (integration)', () => {
 
   describe('tax classes management', () => {
     it('creates a tax class', async () => {
-      const res = await api()
-        .post('/api/v1/admin/tax-classes')
-        .set(asStaff())
-        .send({
-          code: TAX_CLASS_CODE,
-          name: 'GST 18% Standard',
-          isActive: true,
-        });
+      const res = await api().post('/api/v1/admin/tax-classes').set(asStaff()).send({
+        code: TAX_CLASS_CODE,
+        name: 'GST 18% Standard',
+        isActive: true,
+      });
 
       expect(res.status).toBe(201);
       expect(res.body.taxClass).toMatchObject({
@@ -201,13 +190,10 @@ describe('tax (integration)', () => {
     });
 
     it('refuses duplicate tax class code creation (409)', async () => {
-      const res = await api()
-        .post('/api/v1/admin/tax-classes')
-        .set(asStaff())
-        .send({
-          code: TAX_CLASS_CODE,
-          name: 'Duplicate GST 18%',
-        });
+      const res = await api().post('/api/v1/admin/tax-classes').set(asStaff()).send({
+        code: TAX_CLASS_CODE,
+        name: 'Duplicate GST 18%',
+      });
 
       expect(res.status).toBe(409);
     });
@@ -216,7 +202,9 @@ describe('tax (integration)', () => {
       const res = await api().get('/api/v1/admin/tax-classes').set(asStaff());
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.taxClasses)).toBe(true);
-      const found = res.body.taxClasses.find((tc: { code: string }) => tc.code === TAX_CLASS_CODE);
+      const found = (res.body.taxClasses as { code: string }[]).find(
+        (tc) => tc.code === TAX_CLASS_CODE,
+      );
       expect(found).toBeDefined();
     });
 
@@ -280,13 +268,10 @@ describe('tax (integration)', () => {
 
   describe('SKU tax classification', () => {
     it('assigns a tax class and HSN code to a SKU', async () => {
-      const res = await api()
-        .put(`/api/v1/admin/skus/${SKU_CODE}/tax`)
-        .set(asStaff())
-        .send({
-          taxClassCode: TAX_CLASS_CODE,
-          hsnCode: '61091000',
-        });
+      const res = await api().put(`/api/v1/admin/skus/${SKU_CODE}/tax`).set(asStaff()).send({
+        taxClassCode: TAX_CLASS_CODE,
+        hsnCode: '61091000',
+      });
 
       expect(res.status).toBe(200);
       expect(res.body.skuTax).toMatchObject({
@@ -297,22 +282,16 @@ describe('tax (integration)', () => {
     });
 
     it('404s SKU classification if SKU or tax class is unknown', async () => {
-      const res1 = await api()
-        .put('/api/v1/admin/skus/NON_EXISTENT_SKU/tax')
-        .set(asStaff())
-        .send({
-          taxClassCode: TAX_CLASS_CODE,
-          hsnCode: '61091000',
-        });
+      const res1 = await api().put('/api/v1/admin/skus/NON_EXISTENT_SKU/tax').set(asStaff()).send({
+        taxClassCode: TAX_CLASS_CODE,
+        hsnCode: '61091000',
+      });
       expect(res1.status).toBe(404);
 
-      const res2 = await api()
-        .put(`/api/v1/admin/skus/${SKU_CODE}/tax`)
-        .set(asStaff())
-        .send({
-          taxClassCode: 'NON_EXISTENT_CLASS',
-          hsnCode: '61091000',
-        });
+      const res2 = await api().put(`/api/v1/admin/skus/${SKU_CODE}/tax`).set(asStaff()).send({
+        taxClassCode: 'NON_EXISTENT_CLASS',
+        hsnCode: '61091000',
+      });
       expect(res2.status).toBe(404);
     });
   });
@@ -324,25 +303,19 @@ describe('tax (integration)', () => {
     });
 
     it('rejects invalid customer GSTIN (400)', async () => {
-      const res = await api()
-        .put('/api/v1/users/me/tax-identity')
-        .set(asCustomer())
-        .send({
-          gstin: 'INVALID_GSTIN_FORMAT',
-          legalName: 'Customer Business',
-        });
+      const res = await api().put('/api/v1/users/me/tax-identity').set(asCustomer()).send({
+        gstin: 'INVALID_GSTIN_FORMAT',
+        legalName: 'Customer Business',
+      });
 
       expect(res.status).toBe(400);
     });
 
     it('creates and reads customer tax identity', async () => {
-      const putRes = await api()
-        .put('/api/v1/users/me/tax-identity')
-        .set(asCustomer())
-        .send({
-          gstin: CUSTOMER_GSTIN,
-          legalName: 'Alice Tech LLP',
-        });
+      const putRes = await api().put('/api/v1/users/me/tax-identity').set(asCustomer()).send({
+        gstin: CUSTOMER_GSTIN,
+        legalName: 'Alice Tech LLP',
+      });
 
       expect(putRes.status).toBe(200);
       expect(putRes.body.taxIdentity).toMatchObject({

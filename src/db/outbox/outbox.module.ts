@@ -1,19 +1,19 @@
 import type { EventBus } from '../../shared/events.js';
 import type { Logger } from '../../shared/logger.js';
 import type { Database } from '../client.js';
-import { createIdempotentDispatchPublisher, createIdempotentDispatcher } from './dispatcher.js';
+import { createIdempotentDispatchPublisher } from './dispatcher.js';
 import { createOutboxDrainer, type DrainerOptions, type OutboxDrainer } from './drainer.js';
 import { createEventBus } from './event-bus.js';
 import { createOutboxRepository, type OutboxRepository } from './outbox.repository.js';
 import type { EventPublisher, HandlerRegistry } from './publisher.js';
-import {
-  createEventQueues,
-  createEventWorkers,
-  createQueueEventPublisher,
-  type EventQueues,
-  type EventWorkers,
-  type QueueRoutes,
-} from './queues.js';
+// BullMQ is DISABLED for now. Only the TYPES are imported here (erased at compile time, no
+// `bullmq`/`ioredis` code runs from importing a type), so `OutboxSubsystem`'s shape does not
+// have to change for every caller that reads `container.outbox.queues`/`.workers` to know
+// they are always `undefined` right now. The real queue/worker construction this file used
+// to hold under `transport: 'queue'` has been removed; find it in git history
+// (`git log -- src/db/outbox/outbox.module.ts src/db/outbox/queues.ts`) the day it needs to
+// come back.
+import type { EventQueues, EventWorkers, QueueRoutes } from './queues.js';
 
 /**
  * Composition for the outbox subsystem.
@@ -29,9 +29,11 @@ import {
  *                  idempotent; right for local development, tests, and a single-process
  *                  deployment. A slow handler blocks the drain loop.
  *
- *   'queue'      — the drainer enqueues to BullMQ and separate worker processes run the
- *                  handlers. The production shape: publishing stays fast, handlers scale
- *                  independently, and one slow handler cannot stall the outbox.
+ *   'queue'      — **disabled, not wired.** Would enqueue to BullMQ and let separate worker
+ *                  processes run the handlers — the shape to reach for once a handler needs
+ *                  to scale independently of the drain loop, and not before. Passing
+ *                  `transport: 'queue'` throws rather than silently doing nothing; the
+ *                  removed implementation is recoverable from git history.
  */
 
 export type OutboxTransport = 'in-process' | 'queue';
@@ -94,49 +96,12 @@ export function createOutboxSubsystem(opts: CreateOutboxSubsystemOptions): Outbo
     };
   }
 
-  if (opts.redisUrl === undefined) {
-    // Fail at construction, not at the first publish. A queue transport with no Redis URL
-    // is a misconfiguration that must not reach a running process.
-    throw new Error("createOutboxSubsystem: redisUrl is required when transport is 'queue'");
-  }
-
-  const queues = createEventQueues({
-    redisUrl: opts.redisUrl,
-    logger,
-    ...(opts.queueRoutes ? { routes: opts.queueRoutes } : {}),
-  });
-  const publisher = createQueueEventPublisher({ queues, logger });
-  const drainer = createOutboxDrainer({
-    repository,
-    publisher,
-    logger,
-    ...(opts.drainer ? { options: opts.drainer } : {}),
-  });
-
-  const workers =
-    opts.runWorkers === true
-      ? createEventWorkers({
-          redisUrl: opts.redisUrl,
-          repository,
-          dispatcher: createIdempotentDispatcher({ db, repository, handlers, logger }),
-          logger,
-          ...(opts.workerConcurrency !== undefined ? { concurrency: opts.workerConcurrency } : {}),
-        })
-      : undefined;
-
-  return {
-    repository,
-    events,
-    publisher,
-    drainer,
-    queues,
-    ...(workers ? { workers } : {}),
-    async shutdown() {
-      // Order matters: stop taking new work, then drain what is in flight, then release
-      // the connections. Closing Redis first would fail the in-flight jobs it is holding.
-      drainer.stop();
-      if (workers) await workers.close();
-      await queues.closeAll();
-    },
-  };
+  // transport === 'queue': disabled for now — no queue system, Redis used only for locks and
+  // rate limiting. See the module docblock above for what this used to build.
+  throw new Error(
+    "createOutboxSubsystem: transport 'queue' is disabled for now — BullMQ support was " +
+      "removed from outbox.module.ts and queues.ts. Use transport: 'in-process' (the " +
+      'default in container.ts), or restore the queue implementation from git history if ' +
+      'this deployment now needs it.',
+  );
 }

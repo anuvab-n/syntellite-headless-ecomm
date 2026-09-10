@@ -5,7 +5,6 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildContainer, type AppContainer } from '../../../container.js';
 import { appUser } from '../../../db/schema/identity.js';
 import { stockItem } from '../../../db/schema/inventory.js';
-import { shipment } from '../../../db/schema/shipments.js';
 import { newId } from '../../../shared/id.js';
 import {
   buildTestConfig,
@@ -23,7 +22,6 @@ describe('fulfilment (integration)', () => {
   let storeId = '';
   let staffToken = '';
   let customerToken = '';
-  let customerId = '';
   let secondCustomerToken = '';
 
   const PASSWORD = 'a-sufficiently-long-password';
@@ -67,11 +65,10 @@ describe('fulfilment (integration)', () => {
 
     // Register customer user
     const customerEmail = `customer.fulfil.${newId()}@example.com`;
-    const customerUser = await container.identity.registerCustomer({
+    await container.identity.registerCustomer({
       storeId,
       input: { email: customerEmail, password: PASSWORD, firstName: 'Jane', lastName: 'Doe' },
     });
-    customerId = customerUser.id;
 
     const customerLogin = await api()
       .post('/api/v1/auth/login')
@@ -209,9 +206,11 @@ describe('fulfilment (integration)', () => {
       const res = await api().get('/api/v1/admin/orders/fulfilment').set(asStaff());
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.orders)).toBe(true);
-      const found = res.body.orders.find((o: { orderNumber: string }) => o.orderNumber === orderNumber);
+      const found = (
+        res.body.orders as { orderNumber: string; shipmentStatus: string | null }[]
+      ).find((o) => o.orderNumber === orderNumber);
       expect(found).toBeDefined();
-      expect(found.shipmentStatus).toBeNull();
+      expect(found?.shipmentStatus).toBeNull();
     });
 
     it('raises a shipment for the order', async () => {
@@ -269,9 +268,7 @@ describe('fulfilment (integration)', () => {
     });
 
     it('staff can read shipments for the order', async () => {
-      const res = await api()
-        .get(`/api/v1/admin/orders/${orderNumber}/shipments`)
-        .set(asStaff());
+      const res = await api().get(`/api/v1/admin/orders/${orderNumber}/shipments`).set(asStaff());
 
       expect(res.status).toBe(200);
       expect(res.body.shipments).toHaveLength(1);
@@ -279,13 +276,10 @@ describe('fulfilment (integration)', () => {
     });
 
     it('updates shipment tracking details via PATCH', async () => {
-      const res = await api()
-        .patch(`/api/v1/admin/shipments/${shipmentId}`)
-        .set(asStaff())
-        .send({
-          carrier: 'FedEx',
-          trackingNumber: 'FX987654321',
-        });
+      const res = await api().patch(`/api/v1/admin/shipments/${shipmentId}`).set(asStaff()).send({
+        carrier: 'FedEx',
+        trackingNumber: 'FX987654321',
+      });
 
       expect(res.status).toBe(200);
       expect(res.body.shipment).toMatchObject({
@@ -296,10 +290,7 @@ describe('fulfilment (integration)', () => {
     });
 
     it('ships the shipment (COD order allows ship when payment is pending)', async () => {
-      const stockBefore = await db()
-        .select()
-        .from(stockItem)
-        .where(eq(stockItem.storeId, storeId));
+      const stockBefore = await db().select().from(stockItem).where(eq(stockItem.storeId, storeId));
       expect(stockBefore.length).toBeGreaterThan(0);
       const onHandBefore = stockBefore[0]!.onHand;
 
@@ -312,10 +303,7 @@ describe('fulfilment (integration)', () => {
       expect(res.body.shipment.status).toBe('shipped');
       expect(res.body.shipment.shippedAt).toBeDefined();
 
-      const stockAfter = await db()
-        .select()
-        .from(stockItem)
-        .where(eq(stockItem.storeId, storeId));
+      const stockAfter = await db().select().from(stockItem).where(eq(stockItem.storeId, storeId));
       expect(stockAfter[0]!.onHand).toBe(onHandBefore - 1);
     });
 

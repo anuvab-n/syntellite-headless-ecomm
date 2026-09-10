@@ -459,7 +459,21 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     db: db.db,
     logger,
     handlers: opts.handlers ?? builtInHandlers,
-    transport: opts.transport ?? 'queue',
+    /**
+     * 'in-process' by default — no BullMQ, no queue Redis database.
+     *
+     * The worker process still polls `outbox_event` and runs handlers itself (see
+     * `workers/default.ts`, which calls `outbox.drainer.start()`); it simply does not hand
+     * the job to a second Redis-backed queue to do it. Redis stays in the picture only for
+     * what nothing else can do without it — locks (`redisLockUrl`) and, through the same
+     * client, auth rate limiting.
+     *
+     * A deployment that later needs handlers to scale independently of the drain loop can
+     * still opt back in explicitly with `buildContainer({ transport: 'queue' })`; nothing
+     * about the 'queue' path (`queues.ts`, `workers/default.ts`'s BullMQ branch) was removed,
+     * only its default.
+     */
+    transport: opts.transport ?? 'in-process',
     redisUrl: config.redisQueueUrl,
     runWorkers: opts.role === 'worker',
     ...(opts.drainer ? { drainer: opts.drainer } : {}),

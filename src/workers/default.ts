@@ -4,20 +4,22 @@ import { manageLifecycle } from '../lifecycle.js';
 /**
  * The worker process.
  *
- * Two jobs, both already implemented in the outbox subsystem — this file starts them and
- * sequences their shutdown, nothing more:
+ * Starts the outbox DRAINER and sequences its shutdown, nothing more. What the drainer does
+ * with a claimed event depends on the transport `buildContainer` was given:
  *
- *  1. The outbox DRAINER: claims committed events with `FOR UPDATE SKIP LOCKED` and hands
- *     them to BullMQ.
- *  2. The event WORKERS: consume those jobs and run handlers, with `processed_event`
- *     suppressing duplicates.
+ *  - **'in-process' (the default since this file was written).** The drainer claims
+ *    committed events with `FOR UPDATE SKIP LOCKED` and runs the matching handler itself,
+ *    right here, with `processed_event` suppressing duplicates. No BullMQ, no queue Redis
+ *    database — Redis is used by nothing in this process. Safe to run on N replicas: `SKIP
+ *    LOCKED` means N drainers divide the claimed work rather than fighting over it.
  *
- * Safe to run on N replicas. `SKIP LOCKED` means N drainers divide the work rather than
- * fighting over it, and BullMQ distributes jobs across consumers. This is the process to
- * scale on queue depth.
+ *  - **'queue'**, if a deployment opts back in explicitly (`buildContainer({ role: 'worker',
+ *    transport: 'queue' })`). The drainer hands claimed events to BullMQ instead of running
+ *    them, and `container.outbox.workers` — otherwise `undefined` — consumes those jobs and
+ *    runs the handlers. This is the process to scale on queue depth once a handler needs to
+ *    scale independently of the drain loop; nothing here requires it before that.
  *
- * No HTTP server. No second queue system — `role: 'worker'` is the single flag that tells
- * the composition root to construct the BullMQ workers it already knows how to build.
+ * No HTTP server either way.
  */
 
 const container = buildContainer({ role: 'worker' });

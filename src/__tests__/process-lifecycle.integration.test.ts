@@ -139,11 +139,15 @@ describe('process lifecycle (integration)', () => {
   /* ── Worker process ────────────────────────────────────────────────────── */
 
   describe('worker process', () => {
-    it('starts the drainer and BullMQ workers, then shuts down without hanging', async () => {
+    // SKIPPED: BullMQ is commented out for now (outbox.module.ts, queues.ts). transport:
+    // 'queue' throws by design, so this test — specifically about the queue path — cannot
+    // pass. Re-enable alongside the queue branch.
+    it.skip('starts the drainer and BullMQ workers, then shuts down without hanging', async () => {
       const container = buildContainer({
         role: 'worker',
         config: config(),
         drainer: { pollIntervalMs: 50 },
+        transport: 'queue',
       });
 
       // Exactly what workers/default.ts does: retain the promise so shutdown can await the
@@ -170,11 +174,13 @@ describe('process lifecycle (integration)', () => {
       await expectRedisClosed(container.locks);
     }, 60_000);
 
-    it('leaves no Redis connection connected after shutdown', async () => {
+    // SKIPPED: BullMQ is commented out for now — see the note above.
+    it.skip('leaves no Redis connection connected after shutdown', async () => {
       const container = buildContainer({
         role: 'worker',
         config: config(),
         drainer: { pollIntervalMs: 50 },
+        transport: 'queue',
       });
       const draining = container.outbox.drainer.start();
 
@@ -209,8 +215,13 @@ describe('process lifecycle (integration)', () => {
   /* ── Scheduler process ─────────────────────────────────────────────────── */
 
   describe('scheduler process', () => {
-    it('builds without BullMQ workers', async () => {
-      const container = buildContainer({ role: 'scheduler', config: config() });
+    // SKIPPED: BullMQ is commented out for now — see the note above.
+    it.skip('builds without BullMQ workers', async () => {
+      const container = buildContainer({
+        role: 'scheduler',
+        config: config(),
+        transport: 'queue',
+      });
 
       // A scheduler enqueues work; it does not consume it. Consuming here would make a slow
       // job delay the next tick.
