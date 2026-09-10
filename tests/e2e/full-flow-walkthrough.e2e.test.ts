@@ -9,7 +9,7 @@ import { appUser } from '../../src/db/schema/identity.js';
 import { invoice } from '../../src/db/schema/invoicing.js';
 import { stockItem } from '../../src/db/schema/inventory.js';
 import { order } from '../../src/db/schema/orders.js';
-import { returnRequest } from '../../src/db/schema/returns.js';
+import { returnEvent, returnRequest } from '../../src/db/schema/returns.js';
 import { shipment } from '../../src/db/schema/shipments.js';
 import { newId } from '../../src/shared/id.js';
 import {
@@ -516,15 +516,15 @@ describe('full flow walkthrough (narrated)', () => {
 
   /* ══ 9. Returns ════════════════════════════════════════════════════════ */
 
-  it('lets the CUSTOMER raise, read and cancel a return', async () => {
-    section('9. CUSTOMER — RETURNS (Increment 40c)');
+  it('runs the return lifecycle: customer raises, STAFF approves and rejects', async () => {
+    section('9. RETURNS — customer raises, staff decides (40c + 40d)');
 
     const created = await api()
       .post(`/api/v1/users/me/orders/${orderNumber}/returns`)
       .set(asCustomer())
       .set('idempotency-key', `ret-${newId()}`)
       .send({ reason: 'defective', customerNote: 'seam split', lines: [{ skuCode, quantity: 1 }] });
-    log('POST', '/api/v1/users/me/orders/:n/returns', created.status, 'return raised');
+    log('POST', '/api/v1/users/me/orders/:n/returns', created.status, 'customer raises a return');
     expect(created.status).toBe(201);
 
     const r = created.body.return;
@@ -540,15 +540,46 @@ describe('full flow walkthrough (narrated)', () => {
     log('GET', '/api/v1/users/me/returns', listed.status, `${String(listed.body.total)} return(s)`);
     expect(listed.status).toBe(200);
 
-    const read = await api().get(`/api/v1/users/me/returns/${returnNumber}`).set(asCustomer());
-    log('GET', '/api/v1/users/me/returns/:n', read.status, 'single return read back');
-    expect(read.status).toBe(200);
+    /* ---- the staff queue ---- */
 
-    /*
-     * The cancellation boundary. `approved` is the only state a customer may cancel from, and
-     * only staff can approve — which is Increment 40d and does not exist yet. The row is moved
-     * directly here so the customer-facing cancel endpoint can still be demonstrated.
-     */
+    const queue = await api()
+      .get('/api/v1/admin/returns')
+      .query({ status: 'requested' })
+      .set(asAdmin());
+    log(
+      'GET',
+      '/api/v1/admin/returns?status=requested',
+      queue.status,
+      `${String(queue.body.total)} awaiting a decision`,
+    );
+    expect(queue.status).toBe(200);
+    expect(
+      (queue.body.returns as { returnNumber: string }[]).some(
+        (x) => x.returnNumber === returnNumber,
+      ),
+    ).toBe(true);
+    fact('staff see staffNote and the per-line inspection counts; customers see neither');
+
+    const staffRead = await api().get(`/api/v1/admin/returns/${returnNumber}`).set(asAdmin());
+    log('GET', '/api/v1/admin/returns/:n', staffRead.status, 'staff read the full record');
+    expect(staffRead.status).toBe(200);
+
+    /* ---- a customer cannot decide their own case ---- */
+
+    const selfApprove = await api()
+      .post(`/api/v1/admin/returns/${returnNumber}/approve`)
+      .set(asCustomer())
+      .send({});
+    log(
+      'POST',
+      '/api/v1/admin/returns/:n/approve',
+      selfApprove.status,
+      'CUSTOMER cannot approve their own return',
+    );
+    expect(selfApprove.status).toBe(403);
+
+    /* ---- the cancellation boundary, now reached honestly ---- */
+
     const tooEarly = await api()
       .post(`/api/v1/users/me/returns/${returnNumber}/cancel`)
       .set(asCustomer())
@@ -561,11 +592,31 @@ describe('full flow walkthrough (narrated)', () => {
     );
     expect(tooEarly.status).toBe(409);
 
-    await db()
-      .update(returnRequest)
-      .set({ status: 'approved' })
-      .where(eq(returnRequest.returnNumber, returnNumber));
-    fact('[test harness] moved to approved — staff approval is Increment 40d, not yet built');
+    const approved = await api()
+      .post(`/api/v1/admin/returns/${returnNumber}/approve`)
+      .set(asAdmin())
+      .send({ staffNote: 'photos check out' });
+    log(
+      'POST',
+      '/api/v1/admin/returns/:n/approve',
+      approved.status,
+      'STAFF approve → requested becomes approved',
+    );
+    expect(approved.status).toBe(200);
+    expect(approved.body.return.status).toBe('approved');
+    fact(
+      `staffNote     = ${approved.body.return.staffNote as string} (internal, never shown to the customer)`,
+    );
+    // Approval agrees to a return; it never edits one.
+    expect(approved.body.return.refundTotal).toBe(r.refundTotal);
+    fact('refund total unchanged by approval — the frozen snapshot is not recomputed');
+
+    const twice = await api()
+      .post(`/api/v1/admin/returns/${returnNumber}/approve`)
+      .set(asAdmin())
+      .send({});
+    log('POST', '/api/v1/admin/returns/:n/approve', twice.status, 'approving twice is refused');
+    expect(twice.status).toBe(409);
 
     const cancelled = await api()
       .post(`/api/v1/users/me/returns/${returnNumber}/cancel`)
@@ -575,21 +626,68 @@ describe('full flow walkthrough (narrated)', () => {
       'POST',
       '/api/v1/users/me/returns/:n/cancel',
       cancelled.status,
-      'withdrawn by the customer',
+      'customer withdraws the approved return',
     );
     expect(cancelled.status).toBe(200);
     expect(cancelled.body.return.status).toBe('cancelled');
 
-    const again = await api()
+    /* ---- rejection releases the quantity ---- */
+
+    const second = await api()
       .post(`/api/v1/users/me/orders/${orderNumber}/returns`)
       .set(asCustomer())
       .set('idempotency-key', `ret2-${newId()}`)
-      .send({ reason: 'defective', lines: [{ skuCode, quantity: 3 }] });
-    log('POST', '/api/v1/users/me/orders/:n/returns', again.status, 'all 3 units returnable again');
-    expect(again.status).toBe(201);
-    fact('a cancelled return RELEASES its quantity — nothing came back, nothing was refunded');
-  });
+      .send({ reason: 'not_as_described', lines: [{ skuCode, quantity: 3 }] });
+    log(
+      'POST',
+      '/api/v1/users/me/orders/:n/returns',
+      second.status,
+      'all 3 units returnable again after the cancel',
+    );
+    expect(second.status).toBe(201);
+    const secondNumber = second.body.return.returnNumber as string;
 
+    const rejected = await api()
+      .post(`/api/v1/admin/returns/${secondNumber}/reject`)
+      .set(asAdmin())
+      .send({ staffNote: 'outside the policy window' });
+    log(
+      'POST',
+      '/api/v1/admin/returns/:n/reject',
+      rejected.status,
+      'STAFF reject → no refund, no restock',
+    );
+    expect(rejected.status).toBe(200);
+    expect(rejected.body.return.status).toBe('rejected');
+    expect(rejected.body.return.closedAt).not.toBeNull();
+
+    const third = await api()
+      .post(`/api/v1/users/me/orders/${orderNumber}/returns`)
+      .set(asCustomer())
+      .set('idempotency-key', `ret3-${newId()}`)
+      .send({ reason: 'defective', lines: [{ skuCode, quantity: 3 }] });
+    log(
+      'POST',
+      '/api/v1/users/me/orders/:n/returns',
+      third.status,
+      'a rejected return also RELEASES its quantity',
+    );
+    expect(third.status).toBe(201);
+    returnNumber = third.body.return.returnNumber as string;
+
+    /* ---- the append-only history ---- */
+
+    const [header] = await db()
+      .select()
+      .from(returnRequest)
+      .where(eq(returnRequest.returnNumber, secondNumber));
+    const events = await db()
+      .select()
+      .from(returnEvent)
+      .where(eq(returnEvent.returnId, header!.id));
+    fact(`history       = ${events.map((e) => e.toStatus).join(' → ')} (append-only)`);
+    expect(events.map((e) => e.toStatus)).toEqual(['requested', 'rejected']);
+  });
   /* ══ 10. Isolation ═════════════════════════════════════════════════════ */
 
   it('keeps one customer out of another customer data', async () => {
@@ -648,7 +746,6 @@ describe('full flow walkthrough (narrated)', () => {
     line(`  customer    : ${customerId}`);
     line('');
     line('  NOT YET IMPLEMENTED (out of scope for this build):');
-    line('    · staff return approval / rejection      — Increment 40d');
     line('    · return receipt, inspection, restock    — Increment 40e');
     line('    · refund execution (COD + Razorpay)      — Increment 40f');
     line('    · credit notes for returned GST          — not approved');
