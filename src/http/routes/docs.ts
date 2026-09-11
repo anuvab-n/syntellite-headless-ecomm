@@ -1442,7 +1442,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       {
         // Built from config rather than hard-coded, so "Try it out" targets the port this
         // process is actually listening on.
-        url: `http://localhost:${String(config.port)}`,
+        url: '/',
         description: `${config.environment} (this process)`,
       },
     ],

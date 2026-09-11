@@ -356,7 +356,7 @@ describe('API documentation', () => {
 
       // Hard-coding localhost:8000 would make "Try it out" fire at the wrong port whenever
       // PORT differs, which is exactly when somebody is debugging.
-      expect(response.body.servers[0].url).toBe('http://localhost:9123');
+      expect(response.body.servers[0].url).toBe('/');
     });
   });
 
