@@ -1,5 +1,14 @@
 import { z } from 'zod';
 
+import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
+
+/**
+ * Re-exported, so a caller of this module needs one import rather than two.
+ *
+ * The shape lives in `shared/pagination.ts` — one definition for every list endpoint.
+ */
+export type { PaginationResponse };
+
 /**
  * The identity module's wire contracts.
  *
@@ -346,5 +355,124 @@ export function toLoginResponse(args: {
     tokenType: 'Bearer',
     expiresIn: args.expiresInSeconds,
     refreshToken: args.refreshToken,
+  };
+}
+
+/* ── GET /admin/customers ────────────────────────────────────────────────── */
+
+/** Page size for the staff customer list. */
+export const ADMIN_CUSTOMER_LIST_DEFAULT_LIMIT = 25;
+export const ADMIN_CUSTOMER_LIST_MAX_LIMIT = 100;
+
+/**
+ * An ISO-8601 instant WITH an offset, matching the promotions and tax modules and the two admin
+ * lists that precede this one.
+ *
+ * **The client owns the timezone, deliberately.** A bare `YYYY-MM-DD` would force the server to
+ * choose one to widen it into, and every choice is wrong somewhere.
+ *
+ * Both bounds are INCLUSIVE, stated on the endpoint and asserted by a test that registers an
+ * account exactly on each boundary — a half-open range that silently dropped the last instant
+ * would look like missing data rather than like a contract.
+ */
+const adminInstantField = z.iso.datetime({ offset: true });
+
+/**
+ * The staff customer list's query string.
+ *
+ * `strictObject`, so an unknown parameter is a `400` naming it rather than a filter silently
+ * ignored. **`storeId` is not here and never will be** — tenancy comes from the verified staff
+ * token, and because this object is strict, supplying one is a `400` rather than an ignored key.
+ *
+ * **There is no search parameter.** A substring match over emails and names is a different
+ * feature with its own disclosure and indexing questions, and it is not part of this increment.
+ */
+export const AdminListCustomersQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_CUSTOMER_LIST_MAX_LIMIT,
+    default: ADMIN_CUSTOMER_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+
+  /**
+   * Account status. Parsed from the two exact strings rather than with `z.coerce.boolean()`,
+   * which treats every non-empty string as `true` — so `?isActive=false` would have filtered to
+   * ACTIVE accounts, the precise opposite of what was asked, with no error to notice.
+   */
+  isActive: z
+    .enum(['true', 'false'])
+    .transform((value) => value === 'true')
+    .optional(),
+
+  createdFrom: adminInstantField.optional(),
+  createdTo: adminInstantField.optional(),
+});
+
+export type AdminListCustomersQuery = z.infer<typeof AdminListCustomersQuerySchema>;
+
+/**
+ * One row of the staff customer list.
+ *
+ * Built field by field from the repository's allowlisted projection — the same discipline
+ * `toUserResponse` documents, applied one layer earlier as well, so a column added to `app_user`
+ * has to pass two deliberate edits before it could reach a client.
+ *
+ * `id` IS published, and it is the one internal identifier here: a customer row has to be
+ * addressable for anything that follows, and unlike an order there is no business-facing number
+ * to address it by.
+ *
+ * Absent by construction: `passwordHash`, `isStaff`, `isSuperuser`, `storeId`, `deletedAt`, and
+ * every password-reset or refresh-session field — those live in other tables the query does not
+ * touch.
+ */
+export type AdminCustomerResponse = {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  /** `false` once an account is deactivated; its tokens then fail on the next request. */
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** The row fields the mapper needs. Structural, so the repository picks the columns. */
+export type MappableAdminCustomer = {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type AdminCustomerListResponse = {
+  customers: AdminCustomerResponse[];
+  pagination: PaginationResponse;
+};
+
+export function toAdminCustomerResponse(row: MappableAdminCustomer): AdminCustomerResponse {
+  return {
+    id: row.id,
+    email: row.email,
+    firstName: row.firstName,
+    lastName: row.lastName,
+    isActive: row.isActive,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+export function toAdminCustomerListResponse(page: {
+  items: readonly MappableAdminCustomer[];
+  total: number;
+  limit: number;
+  offset: number;
+}): AdminCustomerListResponse {
+  return {
+    customers: page.items.map(toAdminCustomerResponse),
+    pagination: { limit: page.limit, offset: page.offset, total: page.total },
   };
 }

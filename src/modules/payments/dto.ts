@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
 
-import { PAYMENT_METHODS } from './payments.repository.js';
+import { PAYMENT_METHODS, PAYMENT_PROVIDERS, PAYMENT_STATUSES } from './payments.repository.js';
 import type { PaymentEventRecord, PaymentRecord } from './payments.repository.js';
 import type { PaymentHandoff, PaymentView } from './payments.service.js';
 
@@ -182,5 +182,135 @@ export function toHandoffResponse(handoff: PaymentHandoff): PaymentHandoffRespon
     provider: handoff.provider,
     providerRef: handoff.providerRef,
     publicKey: handoff.publicKey,
+  };
+}
+
+/* ── GET /admin/payments ─────────────────────────────────────────────────── */
+
+/** Page size for the staff payment list. Larger than the customer's, for the same reason. */
+export const ADMIN_PAYMENT_LIST_DEFAULT_LIMIT = 25;
+export const ADMIN_PAYMENT_LIST_MAX_LIMIT = 100;
+
+/**
+ * An ISO-8601 instant WITH an offset, matching the promotions and tax modules' `instantField`
+ * and the admin order list.
+ *
+ * **The client owns the timezone, deliberately.** A bare `YYYY-MM-DD` would force the server to
+ * choose one to widen it into, and every choice is wrong somewhere — UTC misfiles the edges of
+ * an Indian trading day, the store's timezone surprises an operator working from another one,
+ * and neither is visible in the request.
+ *
+ * Both bounds are INCLUSIVE. Stated here, on the endpoint, and asserted by a test that places a
+ * payment exactly on each boundary — a half-open range that silently dropped the last day would
+ * otherwise look like missing data rather than like a contract.
+ */
+const instantField = z.iso.datetime({ offset: true });
+
+/**
+ * The staff payment list's query string.
+ *
+ * `strictObject`, so an unknown parameter is a `400` naming it rather than a filter silently
+ * ignored — the failure mode where an operator trusts a page that was never narrowed.
+ *
+ * **`storeId` is not here and never will be.** Tenancy comes from the verified staff token; a
+ * store parameter on an admin list is a cross-tenant read waiting to be discovered, and because
+ * this object is strict, sending one is a `400` rather than an ignored key.
+ *
+ * The status, method and provider vocabularies are the REAL ones, re-exported by the repository
+ * from the schema — not restatements. A value the database cannot hold is rejected here rather
+ * than returning a confusingly empty page.
+ */
+export const AdminListPaymentsQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_PAYMENT_LIST_MAX_LIMIT,
+    default: ADMIN_PAYMENT_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+
+  status: z.enum(PAYMENT_STATUSES).optional(),
+  method: z.enum(PAYMENT_METHODS).optional(),
+  provider: z.enum(PAYMENT_PROVIDERS).optional(),
+
+  /**
+   * An EXACT order number, not a search.
+   *
+   * The same pattern the orders module validates, so a malformed number is a `400` rather than a
+   * query that can only ever miss. `uq_payment_order` means this selects at most one payment.
+   */
+  orderNumber: z
+    .string()
+    .trim()
+    .max(64)
+    .regex(/^ORD-\d{8}-[A-Z2-9]{6}$/, 'must be an order number of the form ORD-YYYYMMDD-XXXXXX')
+    .optional(),
+
+  createdFrom: instantField.optional(),
+  createdTo: instantField.optional(),
+});
+
+export type AdminListPaymentsQuery = z.infer<typeof AdminListPaymentsQuerySchema>;
+
+/**
+ * One row of the staff payment list.
+ *
+ * Built field by field from `PaymentRecord`, and the omissions are the contract:
+ *
+ *  - **`providerRef`** — the Razorpay order/payment id. It is the handle used to act on the
+ *    provider side, so it is handed to the paying customer for the checkout handoff and to
+ *    nobody else. An operator list is a read, and a read does not need a capability.
+ *  - **`amountMinor`** — the integer mirror of `amount`, kept for the provider call. Publishing
+ *    both invites a client to pick one, and money leaves this system as a decimal string.
+ *  - **`id`, `userId`, `orderId`, `storeId`** — internal ids. A payment is addressed by its
+ *    order number here; tenancy and ownership are invariants of the query, not fields.
+ *
+ * `failureCode` IS included: it is already on the customer-facing `PaymentResponse`, so it is
+ * established as non-sensitive, and it is the reason a row reads as failed on an operator screen.
+ */
+export type AdminPaymentResponse = {
+  orderNumber: string;
+  status: string;
+  method: string;
+  /** `null` for COD — `ck_payment_provider_matches_method` guarantees the pairing. */
+  provider: string | null;
+  amount: string;
+  currency: string;
+  /** Set only on a failed payment; `ck_payment_failure_code` enforces that. */
+  failureCode: string | null;
+  createdAt: string;
+  /** The last transition's instant — when a payment succeeded, failed or expired. */
+  updatedAt: string;
+};
+
+export type AdminPaymentListResponse = {
+  payments: AdminPaymentResponse[];
+  pagination: PaginationResponse;
+};
+
+export function toAdminPaymentResponse(
+  record: PaymentRecord & { orderNumber: string },
+): AdminPaymentResponse {
+  return {
+    orderNumber: record.orderNumber,
+    status: record.status,
+    method: record.method,
+    provider: record.provider,
+    amount: record.amount,
+    currency: record.currency,
+    failureCode: record.failureCode,
+    createdAt: record.createdAt.toISOString(),
+    updatedAt: record.updatedAt.toISOString(),
+  };
+}
+
+export function toAdminPaymentListResponse(page: {
+  items: readonly (PaymentRecord & { orderNumber: string })[];
+  total: number;
+  limit: number;
+  offset: number;
+}): AdminPaymentListResponse {
+  return {
+    payments: page.items.map(toAdminPaymentResponse),
+    pagination: { limit: page.limit, offset: page.offset, total: page.total },
   };
 }

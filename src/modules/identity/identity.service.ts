@@ -16,6 +16,8 @@ import {
   EMAIL_UNIQUE_CONSTRAINT,
   PHONE_UNIQUE_CONSTRAINT,
   uniqueViolationConstraint,
+  type AdminCustomerFilters,
+  type AdminCustomerRecord,
   type EditableUserFields,
   type IdentityRepository,
   type UserSubject,
@@ -589,6 +591,37 @@ export function createIdentityService(deps: {
      * `findPublicUserById`. It already does exactly what is needed: store-scoped in the query
      * itself, `deleted_at IS NULL`, and a projection that never selects `passwordHash`.
      */
+    /**
+     * **A page of the STORE's customers, for staff.** Increment 51. Read-only.
+     *
+     * Named `listStoreCustomers` rather than `listCustomers` because the access predicate is
+     * tenancy alone, and the name says so — the same convention `findStoreOrderByNumber` set
+     * against `findOwnedOrderByNumber`. The authorization boundary is entirely in the routes
+     * file (`auth -> requireStaff`); this method assumes it has already been enforced, exactly
+     * as every other admin service method in the project does.
+     *
+     * **No transaction, no audit row, no event, no session touched.** Every other method on this
+     * service writes something; this one does not. A read that recorded an audit entry would
+     * make "who looked at this customer" indistinguishable from "who changed this customer" in
+     * the trail, and the trail's value is that every row in it is a change.
+     *
+     * `storeId` is passed through untouched — there is no parameter here a client could widen.
+     */
+    async listStoreCustomers(params: {
+      storeId: string;
+      filters: AdminCustomerFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly AdminCustomerRecord[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listStoreCustomers(params);
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
     async getCurrentUser(params: { storeId: string; userId: string }): Promise<UserSubject> {
       const user = await repository.findSubjectById({
         storeId: params.storeId,

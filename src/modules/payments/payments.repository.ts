@@ -1,4 +1,4 @@
-import { and, asc, count, desc, eq, isNotNull, lte } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, isNotNull, lte, type SQL } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { order } from '../../db/schema/orders.js';
@@ -419,6 +419,63 @@ export function createPaymentsRepository(deps: { db: Database }) {
     },
 
     /**
+     * **A page of the STORE's payments, whosever they are.** Increment 51.
+     *
+     * The staff counterpart of `listForUser`, and a separate method for the reason
+     * `findStateByOrderId` is separate from the owner-scoped reads: a caller that forgot to pass
+     * a `userId` would otherwise silently get store-wide reach. Two names, two predicates, and
+     * the narrower one stays the default.
+     *
+     * `store_id` is NOT relaxed and never comes from input — the caller takes it from the staff
+     * member's verified token. Only ownership within the store is dropped.
+     *
+     * **One query for the page, one for the total, and no N+1.** `order_number` comes from the
+     * same `INNER JOIN` that `listForUser` already uses rather than a lookup per row, so a page
+     * of 100 payments is one round trip. The join cannot multiply rows: `uq_payment_order` makes
+     * the relationship one-to-one, and the join is additionally pinned on `store_id` so a row
+     * can only ever meet its own tenant's order.
+     *
+     * Page and count share ONE predicate, so a caller on the last page is never told the total
+     * counted rows it cannot see. Ordered by `created_at DESC, id DESC`: `created_at` alone is
+     * not a total order — two payments can share an instant — and a non-total order makes
+     * `offset` pagination silently skip and repeat rows.
+     */
+    async listForStore(params: {
+      storeId: string;
+      filters: AdminPaymentFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: (PaymentRecord & { orderNumber: string })[]; total: number }> {
+      const where = adminPaymentPredicate(params.storeId, params.filters);
+
+      /*
+       * The join is repeated on the count rather than factored away: the `orderNumber` filter is
+       * expressed over the joined table, and a count over `payment` alone would silently ignore
+       * it and report a total for a different query than the page.
+       */
+      const [rows, [counted]] = await Promise.all([
+        executor(db)
+          .select({ ...PAYMENT_COLUMNS, orderNumber: order.orderNumber })
+          .from(payment)
+          .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+          .where(where)
+          .orderBy(desc(payment.createdAt), desc(payment.id))
+          .limit(params.limit)
+          .offset(params.offset),
+        executor(db)
+          .select({ total: count() })
+          .from(payment)
+          .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+          .where(where),
+      ]);
+
+      return {
+        items: rows.map((row) => ({ ...toPaymentRecord(row), orderNumber: row.orderNumber })),
+        total: counted?.total ?? 0,
+      };
+    },
+
+    /**
      * The status of an order's payment, or `undefined` when it has none.
      *
      * Store-scoped and deliberately NOT user-scoped: `uq_payment_order` is global to the order,
@@ -524,4 +581,47 @@ export function createPaymentsRepository(deps: { db: Database }) {
       return rows.map(toEventRecord);
     },
   };
+}
+
+/** The filters the staff payment list accepts. Every one of them is optional. */
+export type AdminPaymentFilters = {
+  readonly status?: string;
+  readonly method?: string;
+  readonly provider?: string;
+  readonly orderNumber?: string;
+  readonly createdFrom?: Date;
+  readonly createdTo?: Date;
+};
+
+/**
+ * The staff list's WHERE clause: tenancy, then whichever filters were supplied.
+ *
+ * A free function rather than a closure inside the factory because it takes everything it needs
+ * and captures nothing — which is what makes it readable as the one place tenancy is applied.
+ * `storeId` is the first conjunct and is not optional; every filter below can only narrow, so
+ * there is no combination of query parameters that widens the result past one tenant.
+ */
+function adminPaymentPredicate(storeId: string, filters: AdminPaymentFilters): SQL | undefined {
+  const clauses: SQL[] = [eq(payment.storeId, storeId)];
+
+  if (filters.status !== undefined) clauses.push(eq(payment.status, filters.status));
+  if (filters.method !== undefined) clauses.push(eq(payment.method, filters.method));
+  if (filters.provider !== undefined) clauses.push(eq(payment.provider, filters.provider));
+
+  /*
+   * An exact match on the JOINED order, not a search. `uq_payment_order` means this narrows to
+   * at most one payment, and it is expressed against `order.order_number` rather than resolved
+   * to an id first — one query rather than two, and an unknown number is an empty page rather
+   * than a 404, which is the right answer for a filter.
+   */
+  if (filters.orderNumber !== undefined) {
+    clauses.push(eq(order.orderNumber, filters.orderNumber));
+  }
+
+  // BOTH BOUNDS INCLUSIVE, and documented as such on the endpoint. A half-open upper bound
+  // would silently drop everything on the last instant a caller asked for.
+  if (filters.createdFrom !== undefined) clauses.push(gte(payment.createdAt, filters.createdFrom));
+  if (filters.createdTo !== undefined) clauses.push(lte(payment.createdAt, filters.createdTo));
+
+  return and(...clauses);
 }

@@ -1005,6 +1005,87 @@ const ORDER_DISPLAY_STATUS = {
     'is indistinguishable from a broken one.',
 } as const;
 
+/**
+ * One row of the staff payment list. Mirrors `AdminPaymentResponse` in `modules/payments/dto.ts`.
+ *
+ * The omissions are the contract. `providerRef` — the Razorpay handle — is absent because it is
+ * a capability to act on the provider side, and it goes to the paying customer for the checkout
+ * handoff and to nobody else. `amountMinor` is absent because money leaves this system as a
+ * decimal string and publishing both invites a client to pick one. Internal ids are absent
+ * because a payment is addressed here by its order number.
+ */
+const ADMIN_PAYMENT = {
+  type: 'object',
+  required: [
+    'orderNumber',
+    'status',
+    'method',
+    'provider',
+    'amount',
+    'currency',
+    'failureCode',
+    'createdAt',
+    'updatedAt',
+  ],
+  properties: {
+    orderNumber: { type: 'string', example: 'ORD-20260904-7QK4M2' },
+    status: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+    method: { type: 'string', enum: ['online', 'cod'] },
+    provider: {
+      description:
+        'The gateway that handled it, or null for `cod` — `ck_payment_provider_matches_method` guarantees the pairing.',
+      oneOf: [{ type: 'string', enum: ['razorpay'] }, { type: 'null' }],
+    },
+    amount: {
+      type: 'string',
+      description: 'A decimal string, always exactly the order’s payable total.',
+      example: '2268.0000',
+    },
+    currency: { type: 'string', example: 'INR' },
+    failureCode: {
+      description:
+        'Set only on a failed payment; `ck_payment_failure_code` makes any other combination unrepresentable.',
+      oneOf: [{ type: 'string' }, { type: 'null' }],
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: {
+      type: 'string',
+      format: 'date-time',
+      description: 'The last transition’s instant — when the payment succeeded, failed or expired.',
+    },
+  },
+} as const;
+
+/**
+ * One row of the staff customer list. Mirrors `AdminCustomerResponse` in `modules/identity/dto.ts`.
+ *
+ * `passwordHash`, `isStaff` and `isSuperuser` are absent from the SQL projection, from the record
+ * type, and from the response mapper — three deliberate edits would be needed to publish one.
+ * Password-reset tokens and refresh sessions live in other tables this query never touches.
+ */
+const ADMIN_CUSTOMER = {
+  type: 'object',
+  required: ['id', 'email', 'firstName', 'lastName', 'isActive', 'createdAt', 'updatedAt'],
+  properties: {
+    id: {
+      type: 'string',
+      format: 'uuid',
+      description:
+        'The one internal identifier published here: unlike an order, a customer has no business-facing number to be addressed by.',
+    },
+    email: { type: 'string', format: 'email' },
+    firstName: { type: 'string', description: 'Empty string when never supplied, never null.' },
+    lastName: { type: 'string', description: 'Empty string when never supplied, never null.' },
+    isActive: {
+      type: 'boolean',
+      description:
+        'False once an account is deactivated. Scopes and liveness are read from the database on every request, so a deactivated account’s existing tokens fail on their next call.',
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
 /** The customer on an admin order row. An allowlist — never a credential or a privilege flag. */
 const ADMIN_ORDER_CUSTOMER = {
   type: 'object',
@@ -1579,7 +1660,11 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
     ],
     tags: [
       { name: 'Authentication', description: 'Registration and session establishment.' },
-      { name: 'Users', description: 'The authenticated user own account.' },
+      {
+        name: 'Users',
+        description:
+          'The authenticated user’s own account, and the staff customer directory. `/users/me` is self-scoped for everyone including staff — privilege does not widen it, so there is no impersonation path. `GET /admin/customers` is the separate, store-scoped staff surface: a read-only list, with no detail, order history, search, activation or deactivation.',
+      },
       {
         name: 'Orders',
         description:
@@ -1588,7 +1673,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       {
         name: 'Payments',
         description:
-          'Paying for an order. One payment per order, and **payment state is a separate lifecycle from order state** — `order.status` stays `placed` whatever happens to the payment. Two methods: `online` through the configured gateway, and `cod` (cash on delivery), which never touches one. The amount is always exactly `order.total`; a client cannot supply it. There is no staff or admin payment surface in this version, and no refund, retry, reconciliation or settlement surface. Instrument data — card, UPI, bank, token — never reaches this system.',
+          'Paying for an order. One payment per order, and **payment state is a separate lifecycle from order state** — `order.status` stays `placed` whatever happens to the payment. Two methods: `online` through the configured gateway, and `cod` (cash on delivery), which never touches one. The amount is always exactly `order.total`; a client cannot supply it. The staff surface is exactly one route and it is a READ — `GET /admin/payments`, store-scoped. There is still no refund, retry, reconciliation or settlement surface, and no staff mutation of any kind. Instrument data — card, UPI, bank, token — never reaches this system.',
       },
       {
         name: 'Webhooks',
@@ -1777,6 +1862,8 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         OrderLine: ORDER_LINE,
         OrderAddress: ORDER_ADDRESS,
         OrderPromotion: ORDER_PROMOTION,
+        AdminPayment: ADMIN_PAYMENT,
+        AdminCustomer: ADMIN_CUSTOMER,
         AdminOrderCustomer: ADMIN_ORDER_CUSTOMER,
         AdminOrderPayment: ADMIN_ORDER_PAYMENT,
         AdminOrderShipment: ADMIN_ORDER_SHIPMENT,
@@ -3462,6 +3549,248 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '409': errorResponse(
               'The order cannot be cancelled. `details.reason` is `status` (already cancelled), `payment_in_progress` (a payment is pending), or `paid` (money was taken and refunds are not supported).',
               'ORDER_NOT_CANCELLABLE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/payments': {
+        get: {
+          tags: ['Payments'],
+          summary: 'List the store’s payments (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every payment in the store**, whosever it is. Requires the `staff` scope.',
+            '',
+            'The module’s first staff route, and it is a **read**. The two questions the payments',
+            'module previously recorded as undecided now have answers: a support agent may see',
+            'every payment in their OWN store and none from another, and a provider reference is',
+            'NOT among the fields.',
+            '',
+            '### What is deliberately absent',
+            '',
+            '| Field | Why |',
+            '| --- | --- |',
+            '| `providerRef` | The gateway handle — a capability to act provider-side. It goes to the paying customer for the checkout handoff and nobody else. |',
+            '| `amountMinor` | The integer mirror kept for the provider call. Money leaves this system as a decimal string; publishing both invites a client to pick one. |',
+            '| internal ids | A payment is addressed here by its order number. |',
+            '',
+            'There is also **no payment detail route, no refund, no reconciliation and no staff',
+            'mutation of any kind**. Staff may see that a payment exists and what state it reached.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400` rather than something ignored.',
+            '',
+            'Ordered by `createdAt` descending, then `id` descending. The tiebreaker matters:',
+            '`createdAt` alone is not a total order, and a non-total order makes `offset` paging',
+            'silently skip and repeat rows between pages.',
+            '',
+            '**Both date bounds are inclusive.** One caveat worth knowing: `createdAt` is',
+            'serialised to millisecond precision while PostgreSQL stores microseconds, so feeding',
+            'a row’s own `createdAt` back as `createdTo` submits a slightly EARLIER instant and',
+            'can exclude that row. Round up by a millisecond when using a response value as an',
+            'upper bound.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+            },
+            {
+              name: 'method',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['online', 'cod'] },
+            },
+            {
+              name: 'provider',
+              in: 'query',
+              required: false,
+              description: 'Matches no `cod` payment — those have a null provider by construction.',
+              schema: { type: 'string', enum: ['razorpay'] },
+            },
+            {
+              name: 'orderNumber',
+              in: 'query',
+              required: false,
+              description:
+                'An EXACT order number, not a search. `uq_payment_order` means this narrows to at most one payment. An unknown number is an empty page, not a `404` — it is a filter, not a lookup.',
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+            {
+              name: 'createdFrom',
+              in: 'query',
+              required: false,
+              description:
+                'INCLUSIVE lower bound on `createdAt`. A full ISO-8601 instant WITH an offset — the client owns the timezone, deliberately: a bare date would force the server to pick one, and every choice is wrong for somebody.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-01T00:00:00+05:30',
+            },
+            {
+              name: 'createdTo',
+              in: 'query',
+              required: false,
+              description: 'INCLUSIVE upper bound on `createdAt`. Same format as `createdFrom`.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-30T23:59:59+05:30',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s payments, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['payments', 'pagination'],
+                    properties: {
+                      payments: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminPayment' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/customers': {
+        get: {
+          tags: ['Users'],
+          summary: 'List the store’s customers (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every account in the store**. Requires the `staff` scope.',
+            '',
+            'The identity module’s first staff route, and its first read that returns many',
+            'subjects — every other authenticated endpoint there is about the caller’s own',
+            'account. `/users/me` stays self-scoped for everyone including staff, so this is a',
+            'separate surface rather than a relaxation of that one.',
+            '',
+            '### What is deliberately absent',
+            '',
+            '`passwordHash`, `isStaff` and `isSuperuser` are absent from the SQL projection, from',
+            'the record type, and from the response mapper — three deliberate edits would be',
+            'needed to publish one. Password-reset tokens and refresh sessions live in other',
+            'tables this query never touches.',
+            '',
+            'There is also **no customer detail, no order history, no search, and no activation or',
+            'deactivation**. Staff may see who exists and whether the account is live.',
+            '',
+            '### What is included, and what is filtered',
+            '',
+            'Soft-deleted accounts are excluded — an erased customer is invisible to staff for the',
+            'same reason they are invisible to authentication. Staff accounts are NOT excluded:',
+            'they are rows in the same table, and hiding them would make the list disagree with',
+            'the database for no stated reason.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400`.',
+            '',
+            'Ordered by `createdAt` descending, then `id` descending — a total order, so `offset`',
+            'paging cannot skip or repeat rows.',
+            '',
+            '**Both date bounds are inclusive**, with the same millisecond caveat as',
+            '`GET /admin/payments`: `createdAt` is serialised to milliseconds while PostgreSQL',
+            'stores microseconds, so a row’s own `createdAt` used as `createdTo` can exclude it.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'isActive',
+              in: 'query',
+              required: false,
+              description:
+                'Exactly `true` or `false`. Parsed from those two strings rather than coerced — a boolean coercion treats every non-empty string as true, so `?isActive=false` would have filtered to ACTIVE accounts with no error to notice.',
+              schema: { type: 'string', enum: ['true', 'false'] },
+            },
+            {
+              name: 'createdFrom',
+              in: 'query',
+              required: false,
+              description:
+                'INCLUSIVE lower bound on `createdAt`. A full ISO-8601 instant WITH an offset; the client owns the timezone.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-01T00:00:00+05:30',
+            },
+            {
+              name: 'createdTo',
+              in: 'query',
+              required: false,
+              description: 'INCLUSIVE upper bound on `createdAt`. Same format as `createdFrom`.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-30T23:59:59+05:30',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s customers, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['customers', 'pagination'],
+                    properties: {
+                      customers: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminCustomer' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. A customer receives this even when asking about themselves — `GET /users/me` is the route they should use.',
+              'PERMISSION_DENIED',
             ),
             ...COMMON_ERRORS,
           },

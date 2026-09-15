@@ -12,6 +12,7 @@ import type { Logger } from '../../shared/logger.js';
 import { fromDb, isCurrency, toMinorUnits, type Currency } from '../../shared/money.js';
 import { PAYMENT_AUDIT, PAYMENT_RESOURCE } from './payments.events.js';
 import type {
+  AdminPaymentFilters,
   PaymentEventRecord,
   PaymentMethod,
   PaymentRecord,
@@ -535,6 +536,36 @@ export function createPaymentsService(deps: {
       offset: number;
     }> {
       const page = await repository.listForUser(params);
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
+     * **A page of the STORE's payments, for staff.** Increment 51. Read-only.
+     *
+     * Named `ForStore` rather than `ForUser` because the access predicate is tenancy alone, and
+     * the name says so. The authorization boundary is entirely in the routes file
+     * (`auth -> requireStaff`); this method assumes it has already been enforced, exactly as
+     * every other admin service method in the project does.
+     *
+     * No transaction, no audit row, no event, no idempotency claim. A read that recorded
+     * something would make "who looked at this" indistinguishable from "who changed this" in
+     * the audit trail, and the trail's value is that every row in it is a change.
+     *
+     * `storeId` is passed through untouched — there is no parameter on this method a client
+     * could use to widen it.
+     */
+    async listForStore(params: {
+      storeId: string;
+      filters: AdminPaymentFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly (PaymentRecord & { orderNumber: string })[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listForStore(params);
       return { ...page, limit: params.limit, offset: params.offset };
     },
 

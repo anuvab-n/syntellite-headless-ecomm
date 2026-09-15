@@ -8,10 +8,14 @@ import {
 } from '../../http/middleware/rate-limit.js';
 import { requireAuth, requireUser } from '../../http/middleware/auth.js';
 import { requireStore } from '../../http/middleware/store.js';
-import { validate, validatedBody } from '../../http/validate.js';
+import { validate, validatedBody, validatedQuery } from '../../http/validate.js';
 import type { RateLimiter, RateLimitPolicy } from '../../redis/rate-limiter.js';
 import type { Logger } from '../../shared/logger.js';
+import type { AdminCustomerFilters } from './identity.repository.js';
 import {
+  AdminListCustomersQuerySchema,
+  toAdminCustomerListResponse,
+  type AdminListCustomersQuery,
   ChangePasswordRequestSchema,
   LoginRequestSchema,
   ForgotPasswordRequestSchema,
@@ -82,8 +86,29 @@ export function createIdentityRoutes(deps: {
     refreshPolicy?: RateLimitPolicy;
     logger: Logger;
   };
+  /**
+   * The `staff` scope guard, pre-built by the composition root — the same instance the
+   * catalogue, inventory, orders and payments routers use.
+   *
+   * Passed in rather than built here even though this module OWNS authorization: the guard is
+   * constructed against the scope loader that reads privileges from the database on every
+   * request, and that wiring belongs to the composition root. This file only declares which
+   * privilege a route requires. Added in Increment 51 for `GET /admin/customers`, the module's
+   * first staff route.
+   *
+   * **Optional, and when it is absent the admin route is NOT MOUNTED** — the same shape
+   * `rateLimit` uses above, and for the same reason: a dozen existing suites mount this router
+   * directly to assert handler behaviour, and none of them has a scope loader.
+   *
+   * Note the asymmetry with `rateLimit`, which mounts its endpoints UNPROTECTED when absent.
+   * That would be indefensible here: an unguarded customer directory is a data breach, not a
+   * missing limit. So the route disappears instead, which is a safe default in a way that
+   * "mount it without the guard" could never be. `container.integration.test.ts` is what proves
+   * the composition root always supplies it.
+   */
+  requireStaff?: RequestHandler;
 }): Router {
-  const { identity, tokens, logger, rateLimit } = deps;
+  const { identity, tokens, logger, rateLimit, requireStaff } = deps;
   const router = Router();
 
   /**
@@ -529,5 +554,69 @@ export function createIdentityRoutes(deps: {
     }),
   );
 
+  /**
+   * `GET /admin/customers` — a page of the store's customers. Increment 51.
+   *
+   * The module's first staff route, and its first read that returns many subjects. Every other
+   * authenticated endpoint here is about the caller's OWN account; this one is about the
+   * store's, and the difference is `requireStaff` plus a repository method whose name says
+   * `Store`.
+   *
+   * **Read-only, and deliberately narrow.** No customer detail, no order history, no
+   * activation or deactivation, no search. Staff may see who exists and whether the account is
+   * live; acting on one is not part of this increment.
+   *
+   * Store-scoped from the verified staff token. There is no `storeId` parameter, and the query
+   * schema is strict, so supplying one is a `400` rather than something to be ignored.
+   *
+   * `passwordHash`, `isStaff` and `isSuperuser` are absent from the repository projection, from
+   * the record type, and from the response mapper — three deliberate edits would be needed to
+   * publish one. Password-reset tokens and refresh sessions live in other tables this query
+   * never touches.
+   *
+   * Failure modes: `400` for an unknown query parameter, a malformed instant, an `isActive`
+   * that is not `true`/`false`, or an out-of-range `limit`; `401` unauthenticated; `403`
+   * without the `staff` scope — including for a customer asking about themselves, who should
+   * use `GET /users/me`.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/customers',
+      auth,
+      requireStaff,
+      validate({ query: AdminListCustomersQuerySchema }),
+      asyncHandler(async (req, res) => {
+        const query = validatedQuery<AdminListCustomersQuery>(req);
+
+        const page = await identity.listStoreCustomers({
+          storeId: requireUser(req).storeId,
+          limit: query.limit,
+          offset: query.offset,
+          filters: adminCustomerFilters(query),
+        });
+
+        res.status(200).json(toAdminCustomerListResponse(page));
+      }),
+    );
+  }
+
   return router;
+}
+
+/**
+ * The validated query, as the repository's filter shape.
+ *
+ * Instants are parsed here rather than in the schema so the DTO stays a description of the WIRE
+ * — strings in, strings out — and the `Date` conversion happens once, at the adapter boundary.
+ *
+ * Built key by key with `exactOptionalPropertyTypes` in mind: an absent filter must be an absent
+ * KEY, not a key holding `undefined`, or the repository would build a predicate against it —
+ * and for `isActive` that would silently filter to deactivated accounts.
+ */
+function adminCustomerFilters(query: AdminListCustomersQuery): AdminCustomerFilters {
+  return {
+    ...(query.isActive === undefined ? {} : { isActive: query.isActive }),
+    ...(query.createdFrom === undefined ? {} : { createdFrom: new Date(query.createdFrom) }),
+    ...(query.createdTo === undefined ? {} : { createdTo: new Date(query.createdTo) }),
+  };
 }

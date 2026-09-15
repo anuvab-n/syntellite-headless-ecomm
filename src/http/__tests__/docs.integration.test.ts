@@ -253,6 +253,12 @@ describe('API documentation', () => {
     apiRouter.get('/admin/orders', (_req, res) => {
       res.status(200).json({ orders: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
+    apiRouter.get('/admin/payments', (_req, res) => {
+      res.status(200).json({ payments: [], pagination: { limit: 25, offset: 0, total: 0 } });
+    });
+    apiRouter.get('/admin/customers', (_req, res) => {
+      res.status(200).json({ customers: [], pagination: { limit: 25, offset: 0, total: 0 } });
+    });
     /*
      * Registered AFTER `/admin/orders/fulfilment` above, mirroring production: in the real
      * application the fulfilment queue is protected by the `onlyOrderNumber` guard in the orders
@@ -439,6 +445,7 @@ describe('API documentation', () => {
       // Explicit, so removing an endpoint from the spec without removing the route is caught
       // — the inverse drift of the test above.
       expect(paths.sort()).toEqual([
+        '/api/v1/admin/customers',
         '/api/v1/admin/inventory',
         '/api/v1/admin/inventory/adjustments',
         '/api/v1/admin/inventory/{skuCode}/history',
@@ -450,6 +457,7 @@ describe('API documentation', () => {
         '/api/v1/admin/orders/{orderNumber}',
         '/api/v1/admin/orders/{orderNumber}/invoice',
         '/api/v1/admin/orders/{orderNumber}/shipments',
+        '/api/v1/admin/payments',
         '/api/v1/admin/products',
         '/api/v1/admin/products/{slug}',
         '/api/v1/admin/products/{slug}/archive',

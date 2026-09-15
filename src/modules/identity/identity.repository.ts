@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gte, isNull, lte, sql, type SQL } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { appUser } from '../../db/schema/identity.js';
@@ -407,5 +407,121 @@ export function createIdentityRepository(deps: { db: Database }) {
 
       return updated.length > 0;
     },
+
+    /**
+     * **A page of the STORE's customers, for staff.** Increment 51. Read-only.
+     *
+     * Every other read in this file is keyed to ONE subject — by id from a verified token, or by
+     * email during authentication. This is the first that returns many, and it is a separate
+     * method with `Store` in its name rather than an optional `userId` on an existing one: a
+     * caller that forgot to pass an owner would otherwise silently get store-wide reach, which
+     * is exactly the hole an optional security parameter creates.
+     *
+     * `store_id` is still non-negotiable and comes from the staff member's verified token.
+     * Only the "one subject" narrowing is dropped.
+     *
+     * **Staff accounts are not filtered out.** A store's staff are rows in this table, and
+     * hiding them would make the list disagree with the database for no stated reason. What IS
+     * filtered is `deleted_at IS NULL`, matching every other read here — an erased customer is
+     * invisible to staff for the same reason they are invisible to authentication.
+     *
+     * Page and count share ONE predicate, so a caller on the last page is never told the total
+     * counted rows it cannot see. Ordered by `created_at DESC, id DESC`: `created_at` alone is
+     * not a total order — two accounts created in the same instant would tie — and a non-total
+     * order makes `offset` pagination silently skip and repeat rows between pages.
+     *
+     * One query for the page and one for the count, both over `app_user` alone. There is no
+     * join and no per-row lookup, so there is no N+1 to avoid.
+     */
+    async listStoreCustomers(params: {
+      storeId: string;
+      filters: AdminCustomerFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: AdminCustomerRecord[]; total: number }> {
+      const where = adminCustomerPredicate(params.storeId, params.filters);
+
+      const [items, [counted]] = await Promise.all([
+        executor(db)
+          .select(ADMIN_CUSTOMER_COLUMNS)
+          .from(appUser)
+          .where(where)
+          .orderBy(desc(appUser.createdAt), desc(appUser.id))
+          .limit(params.limit)
+          .offset(params.offset),
+        executor(db).select({ total: count() }).from(appUser).where(where),
+      ]);
+
+      return { items, total: counted?.total ?? 0 };
+    },
   };
+}
+
+/**
+ * The columns the staff customer list reads. **An allowlist, and the omissions are the point.**
+ *
+ * Selected explicitly rather than with `select()`: a bare select would silently start returning
+ * any column a later increment adds, which is how an internal field reaches a response body
+ * nobody meant to widen.
+ *
+ * Never selected, here or anywhere downstream:
+ *
+ *  - `password_hash` — a credential. It has exactly two legitimate readers, both of them
+ *    authentication paths with their own projections (`CREDENTIAL_COLUMNS`), and a list is
+ *    neither of them.
+ *  - `is_staff`, `is_superuser` — privilege flags. Publishing them would make an operator
+ *    screen double as a map of which accounts are worth attacking.
+ *  - `store_id` — tenancy is an invariant of the query, not a field to inspect.
+ *  - `deleted_at` — every row here is live by construction.
+ *
+ * Password-reset tokens and refresh sessions live in their own tables and are not reachable
+ * from this query at all.
+ */
+const ADMIN_CUSTOMER_COLUMNS = {
+  id: appUser.id,
+  email: appUser.email,
+  firstName: appUser.firstName,
+  lastName: appUser.lastName,
+  isActive: appUser.isActive,
+  createdAt: appUser.createdAt,
+  updatedAt: appUser.updatedAt,
+} as const;
+
+/** One customer as the staff list reads them. Structurally the projection above. */
+export type AdminCustomerRecord = {
+  readonly id: string;
+  readonly email: string;
+  readonly firstName: string;
+  readonly lastName: string;
+  readonly isActive: boolean;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+};
+
+/** The filters the staff customer list accepts. Every one of them is optional. */
+export type AdminCustomerFilters = {
+  readonly isActive?: boolean;
+  readonly createdFrom?: Date;
+  readonly createdTo?: Date;
+};
+
+/**
+ * The staff list's WHERE clause: tenancy and liveness, then whichever filters were supplied.
+ *
+ * A free function rather than a closure inside the factory because it takes everything it needs
+ * and captures nothing — which is what makes it readable as the one place tenancy is applied.
+ * The first two conjuncts are not optional; every filter below can only narrow, so no
+ * combination of query parameters widens the result past one tenant.
+ */
+function adminCustomerPredicate(storeId: string, filters: AdminCustomerFilters): SQL | undefined {
+  const clauses: SQL[] = [eq(appUser.storeId, storeId), isNull(appUser.deletedAt)];
+
+  if (filters.isActive !== undefined) clauses.push(eq(appUser.isActive, filters.isActive));
+
+  // BOTH BOUNDS INCLUSIVE, and documented as such on the endpoint. A half-open upper bound
+  // would silently drop every account created on the last instant a caller asked for.
+  if (filters.createdFrom !== undefined) clauses.push(gte(appUser.createdAt, filters.createdFrom));
+  if (filters.createdTo !== undefined) clauses.push(lte(appUser.createdAt, filters.createdTo));
+
+  return and(...clauses);
 }

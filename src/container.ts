@@ -1207,6 +1207,11 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       tokens,
       logger,
       rateLimit: { limiter: rateLimiter, ipPolicy, emailPolicy, refreshPolicy, logger },
+      // For the ONE staff route in this module: the store-wide customer list, added in
+      // Increment 51. Built here rather than inside the module even though identity owns
+      // authorization, because the guard is constructed against the scope loader and that
+      // wiring is the composition root's job.
+      requireStaff: scopeGuards.requireScope('staff'),
     }),
   );
   apiRouter.use(
@@ -1338,8 +1343,10 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       // The same capability every other domain router receives, adapted here for the same
       // reason: payments must not know which module mints tokens.
       verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
-      // No `requireStaff`: initiation is authenticated-customer only and there is no admin
-      // surface in the approved scope.
+      // For the ONE staff route in this module: the store-wide payment list, added in
+      // Increment 51. Built against identity's authorization loader, which payments must not
+      // import, so it arrives pre-built exactly as the catalogue's and orders' do.
+      requireStaff: scopeGuards.requireScope('staff'),
       requireIdempotency: requireIdempotency({ store: idempotency, logger }),
       logger,
     }),

@@ -6,25 +6,34 @@ import { validate, validatedBody, validatedParams, validatedQuery } from '../../
 import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
 import {
+  AdminListPaymentsQuerySchema,
   InitiatePaymentRequestSchema,
   ListPaymentsQuerySchema,
   OrderNumberParamsSchema,
+  toAdminPaymentListResponse,
   toPaymentListResponse,
   toHandoffResponse,
   toPaymentResponse,
+  type AdminListPaymentsQuery,
   type InitiatePaymentRequest,
   type ListPaymentsQuery,
   type OrderNumberParams,
 } from './dto.js';
+import type { AdminPaymentFilters } from './payments.repository.js';
 import type { PaymentsService } from './payments.service.js';
 
 /**
- * The payments module's customer HTTP surface: three customer routes.
+ * The payments module's HTTP surface: three customer routes and one staff route.
  *
- * **No admin or staff surface.** The approved scope names the customer read and initiation
- * endpoints as the minimum and excludes admin payment management outright. An operator payment
- * list would also need its own visibility rules — which payments a support agent may see, and
- * whether a provider reference is among them — and those are not decided.
+ * **The staff surface is exactly one route, and it is a READ** — `GET /admin/payments`, added
+ * in Increment 51. The two questions this file previously recorded as undecided now have
+ * answers: a support agent may see every payment in their OWN store and none from another, and
+ * a provider reference is NOT among the fields — `providerRef` is the handle used to act on the
+ * provider side, so it goes to the paying customer for the checkout handoff and to nobody else.
+ *
+ * **Still deliberately absent:** payment detail, refunds, reconciliation, and any staff
+ * mutation at all. Staff may see that a payment exists and what state it reached; changing one
+ * is not part of this increment and would need its own decisions about money.
  *
  * ## The middleware chain
  *
@@ -49,11 +58,26 @@ export function createPaymentsRoutes(deps: {
    * this module must not reach for — the same reason it arrives pre-built in `orders.routes.ts`.
    */
   requireIdempotency: RequestHandler;
+  /**
+   * The `staff` scope guard, pre-built by the composition root — the same instance the
+   * catalogue, inventory, orders and promotions routers use.
+   *
+   * Passed in for the reason `requireIdempotency` is: the privilege check belongs to identity,
+   * and this file only declares which privilege a route requires. Added in Increment 51 for
+   * `GET /admin/payments`, the module's first staff route.
+   *
+   * **Optional, and when it is absent the admin route is NOT MOUNTED.** Several existing suites
+   * mount this router directly to assert customer handler behaviour and have no scope loader.
+   * The route disappearing is a safe default in a way that "mount it without the guard" could
+   * never be — an unguarded store-wide payment list is a data breach, not a missing feature.
+   * `container.integration.test.ts` is what proves the composition root always supplies it.
+   */
+  requireStaff?: RequestHandler;
   logger: Logger;
   // Annotated rather than inferred, matching every other routes file: without it `tsc` cannot
   // name the router type portably under pnpm's nested `node_modules`.
 }): Router {
-  const { payments, requireIdempotency, logger } = deps;
+  const { payments, requireIdempotency, requireStaff, logger } = deps;
 
   const router = Router();
   const auth: RequestHandler = requireAuth({
@@ -194,5 +218,69 @@ export function createPaymentsRoutes(deps: {
     }),
   );
 
+  /**
+   * `GET /admin/payments` — a page of the store's payments. Increment 51.
+   *
+   * The module's first staff route. The header of this file recorded that there was "no admin
+   * or staff surface" and that the approved scope named only the customer read and initiation;
+   * this adds the read, and only the read.
+   *
+   * **Read-only, and deliberately narrow.** There is no payment detail route, no refund, no
+   * reconciliation and no mutation of any kind. Staff may see that a payment exists and what
+   * state it reached; acting on it is not part of this increment.
+   *
+   * Store-scoped from the verified staff token. There is no `storeId` parameter, and the query
+   * schema is strict, so supplying one is a `400` rather than something to be ignored.
+   *
+   * `providerRef` is NOT in the response. It is the handle used to act on the provider side and
+   * is handed to the paying customer for the checkout handoff alone — a staff list is a read,
+   * and a read does not need a capability.
+   *
+   * Failure modes: `400` for an unknown query parameter, a malformed instant, a status/method/
+   * provider outside the real vocabulary, a malformed order number, or an out-of-range `limit`;
+   * `401` unauthenticated; `403` without the `staff` scope.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/payments',
+      auth,
+      requireStaff,
+      validate({ query: AdminListPaymentsQuerySchema }),
+      asyncHandler(async (req, res) => {
+        const query = validatedQuery<AdminListPaymentsQuery>(req);
+
+        const page = await payments.listForStore({
+          storeId: requireUser(req).storeId,
+          limit: query.limit,
+          offset: query.offset,
+          filters: adminPaymentFilters(query),
+        });
+
+        res.status(200).json(toAdminPaymentListResponse(page));
+      }),
+    );
+  }
+
   return router;
+}
+
+/**
+ * The validated query, as the repository's filter shape.
+ *
+ * Instants are parsed here rather than in the schema so the DTO stays a description of the WIRE
+ * — strings in, strings out — and the `Date` conversion happens once, at the adapter boundary
+ * where every other parse in this file happens.
+ *
+ * Built key by key with `exactOptionalPropertyTypes` in mind: an absent filter must be an absent
+ * KEY, not a key holding `undefined`, or the repository would build a predicate against it.
+ */
+function adminPaymentFilters(query: AdminListPaymentsQuery): AdminPaymentFilters {
+  return {
+    ...(query.status === undefined ? {} : { status: query.status }),
+    ...(query.method === undefined ? {} : { method: query.method }),
+    ...(query.provider === undefined ? {} : { provider: query.provider }),
+    ...(query.orderNumber === undefined ? {} : { orderNumber: query.orderNumber }),
+    ...(query.createdFrom === undefined ? {} : { createdFrom: new Date(query.createdFrom) }),
+    ...(query.createdTo === undefined ? {} : { createdTo: new Date(query.createdTo) }),
+  };
 }
