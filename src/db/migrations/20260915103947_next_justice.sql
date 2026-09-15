@@ -1,0 +1,1 @@
+CREATE INDEX "ix_order_store_placed" ON "order" USING btree ("store_id","placed_at");

@@ -354,6 +354,32 @@ export const order = pgTable(
     index('ix_order_user_placed').on(t.userId, t.placedAt),
 
     /**
+     * **The admin order list, newest first** — `GET /admin/orders`, Increment 50.
+     *
+     * `ix_order_user_placed` cannot serve it: that index leads with `user_id`, and the admin list
+     * has no user to lead with. It filters on tenant alone and orders by `placed_at DESC`.
+     *
+     * Measured on 200,000 orders across three stores before this index was added, rather than
+     * assumed. Without it PostgreSQL sequentially scans the whole table and sorts the entire
+     * store partition — an `external merge` spilling 5 MB to disk — to return the first 25 rows:
+     *
+     * ```
+     *   without : Seq Scan + external merge (disk 5056kB), 2911 buffers, 33.4 ms
+     *   with    : Index Scan Backward + quicksort (26kB), 216 buffers,    0.25 ms
+     * ```
+     *
+     * 132x, and the shape matters more than the number: the unindexed plan's cost grows with
+     * every order the store ever takes, because a top-25 page still sorts everything. The indexed
+     * plan reads 25 rows and stops.
+     *
+     * `order_number` is deliberately NOT a third column. The query's tiebreaker is
+     * `order_number DESC`, but `placed_at` alone leaves the planner an Incremental Sort over one
+     * tiny group, which the measurement above already includes. A third column would widen every
+     * entry to remove a sort that costs 26kB.
+     */
+    index('ix_order_store_placed').on(t.storeId, t.placedAt),
+
+    /**
      * Ownership AND tenancy in one constraint: the order's user must exist, and its store must
      * be that user's store. A cross-store order is unrepresentable rather than merely refused
      * by application code.

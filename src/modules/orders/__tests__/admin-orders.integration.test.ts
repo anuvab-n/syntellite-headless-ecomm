@@ -183,8 +183,8 @@ describe('admin orders (integration)', () => {
       const cancelled = await api()
         .post(`/api/v1/users/me/orders/${orderNumber}/cancel`)
         .set({ Authorization: `Bearer ${token}` })
-        .send();
-      expect(cancelled.status).toBe(200);
+        .send({});
+      expect(cancelled.status, JSON.stringify(cancelled.body)).toBe(200);
       placed.push({
         orderNumber,
         expected: 'cancelled',
@@ -216,8 +216,8 @@ describe('admin orders (integration)', () => {
     const shipment = await api()
       .post(`/api/v1/admin/orders/${orderNumber}/shipments`)
       .set(asStaff())
-      .send({ carrier: 'Bluedart', trackingNumber: `TRK-${newId().slice(0, 8)}` });
-    expect(shipment.status).toBe(201);
+      .send({ carrier: 'Bluedart', trackingNumber: `TRK-${newId().replace(/-/gu, '')}` });
+    expect(shipment.status, JSON.stringify(shipment.body)).toBe(201);
     const shipmentId = shipment.body.shipment.id as string;
 
     if (state === 'shipment_pending') {
@@ -234,8 +234,8 @@ describe('admin orders (integration)', () => {
     const shipped = await api()
       .post(`/api/v1/admin/shipments/${shipmentId}/ship`)
       .set(asStaff())
-      .send();
-    expect(shipped.status).toBe(200);
+      .send({});
+    expect(shipped.status, JSON.stringify(shipped.body)).toBe(200);
 
     if (state === 'shipped') {
       placed.push({
@@ -251,8 +251,8 @@ describe('admin orders (integration)', () => {
     const delivered = await api()
       .post(`/api/v1/admin/shipments/${shipmentId}/deliver`)
       .set(asStaff())
-      .send();
-    expect(delivered.status).toBe(200);
+      .send({});
+    expect(delivered.status, JSON.stringify(delivered.body)).toBe(200);
     placed.push({
       orderNumber,
       expected: 'delivered',
@@ -624,35 +624,73 @@ describe('admin orders (integration)', () => {
         [otherUserId, otherStoreId, `foreign.${otherUserId}@example.com`],
       );
 
-      /*
-       * Clone every column, then override the five that make it another store's order. Written as
-       * a generic column copy rather than a hand-written INSERT so a column added to `order`
-       * later cannot make this silently insert a NULL and stop testing anything.
-       */
-      const { rows } = await container.db.pool.query<Record<string, unknown>>(
+      const { rows: sourceRows } = await container.db.pool.query<Record<string, unknown>>(
         'select * from "order" where order_number = $1',
         [source.orderNumber],
       );
-      const row = rows[0];
-      expect(row).toBeDefined();
-      if (!row) return;
+      const sourceOrder = sourceRows[0];
+      expect(sourceOrder).toBeDefined();
+      if (!sourceOrder) return;
 
-      const clone: Record<string, unknown> = {
-        ...row,
+      /*
+       * The cart is cloned FIRST: `fk_order_cart_store` points at `cart(id, store_id)`, so an
+       * order in another store needs a cart in that store. Inventing a bare UUID fails the
+       * constraint — which is the schema correctly refusing a half-tenanted row, and exactly the
+       * kind of thing this clone should respect rather than work around.
+       */
+      const foreignCartId = newId();
+      await cloneRow('cart', 'id', String(sourceOrder['cart_id']), {
+        id: foreignCartId,
+        store_id: otherStoreId,
+        user_id: otherUserId,
+      });
+
+      /*
+       * `address_id` is nulled rather than cloned. It is nullable on `order` precisely because
+       * the delivery address is SNAPSHOTTED onto the order at checkout — `ship_line1` and the
+       * rest survive the address being deleted. So a null here is a shape the schema already
+       * models, and cloning a third table to satisfy `fk_order_address_store` would add reach
+       * this test does not need.
+       */
+      await cloneRow('order', 'order_number', source.orderNumber, {
         id: newId(),
         store_id: otherStoreId,
         user_id: otherUserId,
-        cart_id: newId(),
+        cart_id: foreignCartId,
+        address_id: null,
         order_number: foreignOrderNumber,
-      };
+      });
+    }, 120_000);
 
+    /**
+     * Copy one row, overriding the columns that move it to another tenant.
+     *
+     * A generic column copy rather than a hand-written INSERT, so a column added to `order` or
+     * `cart` later cannot make this silently insert a NULL and quietly stop testing anything.
+     */
+    async function cloneRow(
+      table: string,
+      keyColumn: string,
+      keyValue: string,
+      overrides: Record<string, unknown>,
+    ): Promise<void> {
+      const { rows } = await container.db.pool.query<Record<string, unknown>>(
+        `select * from "${table}" where "${keyColumn}" = $1`,
+        [keyValue],
+      );
+      const row = rows[0];
+      expect(row, `no ${table} row with ${keyColumn}=${keyValue}`).toBeDefined();
+      if (!row) return;
+
+      const clone: Record<string, unknown> = { ...row, ...overrides };
       const columns = Object.keys(clone);
       const placeholders = columns.map((_c, i) => `$${i + 1}`).join(', ');
+
       await container.db.pool.query(
-        `insert into "order" (${columns.map((c) => `"${c}"`).join(', ')}) values (${placeholders})`,
+        `insert into "${table}" (${columns.map((c) => `"${c}"`).join(', ')}) values (${placeholders})`,
         columns.map((c) => clone[c]),
       );
-    }, 120_000);
+    }
 
     it('has actually created a foreign order — otherwise the next two cases prove nothing', async () => {
       const { rows } = await container.db.pool.query<{ count: string }>(
@@ -788,23 +826,25 @@ describe('admin orders (integration)', () => {
     });
 
     /**
-     * An index gap, recorded rather than fixed.
+     * The index the admin list is built on, asserted to exist.
      *
-     * The admin list filters on `store_id` and orders by `placed_at` — and `order` carries no
-     * index on that pair. `ix_order_user_placed` leads with `user_id`, so it cannot serve a
-     * store-wide scan. At this fixture's size the planner would choose a sequential scan anyway,
-     * so asserting the plan would prove nothing; this asserts the GAP instead, and fails the day
-     * somebody adds the index — at which point this test is the reminder to delete it.
+     * `ix_order_user_placed` leads with `user_id` and cannot serve a store-wide list, so this
+     * pair is the list's only usable access path. Measured on 200,000 orders before it was added:
+     * without it the planner sequentially scans and sorts the entire store partition on disk
+     * (`external merge`, 5 MB) to return 25 rows, 33.4 ms; with it, an Index Scan Backward reads
+     * 25 rows and stops, 0.25 ms.
      *
-     * Adding `ix_order_store_placed` is a migration, and migrations are out of scope for this
-     * increment. Flagged for approval rather than taken unilaterally.
+     * Asserted here rather than in a plan snapshot because at this fixture's size the planner
+     * would reasonably choose a sequential scan regardless — a plan assertion would fail for a
+     * correct database. The index's EXISTENCE is the invariant that survives table size.
      */
-    it('records that no (store_id, placed_at) index exists yet on `order`', async () => {
+    it('has the (store_id, placed_at) index the admin list depends on', async () => {
       const { rows } = await container.db.pool.query<{ indexdef: string }>(
         `select indexdef from pg_indexes where schemaname = 'public' and tablename = 'order'`,
       );
-      const covering = rows.filter((r) => /\(\s*store_id\s*,\s*placed_at/iu.test(r.indexdef));
-      expect(covering).toEqual([]);
+      const covering = rows.filter((r) => /\(\s*store_id\s*,\s*placed_at\s*\)/iu.test(r.indexdef));
+      expect(covering.length).toBe(1);
+      expect(covering[0]?.indexdef).toContain('ix_order_store_placed');
     });
   });
 });
