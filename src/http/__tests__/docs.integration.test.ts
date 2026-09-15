@@ -250,6 +250,18 @@ describe('API documentation', () => {
     apiRouter.get('/admin/orders/:orderNumber/shipments', (_req, res) => {
       res.status(200).json({ shipments: [] });
     });
+    apiRouter.get('/admin/orders', (_req, res) => {
+      res.status(200).json({ orders: [], pagination: { limit: 25, offset: 0, total: 0 } });
+    });
+    /*
+     * Registered AFTER `/admin/orders/fulfilment` above, mirroring production: in the real
+     * application the fulfilment queue is protected by the `onlyOrderNumber` guard in the orders
+     * router, and here by nothing more than declaration order. Either way, a stub that shadowed
+     * the queue would make the test above pass for the wrong reason.
+     */
+    apiRouter.get('/admin/orders/:orderNumber', (_req, res) => {
+      res.status(200).json({ order: {} });
+    });
     apiRouter.post('/admin/shipments/:id/ship', (_req, res) => {
       res.status(200).json({ ok: true });
     });
@@ -433,7 +445,9 @@ describe('API documentation', () => {
         '/api/v1/admin/option-values/{id}',
         '/api/v1/admin/options/{id}',
         '/api/v1/admin/options/{id}/values',
+        '/api/v1/admin/orders',
         '/api/v1/admin/orders/fulfilment',
+        '/api/v1/admin/orders/{orderNumber}',
         '/api/v1/admin/orders/{orderNumber}/invoice',
         '/api/v1/admin/orders/{orderNumber}/shipments',
         '/api/v1/admin/products',

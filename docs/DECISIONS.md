@@ -5173,3 +5173,95 @@ that must not have gaps, and incomplete until credit notes exist. The document a
 The series width is **six digits**, so a store may issue 999,999 invoices in one financial year
 before the format must widen. `formatInvoiceNumber` refuses a wider number loudly rather than
 producing a document the CHECK would reject.
+
+## 49. Phase 4 increment 50 — the admin order surface, and D1: `displayStatus`
+
+The Figma admin dashboard shows an order status vocabulary this backend does not have and,
+deliberately, will not grow. Its Orders tabs are `Pending`, `Confirmed`, `Processing`,
+`Delivered`, `Cancelled`, `Failed`, `Returned`, and its order timeline runs `Order Placed ->
+Confirmed -> Processing -> Ready To Ship -> Shipped -> Out for Delivery -> Delivered`.
+
+`order.status` has exactly two values, `placed` and `cancelled`, and §43 records at length why:
+payment lives in `payment`, fulfilment lives in `shipment`, and folding either into the order's
+status is "the shortcut that makes both impossible to model properly later". That decision is not
+reopened here.
+
+### The decision
+
+**`displayStatus` is a DERIVED PRESENTATION FIELD, computed on read, stored nowhere.**
+
+It is composed from the three lifecycles that already exist — `order.status`, the order's payment
+state, and the order's shipment state — by one pure function,
+`modules/orders/order-display-status.ts`, which reaches no database and holds no clock. It appears
+only on the admin order responses. **No customer response gains this field**, because the customer
+contract is already published and a status the customer can see is a status the customer will
+rely on.
+
+The alternative — adding real statuses to `order.status` — was rejected. It would rewrite the
+orders module, contradict §43, and make the three lifecycles able to disagree with each other,
+which is the failure mode the separation exists to prevent. A derived field cannot disagree with
+its sources; it IS its sources.
+
+### The mapping, in precedence order
+
+First match wins. The order of the rows is the whole specification — several inputs match more
+than one row, and the earlier row is the answer.
+
+| #   | Condition                                   | `displayStatus` |
+| --- | ------------------------------------------- | --------------- |
+| 1   | `order.status = 'cancelled'`                | `cancelled`     |
+| 2   | shipment is `delivered`                     | `delivered`     |
+| 3   | shipment is `shipped`                       | `shipped`       |
+| 4   | shipment is `pending`                       | `processing`    |
+| 5   | payment is `failed` or `expired`            | `failed`        |
+| 6   | payment is `succeeded`                      | `confirmed`     |
+| 7   | payment is `pending` and method is `cod`    | `confirmed`     |
+| 8   | payment is `pending` and method is `online` | `pending`       |
+| 9   | no payment row exists                       | `pending`       |
+
+**Why fulfilment outranks payment.** Rows 2–4 sit above rows 5–8 because a shipment is downstream
+of a payment: if goods have moved, that is the more advanced fact about the order, and reporting
+`failed` for a parcel already delivered would be wrong in the direction that matters. The
+combination is close to unreachable today — `requirePaymentPrerequisite` guards shipment creation
+— but a rule that depends on another module continuing to guard something is a rule that breaks
+silently, so the precedence is stated rather than assumed.
+
+**Why `cancelled` outranks everything.** It is the one status that is a fact about the order
+itself rather than about money or goods. Cancellation already refuses an order with a blocking
+shipment, so row 1 cannot mask a delivery in practice; it is first so that it cannot in principle.
+
+**Why COD pending is `confirmed` (row 7).** A COD order is agreed the moment it is placed — there
+is nothing to wait for, and the money arrives at the door. Reporting it as `pending` alongside an
+unpaid online order would put the two in the same operational bucket when one needs chasing and
+the other needs packing. This is the single row where the mapping asserts a business meaning
+rather than restating a state, and it is the row to revisit first if the dashboard looks wrong.
+
+### Two UI statuses are NOT reachable, and are not faked
+
+`ready_to_ship` and `returned` are in the Figma and are absent from this mapping.
+
+- **`ready_to_ship`** would mean "a shipment exists and has an AWB". There is no AWB column and
+  no carrier integration; `shipment.trackingNumber` is free text a human may or may not have
+  typed. Every such order reports `processing` (row 4) instead. When the carrier increment lands
+  it adds a row between 3 and 4 and nothing else changes.
+- **`returned`** would mean "a return against this order reached `completed`". Returns cannot
+  reach `completed` yet — the transitions exist in `return.state.ts` but the routes do not — and
+  the admin order read deliberately does not query the returns module, because a third port for
+  a status that is currently unreachable is a port that would be built untested.
+
+Emitting a status the system cannot actually justify is worse than omitting it: the dashboard
+would show a bucket that never fills, and nobody could tell whether that meant "no such orders"
+or "broken". Both are documented as absent on the endpoint itself.
+
+### What is deliberately not in the derivation
+
+No clock. Nothing ages an order into a different status after N days, so the same inputs always
+produce the same answer and the function is exhaustively testable by enumeration rather than by
+sampling. No money: the mapping reads a payment's STATUS and METHOD and never its amount.
+
+### Scope of this increment
+
+`GET /admin/orders` and `GET /admin/orders/{orderNumber}`, both read-only, both store-scoped from
+the staff member's verified token. No migration and no schema change. The admin order list is the
+surface §46 declined to invent as a side effect of the invoice route; it is invented here, on
+purpose, with its own filtering, pagination and PII decisions.

@@ -986,6 +986,137 @@ const ORDER = {
   },
 } as const;
 
+/**
+ * The composed order status the admin dashboard shows. §49 in `docs/DECISIONS.md`.
+ *
+ * Derived on read from `order.status`, the payment state and the shipment state. Stored nowhere,
+ * and absent from every customer-facing response.
+ */
+const ORDER_DISPLAY_STATUS = {
+  type: 'string',
+  enum: ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled', 'failed'],
+  description:
+    'Composed on read from the three lifecycles, first match wins: `cancelled` when the order ' +
+    'is cancelled; else `delivered`/`shipped`/`processing` from the shipment; else `failed` for ' +
+    'a failed or expired payment, `confirmed` for a succeeded one or a pending COD one, and ' +
+    '`pending` otherwise. **`ready_to_ship` and `returned` are NOT produced** — the first needs ' +
+    'an AWB this version has no column for, the second needs a return lifecycle whose routes do ' +
+    'not exist yet. Neither is emitted as an empty bucket, because a status that never appears ' +
+    'is indistinguishable from a broken one.',
+} as const;
+
+/** The customer on an admin order row. An allowlist — never a credential or a privilege flag. */
+const ADMIN_ORDER_CUSTOMER = {
+  type: 'object',
+  description:
+    'Who placed the order. Four fields, chosen deliberately: `passwordHash`, `isStaff` and ' +
+    '`isSuperuser` are never selected from the database, never carried on the record type, and ' +
+    'never mapped onto a response.',
+  required: ['id', 'email', 'firstName', 'lastName'],
+  properties: {
+    id: { type: 'string', format: 'uuid' },
+    email: { type: 'string', format: 'email' },
+    firstName: { type: 'string' },
+    lastName: { type: 'string' },
+  },
+} as const;
+
+/** The payment state on an admin order. A status and a method — never an amount or a provider. */
+const ADMIN_ORDER_PAYMENT = {
+  type: 'object',
+  required: ['status', 'method'],
+  properties: {
+    status: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+    method: { type: 'string', enum: ['online', 'cod'] },
+  },
+} as const;
+
+/** The shipment state on an admin order. */
+const ADMIN_ORDER_SHIPMENT = {
+  type: 'object',
+  required: ['status'],
+  properties: {
+    status: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+  },
+} as const;
+
+/**
+ * One row of the admin order list. Mirrors `AdminOrderSummaryResponse` in `modules/orders/dto.ts`.
+ *
+ * Deliberately NOT the full `Order`: a list row carries no items and no delivery address, so a
+ * page of a hundred orders does not ship a hundred addresses to render a table that shows none
+ * of them. The detail endpoint carries both.
+ */
+const ADMIN_ORDER_SUMMARY = {
+  type: 'object',
+  required: [
+    'orderNumber',
+    'displayStatus',
+    'status',
+    'currency',
+    'total',
+    'taxTotal',
+    'grandTotal',
+    'placedAt',
+    'customer',
+    'payment',
+    'shipment',
+  ],
+  properties: {
+    orderNumber: { type: 'string', example: 'ORD-20260904-7QK4M2' },
+    displayStatus: ORDER_DISPLAY_STATUS,
+    status: {
+      type: 'string',
+      enum: ['placed', 'cancelled'],
+      description:
+        'The underlying `order.status`, unchanged. The order lifecycle has exactly these two ' +
+        'values; payment and fulfilment live in their own tables. See `displayStatus` for the ' +
+        'composed view, and §43 for why the three are not merged.',
+    },
+    currency: { type: 'string', example: 'INR' },
+    total: { type: 'string', description: 'The goods total, after the merchandise discount.' },
+    taxTotal: { type: 'string' },
+    grandTotal: { type: 'string', description: 'total + taxTotal — the payable amount.' },
+    placedAt: { type: 'string', format: 'date-time' },
+    customer: { $ref: '#/components/schemas/AdminOrderCustomer' },
+    payment: {
+      description: 'The payment state, or null when the order has no payment row at all.',
+      oneOf: [{ $ref: '#/components/schemas/AdminOrderPayment' }, { type: 'null' }],
+    },
+    shipment: {
+      description: 'The shipment state, or null when no shipment has been created.',
+      oneOf: [{ $ref: '#/components/schemas/AdminOrderShipment' }, { type: 'null' }],
+    },
+  },
+} as const;
+
+/**
+ * The admin order detail: the customer's own `Order` document, plus the four operator fields.
+ *
+ * Composed with `allOf` rather than restated, mirroring how `AdminOrderDetailResponse` spreads
+ * `toOrderResponse` — so the money, the tax snapshot, the promotion and the line items cannot
+ * drift between the customer and admin audiences.
+ */
+const ADMIN_ORDER_DETAIL = {
+  allOf: [
+    { $ref: '#/components/schemas/Order' },
+    {
+      type: 'object',
+      required: ['displayStatus', 'customer', 'payment', 'shipment'],
+      properties: {
+        displayStatus: ORDER_DISPLAY_STATUS,
+        customer: { $ref: '#/components/schemas/AdminOrderCustomer' },
+        payment: {
+          oneOf: [{ $ref: '#/components/schemas/AdminOrderPayment' }, { type: 'null' }],
+        },
+        shipment: {
+          oneOf: [{ $ref: '#/components/schemas/AdminOrderShipment' }, { type: 'null' }],
+        },
+      },
+    },
+  ],
+} as const;
+
 /** One line of the cart. Mirrors `CartItemResponse` in `modules/cart/dto.ts`. */
 const CART_ITEM = {
   type: 'object',
@@ -1646,6 +1777,11 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         OrderLine: ORDER_LINE,
         OrderAddress: ORDER_ADDRESS,
         OrderPromotion: ORDER_PROMOTION,
+        AdminOrderCustomer: ADMIN_ORDER_CUSTOMER,
+        AdminOrderPayment: ADMIN_ORDER_PAYMENT,
+        AdminOrderShipment: ADMIN_ORDER_SHIPMENT,
+        AdminOrderSummary: ADMIN_ORDER_SUMMARY,
+        AdminOrderDetail: ADMIN_ORDER_DETAIL,
         Payment: PAYMENT,
         PaymentEvent: PAYMENT_EVENT,
         PaymentHandoff: PAYMENT_HANDOFF,
@@ -5102,6 +5238,217 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/orders': {
+        get: {
+          tags: ['Orders'],
+          summary: 'List the store’s orders (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every order in the store**, whosever it is. Requires the `staff` scope.',
+            '',
+            'The browsable operator surface that `GET /admin/orders/{orderNumber}/invoice`',
+            'deliberately declined to invent as a side effect of an invoice request. Its three',
+            'open questions are answered here on their own terms:',
+            '',
+            '| Question | Answer |',
+            '| --- | --- |',
+            '| Filtering | `displayStatus`, `paymentStatus`, `shipmentStatus`, a placed-at range, and `q` |',
+            '| Pagination | the usual `limit`/`offset`; page and total share one predicate |',
+            '| How much of another customer staff may see | an id, an email and a name — **no address** |',
+            '',
+            '### `displayStatus`, and why it is derived',
+            '',
+            'The order lifecycle has two states, `placed` and `cancelled`. Payment lives in the',
+            'payment table and fulfilment in the shipment table, and §43 records why folding them',
+            'together is the shortcut that makes all three impossible to model properly later.',
+            '',
+            'So the dashboard’s single status is **composed on read** from all three and stored',
+            'nowhere — see the `displayStatus` schema for the precedence table, and §49 in',
+            '`docs/DECISIONS.md` for the full argument. Filtering by it happens in the database,',
+            'before the page is cut, so a filtered page is a full page and the total agrees with',
+            'it.',
+            '',
+            '**Two statuses in the dashboard design are not produced**: `ready_to_ship` needs an',
+            'AWB column that does not exist, and `returned` needs a return to reach `completed`,',
+            'which no route currently permits.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, so there',
+            'is nothing a client could widen. Ownership within the store is what is relaxed, and',
+            'that is the entire meaning of “admin” here.',
+            '',
+            'Ordered by `placedAt` descending, then `orderNumber` descending, so the ordering is',
+            'total and a page boundary is stable when two orders share an instant.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'displayStatus',
+              in: 'query',
+              required: false,
+              description: 'The dashboard tab. Applied in the database, not after paging.',
+              schema: ORDER_DISPLAY_STATUS,
+            },
+            {
+              name: 'paymentStatus',
+              in: 'query',
+              required: false,
+              description:
+                'The raw payment status. Orders with no payment row match no value here — use ' +
+                '`displayStatus=pending` for those.',
+              schema: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+            },
+            {
+              name: 'shipmentStatus',
+              in: 'query',
+              required: false,
+              description: 'The raw shipment status. Orders with no shipment match no value here.',
+              schema: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+            },
+            {
+              name: 'placedFrom',
+              in: 'query',
+              required: false,
+              description:
+                'Inclusive lower bound on `placedAt`. A full ISO-8601 instant WITH an offset — ' +
+                'the client owns the timezone, deliberately: a bare date would force the server ' +
+                'to pick one, and every choice is wrong for somebody.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-01T00:00:00+05:30',
+            },
+            {
+              name: 'placedTo',
+              in: 'query',
+              required: false,
+              description: 'Inclusive upper bound on `placedAt`. Same format as `placedFrom`.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-30T23:59:59+05:30',
+            },
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description:
+                'Case-insensitive substring of the **order number or the customer’s email**. ' +
+                'Deliberately not a search across names or addresses — a wider search is a wider ' +
+                'disclosure, and these two are what an operator already has from the customer. ' +
+                '`%` and `_` are escaped, so a typo cannot become a match-everything scan.',
+              schema: { type: 'string', minLength: 1, maxLength: 320 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s orders, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders', 'pagination'],
+                    properties: {
+                      orders: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminOrderSummary' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}': {
+        get: {
+          tags: ['Orders'],
+          summary: 'Read any order in the store (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The same order document the customer sees, for **any order in the store**, plus the',
+            'four things an operator needs and a customer does not: the composed `displayStatus`,',
+            'who placed it, where its payment stands and where its shipment stands.',
+            '',
+            'Requires the `staff` scope. Store-scoped and not owner-scoped — another customer’s',
+            'order in the same store is NOT a `404` here, which is the point of the route.',
+            '',
+            'The order body is composed from the customer response rather than restated, so the',
+            'money, the tax snapshot, the promotion and the line items cannot drift between the',
+            'two audiences.',
+            '',
+            '### A malformed order number is a `404`, not a `400`',
+            '',
+            'Unusually for this API, and deliberately. This path is one segment under',
+            '`/admin/orders/`, and it shares that shape with `GET /admin/orders/fulfilment`, which',
+            'already exists. A path segment that is not shaped like an order number is therefore',
+            'declined by this route and left to the rest of the application, so the fulfilment',
+            'queue keeps working — measured, not assumed.',
+            '',
+            'The side effect is a better answer anyway: a `400` that distinguished “wrong shape”',
+            'from “no such order” would tell an unauthorized prober which path shapes are real.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The order, with its customer and its lifecycle states.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['order'],
+                    properties: {
+                      order: { $ref: '#/components/schemas/AdminOrderDetail' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such order in this store. An unknown number, another store’s order, and a malformed order number are all deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/users/me/orders': {
         get: {
           tags: ['Orders'],
@@ -5118,7 +5465,9 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'The page and the total share one predicate, so a caller on the last page is never',
             'told the total counted rows it cannot see.',
             '',
-            'There is no staff or admin equivalent in this version.',
+            'The staff equivalent is `GET /admin/orders`, which is store-scoped rather than',
+            'owner-scoped and carries a composed `displayStatus`. This route is unchanged by it —',
+            'no customer response gained a field.',
           ].join('\n'),
           parameters: [
             {

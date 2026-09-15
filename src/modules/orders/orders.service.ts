@@ -27,6 +27,8 @@ import { ORDER_AUDIT, ORDER_RESOURCE } from './orders.events.js';
 import {
   CANCELLABLE_ORDER_STATUSES,
   CANCELLED_ORDER_STATUS,
+  type AdminOrderFilters,
+  type AdminOrderRecord,
   type OrderLineRecord,
   type OrderRecord,
   type OrdersRepository,
@@ -467,6 +469,17 @@ export class CheckoutCartNotAvailable extends Conflict {
 /** An order and its lines, exactly as they were snapshotted. */
 export type OrderView = {
   readonly order: OrderRecord;
+  readonly lines: readonly OrderLineRecord[];
+};
+
+/**
+ * The same, for the admin surface: the header carries its customer and its two lifecycle states.
+ *
+ * A distinct type rather than an optional widening of `OrderView`, so a customer-facing mapper
+ * cannot be handed one of these by accident and start publishing another customer's email.
+ */
+export type AdminOrderView = {
+  readonly order: AdminOrderRecord;
   readonly lines: readonly OrderLineRecord[];
 };
 
@@ -1473,6 +1486,66 @@ export function createOrdersService(deps: {
         limit: params.limit,
         offset: params.offset,
       };
+    },
+
+    /**
+     * **A page of the STORE's orders, for staff.** Increment 50.
+     *
+     * The admin counterpart of `listOrders`, and named `Store` rather than `Owned` for the same
+     * reason `getStoreOrderForInvoice` is: the access predicate is tenancy alone, and the name
+     * says so. The authorization boundary is entirely in the routes file (`auth -> requireStaff`);
+     * this method assumes it has already been enforced, exactly as every other admin service
+     * method does.
+     *
+     * **No lines are loaded.** `listOrders` fetches them because the customer's list renders
+     * them; the admin list renders a table of statuses and money, and a hundred orders' worth of
+     * line items to show none of them is a page nobody asked for. The detail read has them.
+     *
+     * `storeId` comes from the caller's verified token and is passed through untouched — there is
+     * no parameter on this method a client could use to widen it.
+     */
+    async listStoreOrders(params: {
+      storeId: string;
+      filters: AdminOrderFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly AdminOrderRecord[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listStoreOrders(params);
+
+      return {
+        items: page.items,
+        total: page.total,
+        limit: params.limit,
+        offset: params.offset,
+      };
+    },
+
+    /**
+     * One order in this store with its lines, its customer and its lifecycle states. Staff read.
+     *
+     * Two queries, not one: the header with its joins, then the lines. Folding the lines into the
+     * same statement would multiply the header across them and force the payment and shipment
+     * columns to be de-duplicated in JavaScript, which is a worse trade than one extra round trip
+     * on a single-order read.
+     *
+     * `404` for an unknown number and for another store's order alike — indistinguishable, the
+     * §25 rule. Another CUSTOMER's order in the same store is deliberately not a 404: that is the
+     * entire point of an admin surface.
+     */
+    async getStoreOrder(params: { storeId: string; orderNumber: string }): Promise<AdminOrderView> {
+      const header = await repository.findStoreOrderDetailByNumber(params);
+      if (!header) throw new NotFound('order');
+
+      const lines = await repository.listOrderLines({
+        orderId: header.id,
+        storeId: params.storeId,
+      });
+      return { order: header, lines };
     },
   };
 }

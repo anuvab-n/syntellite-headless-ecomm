@@ -1,8 +1,24 @@
-import { and, count, desc, eq, inArray, isNull } from 'drizzle-orm';
+import {
+  and,
+  count,
+  desc,
+  eq,
+  gte,
+  ilike,
+  inArray,
+  isNull,
+  lte,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { address } from '../../db/schema/address.js';
+import { appUser } from '../../db/schema/identity.js';
 import { order, orderLine, orderStatusHistory } from '../../db/schema/orders.js';
+import { payment } from '../../db/schema/payments.js';
+import { shipment } from '../../db/schema/shipments.js';
 
 /**
  * The order lifecycle vocabulary, re-exported so nothing outside this module names the table.
@@ -36,6 +52,26 @@ import { executor } from '../../db/transaction.js';
  * here writes an address, and the only thing decided about one is whether this customer owns it
  * and it is still live. The alternative — a port into the addresses module — would move the
  * ownership predicate out of the query, which is the one place §25 requires it to be.
+ *
+ * ## Why this file may also name `app_user`, `payment` and `shipment`
+ *
+ * Increment 50 — the admin order surface. `displayStatus` (§49) is composed from three
+ * lifecycles, and the admin list must be able to FILTER and SORT on the result. Reading the
+ * payment and shipment state through the existing ports would mean one round trip per order to
+ * assemble a page and no way to filter in the database at all — an N+1 by construction, and a
+ * filter applied in JavaScript after the page had already been cut, which would produce short
+ * pages and a total nobody could trust.
+ *
+ * `schema-only-in-repositories` permits exactly this, and `no-cross-module-imports` is not
+ * engaged: a table is not a module. The reach is deliberately narrow and read-only — nothing
+ * here writes to any of the three, and the columns read are a status, a method, and the three
+ * customer name fields the admin list shows. `password_hash`, `is_staff` and `is_superuser` are
+ * never selected, here or anywhere downstream.
+ *
+ * Both joins are safe against row multiplication: an order has at most one payment
+ * (`uq_payment_order`) and at most one shipment (the whole-order model `SHIPMENT_ALREADY_EXISTS`
+ * enforces), so a `LEFT JOIN` on either cannot turn one order into two rows. If split shipments
+ * ever land, this becomes a `DISTINCT ON` and the tests below are what will say so.
  */
 
 export type OrdersRepository = ReturnType<typeof createOrdersRepository>;
@@ -182,6 +218,91 @@ const ORDER_COLUMNS = {
   shipCountryCode: order.shipCountryCode,
   placedAt: order.placedAt,
 } as const;
+
+/**
+ * The customer identity an admin order row carries. **An allowlist, and a short one.**
+ *
+ * Three columns, chosen because the admin list shows "who placed this" and nothing more. The
+ * omissions are the point: `password_hash` is a credential, `is_staff` and `is_superuser` are
+ * privilege flags that would let an operator screen double as a privilege map, and neither has
+ * any business travelling with an order. Written as an explicit projection rather than
+ * `getTableColumns(appUser)` so that a column added to `app_user` later cannot arrive here by
+ * default — the §25 rule that a response is an allowlist, applied one layer earlier.
+ */
+const ADMIN_ORDER_CUSTOMER_COLUMNS = {
+  customerId: appUser.id,
+  customerEmail: appUser.email,
+  customerFirstName: appUser.firstName,
+  customerLastName: appUser.lastName,
+} as const;
+
+/**
+ * The three lifecycle facts, joined. `null` on either side means "no such row", which is a
+ * distinct answer from any status — see `deriveOrderDisplayStatus`, which relies on it.
+ */
+const ADMIN_ORDER_CONTEXT_COLUMNS = {
+  paymentStatus: payment.status,
+  paymentMethod: payment.method,
+  shipmentStatus: shipment.status,
+} as const;
+
+const ADMIN_ORDER_COLUMNS = {
+  ...ORDER_COLUMNS,
+  ...ADMIN_ORDER_CUSTOMER_COLUMNS,
+  ...ADMIN_ORDER_CONTEXT_COLUMNS,
+} as const;
+
+/** One order as the admin surface reads it: the header, its customer, and its two contexts. */
+export type AdminOrderRecord = OrderRecord & {
+  readonly customerId: string;
+  readonly customerEmail: string;
+  readonly customerFirstName: string;
+  readonly customerLastName: string;
+  readonly paymentStatus: string | null;
+  readonly paymentMethod: string | null;
+  readonly shipmentStatus: string | null;
+};
+
+/**
+ * **`displayStatus` as SQL — the second implementation of §49's table, and the only one.**
+ *
+ * `deriveOrderDisplayStatus` is the runtime source of the VALUE on every response. This fragment
+ * exists solely so the list can FILTER on that value in the database rather than in JavaScript
+ * after the page has been cut. Two implementations of one rule is a drift risk, and it is
+ * accepted deliberately rather than by accident:
+ *
+ *  - The branches below are in the same order, with the same conditions, as the `if` chain in
+ *    `order-display-status.ts`. Read side by side they diff by eye.
+ *  - `admin-orders.integration.test.ts` seeds every reachable combination and asserts that
+ *    filtering by each status returns exactly the orders the TS function maps to it. Drift is
+ *    caught by a failing test, not prevented by a comment.
+ *
+ * The alternative — deriving in SQL and deleting the TS function — was rejected because it would
+ * make the rule untestable without a database and unavailable to the detail endpoint, which has
+ * no filter to apply.
+ */
+const displayStatusSql: SQL<string> = sql<string>`
+  case
+    when ${order.status} = 'cancelled' then 'cancelled'
+    when ${shipment.status} = 'delivered' then 'delivered'
+    when ${shipment.status} = 'shipped' then 'shipped'
+    when ${shipment.status} = 'pending' then 'processing'
+    when ${payment.status} is null then 'pending'
+    when ${payment.status} in ('failed', 'expired') then 'failed'
+    when ${payment.status} = 'succeeded' then 'confirmed'
+    when ${payment.status} = 'pending' and ${payment.method} = 'cod' then 'confirmed'
+    else 'pending'
+  end`;
+
+/** The filters the admin list accepts. Every one of them is optional. */
+export type AdminOrderFilters = {
+  readonly displayStatus?: string;
+  readonly paymentStatus?: string;
+  readonly shipmentStatus?: string;
+  readonly placedFrom?: Date;
+  readonly placedTo?: Date;
+  readonly q?: string;
+};
 
 export function createOrdersRepository(deps: { db: Database }) {
   const { db } = deps;
@@ -656,5 +777,143 @@ export function createOrdersRepository(deps: { db: Database }) {
         )
         .orderBy(orderLine.skuCode);
     },
+
+    /**
+     * **A page of the STORE's orders, whosever they are, with their payment and shipment state.**
+     *
+     * The admin counterpart of `listOrdersForUser`, and a separate method for the reason
+     * `findStoreOrderByNumber` is separate from `findOwnedOrderByNumber`: a caller that forgot
+     * to pass an owner would otherwise silently get store-wide reach. Two names, two predicates,
+     * and the narrower one stays the default.
+     *
+     * `store_id` is NOT relaxed and never comes from input — the caller takes it from the staff
+     * member's verified token. Only ownership within the store is dropped, which is the entire
+     * meaning of "admin" here.
+     *
+     * **One query, two joins, no N+1.** The payment and shipment state travel with the order row
+     * rather than being fetched per order, so a page of 100 orders is one round trip and the
+     * `displayStatus` filter is applied by the database BEFORE the page is cut. Filtering after
+     * the fact would return short pages and a total that counted rows the filter then removed.
+     *
+     * Page and count share ONE predicate, so a caller on the last page is never told the total
+     * counted rows it cannot see — the §28 rule `listOrdersForUser` already follows. Ordered by
+     * `placed_at DESC` then `order_number DESC` so the ordering is total and a page boundary is
+     * stable when two orders share an instant.
+     */
+    async listStoreOrders(params: {
+      storeId: string;
+      filters: AdminOrderFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: AdminOrderRecord[]; total: number }> {
+      const where = adminOrderPredicate(params.storeId, params.filters);
+
+      /*
+       * The joins are repeated on both halves rather than factored into a shared builder: the
+       * count MUST see the same join graph as the page, because `displayStatus` and the shipment
+       * and payment filters are expressed over the joined columns. A count over `order` alone
+       * would silently ignore every one of them.
+       */
+      const [items, [totals]] = await Promise.all([
+        executor(db)
+          .select(ADMIN_ORDER_COLUMNS)
+          .from(order)
+          .innerJoin(appUser, eq(appUser.id, order.userId))
+          .leftJoin(payment, and(eq(payment.orderId, order.id), eq(payment.storeId, order.storeId)))
+          .leftJoin(
+            shipment,
+            and(eq(shipment.orderId, order.id), eq(shipment.storeId, order.storeId)),
+          )
+          .where(where)
+          .orderBy(desc(order.placedAt), desc(order.orderNumber))
+          .limit(params.limit)
+          .offset(params.offset),
+        executor(db)
+          .select({ total: count() })
+          .from(order)
+          .innerJoin(appUser, eq(appUser.id, order.userId))
+          .leftJoin(payment, and(eq(payment.orderId, order.id), eq(payment.storeId, order.storeId)))
+          .leftJoin(
+            shipment,
+            and(eq(shipment.orderId, order.id), eq(shipment.storeId, order.storeId)),
+          )
+          .where(where),
+      ]);
+
+      return { items, total: totals?.total ?? 0 };
+    },
+
+    /**
+     * One order in this store with its payment and shipment state, for the admin detail read.
+     *
+     * The same join graph as the list, so the `displayStatus` the detail reports can never
+     * disagree with the one the list reported for the same order. Store-scoped and NOT
+     * user-scoped, exactly as `findStoreOrderByNumber` is; `undefined` for an unknown number and
+     * for another store's order alike, so the caller answers one `404` and reveals nothing.
+     */
+    async findStoreOrderDetailByNumber(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<AdminOrderRecord | undefined> {
+      const [row] = await executor(db)
+        .select(ADMIN_ORDER_COLUMNS)
+        .from(order)
+        .innerJoin(appUser, eq(appUser.id, order.userId))
+        .leftJoin(payment, and(eq(payment.orderId, order.id), eq(payment.storeId, order.storeId)))
+        .leftJoin(
+          shipment,
+          and(eq(shipment.orderId, order.id), eq(shipment.storeId, order.storeId)),
+        )
+        .where(and(eq(order.orderNumber, params.orderNumber), eq(order.storeId, params.storeId)))
+        .limit(1);
+      return row;
+    },
   };
+}
+
+/**
+ * The admin list's WHERE clause: tenancy, then whichever filters were supplied.
+ *
+ * A free function rather than a closure inside the factory because it takes everything it needs
+ * and captures nothing — which is what makes it readable as the one place tenancy is applied.
+ * `storeId` is the first conjunct and is not optional; every filter below can only narrow.
+ */
+function adminOrderPredicate(storeId: string, filters: AdminOrderFilters): SQL | undefined {
+  const clauses: SQL[] = [eq(order.storeId, storeId)];
+
+  /*
+   * Compared against the CASE expression itself rather than against a set of raw-column
+   * conditions unrolled per status. Unrolling would be a THIRD statement of §49's table, and the
+   * one most likely to drift, because each status would be a hand-written combination nobody
+   * reads next to the other two.
+   */
+  if (filters.displayStatus !== undefined) {
+    clauses.push(sql`${displayStatusSql} = ${filters.displayStatus}`);
+  }
+
+  if (filters.paymentStatus !== undefined) clauses.push(eq(payment.status, filters.paymentStatus));
+  if (filters.shipmentStatus !== undefined) {
+    clauses.push(eq(shipment.status, filters.shipmentStatus));
+  }
+
+  // Inclusive on both ends: the route parses whole days, and a half-open range would silently
+  // drop every order placed on the `to` date.
+  if (filters.placedFrom !== undefined) clauses.push(gte(order.placedAt, filters.placedFrom));
+  if (filters.placedTo !== undefined) clauses.push(lte(order.placedAt, filters.placedTo));
+
+  /*
+   * The operator's search box: an order number or a customer email, case-insensitively, as a
+   * substring. `%` and `_` in the term are escaped first — an unescaped `%` would turn a typo
+   * into a full table scan that matched everything, which reads as "the filter is broken".
+   *
+   * Deliberately NOT a search over names or addresses. A wider search is a wider disclosure, and
+   * the two fields here are the two an operator already has in hand from the customer.
+   */
+  if (filters.q !== undefined && filters.q.length > 0) {
+    const term = `%${filters.q.replace(/([\\%_])/gu, '\\$1')}%`;
+    const match = or(ilike(order.orderNumber, term), ilike(appUser.email, term));
+    if (match) clauses.push(match);
+  }
+
+  return and(...clauses);
 }

@@ -8,12 +8,17 @@ import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
 import { renderInvoice, type InvoiceDocumentRecord, type InvoiceInput } from './invoice.js';
 import type { OrdersService } from './orders.service.js';
+import type { AdminOrderFilters } from './orders.repository.js';
 import {
+  AdminListOrdersQuerySchema,
   CheckoutRequestSchema,
   ListOrdersQuerySchema,
   OrderNumberParamsSchema,
+  toAdminOrderDetailResponse,
+  toAdminOrderListResponse,
   toOrderListResponse,
   toOrderResponse,
+  type AdminListOrdersQuery,
   type CheckoutRequest,
   type ListOrdersQuery,
   type OrderNumberParams,
@@ -398,5 +403,138 @@ export function createOrdersRoutes(deps: {
     }),
   );
 
+  /**
+   * `GET /admin/orders` — a page of the store's orders. Increment 50.
+   *
+   * The surface §46 declined to invent as a side effect of the invoice route. It is invented
+   * here on its own terms, and the three questions that increment listed are answered:
+   *
+   *  - **Filtering** — by the dashboard's composed `displayStatus` (§49), by the raw payment and
+   *    shipment statuses, by a placed-at range, and by a substring of the order number or the
+   *    customer's email. All applied in the database, before the page is cut.
+   *  - **Pagination** — the project's `limit`/`offset` contract, with the page and the total
+   *    sharing one predicate.
+   *  - **How much of another customer staff may see** — an id, an email and a name. A list row
+   *    carries no delivery address at all; the detail route below does, because an operator
+   *    looking at one order is answering a question about that order.
+   *
+   * Store-scoped from the verified staff token. There is no `storeId` parameter, so there is
+   * nothing for a client to widen.
+   *
+   * Failure modes: `400` for an unknown query parameter, a malformed one, or an out-of-range
+   * `limit`; `401` unauthenticated; `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/orders',
+    auth,
+    requireStaff,
+    validate({ query: AdminListOrdersQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const query = validatedQuery<AdminListOrdersQuery>(req);
+
+      const page = await orders.listStoreOrders({
+        storeId: requireUser(req).storeId,
+        limit: query.limit,
+        offset: query.offset,
+        filters: adminOrderFilters(query),
+      });
+
+      res.status(200).json(toAdminOrderListResponse(page));
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/{orderNumber}` — one order in the store, whosever it is.
+   *
+   * The same document the customer sees, plus the four things an operator needs and a customer
+   * does not: the composed `displayStatus`, who placed it, where its payment stands, and where
+   * its shipment stands.
+   *
+   * ### `onlyOrderNumber`, and the route it protects
+   *
+   * The orders router is mounted BEFORE the fulfilment router, so this path — `/admin/orders/`
+   * plus one segment — is consulted first and would otherwise swallow
+   * `GET /admin/orders/fulfilment`, an endpoint that already exists and already has clients.
+   * Measured, not assumed: without the guard that request resolves to this handler and dies on
+   * the order-number pattern as a `400`.
+   *
+   * `next('router')` is the fix, and it is the narrow one. A path segment that is not shaped like
+   * an order number leaves this router untouched and continues in the parent, so the fulfilment
+   * queue keeps its route and any future literal under `/admin/orders/` keeps working without
+   * anyone having to remember this file exists.
+   *
+   * The cost is that a MALFORMED order number is a `404` here rather than a `400`: nothing
+   * downstream claims it, so it falls through to the not-found handler. That is the better answer
+   * anyway — a `400` distinguishing "wrong shape" from "no such order" tells an unauthorized
+   * prober which path shapes are real.
+   */
+  router.get(
+    '/admin/orders/:orderNumber',
+    auth,
+    requireStaff,
+    onlyOrderNumber,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const view = await orders.getStoreOrder({
+        storeId: requireUser(req).storeId,
+        orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+      });
+
+      res.status(200).json({ order: toAdminOrderDetailResponse(view) });
+    }),
+  );
+
   return router;
+}
+
+/**
+ * The order-number shape, as a route guard rather than as validation.
+ *
+ * Duplicated from `OrderNumberParamsSchema` deliberately: this decides whether the request is
+ * ADDRESSED to this route at all, which has to happen before validation, and a Zod schema cannot
+ * answer that without also rejecting the request. The two are asserted to agree by the
+ * integration test that drives a real order number through both.
+ */
+const ADMIN_ORDER_NUMBER_PATTERN = /^ORD-\d{8}-[A-Z2-9]{6}$/u;
+
+/**
+ * Continue only if this segment looks like an order number; otherwise leave the router entirely.
+ *
+ * `next('router')` rather than `next()`: `next()` would fall through to the 404 handler inside
+ * this router's stack and still shadow whatever the parent had for this path.
+ */
+const onlyOrderNumber: RequestHandler = (req, _res, next) => {
+  /*
+   * Express types a path parameter as `string | string[]` because a repeated parameter name in a
+   * pattern produces an array. This pattern declares `:orderNumber` once, so only the string case
+   * can occur — but the array case is REFUSED rather than joined or indexed, because the honest
+   * answer to "this route was reached with a shape it does not model" is to decline it.
+   */
+  const raw: unknown = req.params['orderNumber'];
+  if (typeof raw === 'string' && ADMIN_ORDER_NUMBER_PATTERN.test(raw)) {
+    next();
+    return;
+  }
+  next('router');
+};
+
+/**
+ * The validated query, as the repository's filter shape.
+ *
+ * Instants are parsed here rather than in the schema so the DTO stays a description of the WIRE
+ * — strings in, strings out — and the `Date` conversion happens once, on the way in, at the
+ * adapter boundary where every other parse in this file happens.
+ *
+ * Built key by key with `exactOptionalPropertyTypes` in mind: an absent filter must be an absent
+ * KEY, not a key holding `undefined`, or the repository would build a predicate against it.
+ */
+function adminOrderFilters(query: AdminListOrdersQuery): AdminOrderFilters {
+  return {
+    ...(query.displayStatus === undefined ? {} : { displayStatus: query.displayStatus }),
+    ...(query.paymentStatus === undefined ? {} : { paymentStatus: query.paymentStatus }),
+    ...(query.shipmentStatus === undefined ? {} : { shipmentStatus: query.shipmentStatus }),
+    ...(query.placedFrom === undefined ? {} : { placedFrom: new Date(query.placedFrom) }),
+    ...(query.placedTo === undefined ? {} : { placedTo: new Date(query.placedTo) }),
+    ...(query.q === undefined ? {} : { q: query.q }),
+  };
 }
