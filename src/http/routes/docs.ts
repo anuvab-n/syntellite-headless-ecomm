@@ -1583,7 +1583,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       {
         name: 'Orders',
         description:
-          "Checkout, and the customer's own order history. Orders are immutable records: every product, price and address value is copied at checkout, so later catalogue or address edits never change a past order. There is no staff or admin order surface in this version.",
+          "Checkout, the customer's own order history, and the staff order surface. Orders are immutable records: every product, price and address value is copied at checkout, so later catalogue or address edits never change a past order. The `/admin` routes are store-scoped rather than owner-scoped — staff read any order in their own store, and none from another. `/users/me` stays self-scoped for everyone, staff included, so there is no impersonation path.",
       },
       {
         name: 'Payments',
