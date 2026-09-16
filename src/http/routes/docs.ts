@@ -3588,11 +3588,14 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '`createdAt` alone is not a total order, and a non-total order makes `offset` paging',
             'silently skip and repeat rows between pages.',
             '',
-            '**Both date bounds are inclusive.** One caveat worth knowing: `createdAt` is',
-            'serialised to millisecond precision while PostgreSQL stores microseconds, so feeding',
-            'a row’s own `createdAt` back as `createdTo` submits a slightly EARLIER instant and',
-            'can exclude that row. Round up by a millisecond when using a response value as an',
-            'upper bound.',
+            '**Both date bounds are inclusive, at millisecond granularity.** A bound NAMES A',
+            'MILLISECOND — that is the finest instant this API can express, because a query',
+            'parameter becomes a JavaScript `Date` and `createdAt` is published with three',
+            'fractional digits — and an inclusive bound includes the whole of the millisecond',
+            'named. So a row stored at `10:00:00.123456Z`, published as `10:00:00.123Z`, is',
+            'returned by `createdTo=2026-09-15T10:00:00.123Z`: **a row’s own timestamp always',
+            'round-trips as a bound.** `…122Z` excludes it and `…124Z` as a lower bound excludes',
+            'it, so no adjacent millisecond is swept in.',
           ].join('\n'),
           parameters: [
             {
@@ -3722,9 +3725,10 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'Ordered by `createdAt` descending, then `id` descending — a total order, so `offset`',
             'paging cannot skip or repeat rows.',
             '',
-            '**Both date bounds are inclusive**, with the same millisecond caveat as',
-            '`GET /admin/payments`: `createdAt` is serialised to milliseconds while PostgreSQL',
-            'stores microseconds, so a row’s own `createdAt` used as `createdTo` can exclude it.',
+            '**Both date bounds are inclusive, at millisecond granularity**, exactly as',
+            '`GET /admin/payments` documents: a bound names a millisecond and includes the whole',
+            'of it, so an account’s own published `createdAt` always round-trips as a bound even',
+            'though PostgreSQL stores microseconds underneath.',
           ].join('\n'),
           parameters: [
             {

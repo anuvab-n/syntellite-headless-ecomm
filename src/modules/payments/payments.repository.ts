@@ -1,9 +1,10 @@
-import { and, asc, count, desc, eq, gte, isNotNull, lte, type SQL } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, isNotNull, lt, lte, type SQL } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { order } from '../../db/schema/orders.js';
 import { payment, paymentEvent } from '../../db/schema/payments.js';
 import { executor } from '../../db/transaction.js';
+import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
 import { newId } from '../../shared/id.js';
 
 /**
@@ -618,10 +619,21 @@ function adminPaymentPredicate(storeId: string, filters: AdminPaymentFilters): S
     clauses.push(eq(order.orderNumber, filters.orderNumber));
   }
 
-  // BOTH BOUNDS INCLUSIVE, and documented as such on the endpoint. A half-open upper bound
-  // would silently drop everything on the last instant a caller asked for.
+  /*
+   * The lower bound needs no adjustment: every microsecond inside the named millisecond is
+   * already greater than its start, so `>=` admits them all.
+   */
   if (filters.createdFrom !== undefined) clauses.push(gte(payment.createdAt, filters.createdFrom));
-  if (filters.createdTo !== undefined) clauses.push(lte(payment.createdAt, filters.createdTo));
+  /*
+   * STRICT `<` against the start of the NEXT millisecond, not `<=` against this one.
+   *
+   * `created_at` is microsecond-precise in the database and millisecond-precise everywhere in
+   * this API, so `<=` dropped every row whose stored microseconds were non-zero — including the
+   * row a client had just read the bound from. `exclusiveEndOfMillisecond` carries the reasoning.
+   */
+  if (filters.createdTo !== undefined) {
+    clauses.push(lt(payment.createdAt, exclusiveEndOfMillisecond(filters.createdTo)));
+  }
 
   return and(...clauses);
 }

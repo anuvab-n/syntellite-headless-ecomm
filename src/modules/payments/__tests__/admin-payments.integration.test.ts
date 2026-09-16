@@ -724,6 +724,98 @@ describe('admin payments (integration)', () => {
     });
   });
 
+  /* ── 6b. Microsecond precision at the bounds ──────────────────────────── */
+
+  /**
+   * The precision mismatch, and the semantics that resolve it.
+   *
+   * PostgreSQL stores `timestamptz` to MICROSECONDS. A JavaScript `Date` cannot represent one:
+   * even a client that sends `...123456Z` is holding `...123Z` by the time the value reaches a
+   * query, and `toISOString()` publishes milliseconds too. So the API is millisecond-grained in
+   * both directions and a bound can only ever NAME A MILLISECOND.
+   *
+   * "Inclusive" therefore has to mean inclusive of the whole millisecond named — otherwise a row
+   * stored at `.123456` is excluded by the very timestamp the API published for it (`.123`),
+   * which is the bug these cases pin.
+   */
+  describe('date bounds at microsecond precision', () => {
+    /** `.123456` — a stored instant whose published form (`.123`) is strictly earlier. */
+    const STORED = '2026-08-10T12:00:00.123456Z';
+    const NAMED = '2026-08-10T12:00:00.123Z';
+    let subject = '';
+
+    beforeAll(async () => {
+      subject = await payForNewOrder('cod');
+      const { rowCount } = await pool().query(
+        `update payment p set created_at = $2::timestamptz
+           from "order" o
+          where o.id = p.order_id and o.order_number = $1 and p.store_id = $3`,
+        [subject, STORED, storeId],
+      );
+      expect(rowCount).toBe(1);
+    }, 300_000);
+
+    const numbersFor = async (qs: string): Promise<string[]> => {
+      const res = await api().get(`/api/v1/admin/payments?limit=100&${qs}`).set(asStaff());
+      expect(res.status).toBe(200);
+      return (res.body.payments as { orderNumber: string }[]).map((p) => p.orderNumber);
+    };
+
+    it('stores microseconds the API cannot publish', async () => {
+      const { rows } = await pool().query<{ exact: string }>(
+        `select to_char(p.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') as exact
+           from payment p join "order" o on o.id = p.order_id
+          where o.order_number = $1`,
+        [subject],
+      );
+      // The database really does hold the sub-millisecond digits.
+      expect(rows[0]?.exact).toBe('2026-08-10T12:00:00.123456');
+
+      // And the API publishes the truncated form, which is STRICTLY EARLIER than what is stored.
+      const res = await api().get(`/api/v1/admin/payments?orderNumber=${subject}`).set(asStaff());
+      expect((res.body.payments as { createdAt: string }[])[0]?.createdAt).toBe(NAMED);
+    });
+
+    it('includes a row whose stored microseconds exceed the named upper bound', async () => {
+      // The regression: createdTo is the row's OWN published timestamp.
+      expect(await numbersFor(`createdTo=${encodeURIComponent(NAMED)}`)).toContain(subject);
+    });
+
+    it('round-trips its own published timestamp as both bounds', async () => {
+      const enc = encodeURIComponent(NAMED);
+      expect(await numbersFor(`createdFrom=${enc}&createdTo=${enc}`)).toEqual([subject]);
+    });
+
+    it('excludes the row one millisecond below the named upper bound', async () => {
+      const below = '2026-08-10T12:00:00.122Z';
+      expect(await numbersFor(`createdTo=${encodeURIComponent(below)}`)).not.toContain(subject);
+    });
+
+    it('keeps the lower bound inclusive of the named millisecond', async () => {
+      expect(await numbersFor(`createdFrom=${encodeURIComponent(NAMED)}`)).toContain(subject);
+    });
+
+    it('excludes the row when the lower bound is the next millisecond', async () => {
+      const above = '2026-08-10T12:00:00.124Z';
+      expect(await numbersFor(`createdFrom=${encodeURIComponent(above)}`)).not.toContain(subject);
+    });
+
+    it('does not spill into the millisecond after the upper bound', async () => {
+      // A second row one millisecond later must NOT be swept in by widening the bound.
+      const later = await payForNewOrder('cod');
+      await pool().query(
+        `update payment p set created_at = '2026-08-10T12:00:00.124000Z'::timestamptz
+           from "order" o
+          where o.id = p.order_id and o.order_number = $1 and p.store_id = $2`,
+        [later, storeId],
+      );
+
+      const got = await numbersFor(`createdTo=${encodeURIComponent(NAMED)}`);
+      expect(got).toContain(subject);
+      expect(got).not.toContain(later);
+    });
+  });
+
   /* ── 7. Existing behaviour is intact ──────────────────────────────────── */
 
   describe('regression against the existing payment surface', () => {

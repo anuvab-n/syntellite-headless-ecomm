@@ -1,9 +1,10 @@
-import { and, count, desc, eq, gte, isNull, lte, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, isNull, lt, sql, type SQL } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { appUser } from '../../db/schema/identity.js';
 import { uniqueViolationConstraint } from '../../db/errors.js';
 import { executor } from '../../db/transaction.js';
+import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
 import type { MappableUser } from './dto.js';
 
 /**
@@ -518,10 +519,21 @@ function adminCustomerPredicate(storeId: string, filters: AdminCustomerFilters):
 
   if (filters.isActive !== undefined) clauses.push(eq(appUser.isActive, filters.isActive));
 
-  // BOTH BOUNDS INCLUSIVE, and documented as such on the endpoint. A half-open upper bound
-  // would silently drop every account created on the last instant a caller asked for.
+  /*
+   * The lower bound needs no adjustment: every microsecond inside the named millisecond is
+   * already greater than its start, so `>=` admits them all.
+   */
   if (filters.createdFrom !== undefined) clauses.push(gte(appUser.createdAt, filters.createdFrom));
-  if (filters.createdTo !== undefined) clauses.push(lte(appUser.createdAt, filters.createdTo));
+  /*
+   * STRICT `<` against the start of the NEXT millisecond, not `<=` against this one.
+   *
+   * `created_at` is microsecond-precise in the database and millisecond-precise everywhere in
+   * this API, so `<=` dropped every row whose stored microseconds were non-zero — including the
+   * row a client had just read the bound from. `exclusiveEndOfMillisecond` carries the reasoning.
+   */
+  if (filters.createdTo !== undefined) {
+    clauses.push(lt(appUser.createdAt, exclusiveEndOfMillisecond(filters.createdTo)));
+  }
 
   return and(...clauses);
 }

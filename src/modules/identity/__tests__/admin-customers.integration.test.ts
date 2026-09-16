@@ -538,6 +538,90 @@ describe('admin customers (integration)', () => {
     });
   });
 
+  /* ── 6b. Microsecond precision at the bounds ──────────────────────────── */
+
+  /**
+   * The same precision rule as `GET /admin/payments`, asserted independently here.
+   *
+   * PostgreSQL stores `timestamptz` to MICROSECONDS; a JavaScript `Date` cannot represent one,
+   * so a bound can only ever NAME A MILLISECOND and `createdAt` is published truncated to one.
+   * "Inclusive" therefore means inclusive of the whole millisecond named — otherwise an account
+   * stored at `.123456` is excluded by the very timestamp the API published for it.
+   */
+  describe('date bounds at microsecond precision', () => {
+    const STORED = '2026-08-11T09:45:00.987654Z';
+    const NAMED = '2026-08-11T09:45:00.987Z';
+    let subject = { id: '', email: '' };
+
+    beforeAll(async () => {
+      subject = await register('micros.admincust', { staff: false });
+      const res = await pool().query(
+        'update app_user set created_at = $2::timestamptz where id = $1',
+        [subject.id, STORED],
+      );
+      expect(res.rowCount).toBe(1);
+    }, 120_000);
+
+    const idsFor = async (qs: string): Promise<string[]> => {
+      const res = await api().get(`/api/v1/admin/customers?limit=100&${qs}`).set(asStaff());
+      expect(res.status).toBe(200);
+      return (res.body.customers as { id: string }[]).map((c) => c.id);
+    };
+
+    it('stores microseconds the API cannot publish', async () => {
+      const { rows } = await pool().query<{ exact: string }>(
+        `select to_char(created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') as exact
+           from app_user where id = $1`,
+        [subject.id],
+      );
+      expect(rows[0]?.exact).toBe('2026-08-11T09:45:00.987654');
+
+      const listed = await api()
+        .get(`/api/v1/admin/customers?limit=100&createdFrom=${encodeURIComponent(NAMED)}`)
+        .set(asStaff());
+      const row = (listed.body.customers as { id: string; createdAt: string }[]).find(
+        (c) => c.id === subject.id,
+      );
+      // Published truncated, and therefore STRICTLY EARLIER than what is stored.
+      expect(row?.createdAt).toBe(NAMED);
+    });
+
+    it('includes an account whose stored microseconds exceed the named upper bound', async () => {
+      expect(await idsFor(`createdTo=${encodeURIComponent(NAMED)}`)).toContain(subject.id);
+    });
+
+    it('round-trips its own published timestamp as both bounds', async () => {
+      const enc = encodeURIComponent(NAMED);
+      expect(await idsFor(`createdFrom=${enc}&createdTo=${enc}`)).toEqual([subject.id]);
+    });
+
+    it('excludes the account one millisecond below the named upper bound', async () => {
+      const below = '2026-08-11T09:45:00.986Z';
+      expect(await idsFor(`createdTo=${encodeURIComponent(below)}`)).not.toContain(subject.id);
+    });
+
+    it('keeps the lower bound inclusive of the named millisecond', async () => {
+      expect(await idsFor(`createdFrom=${encodeURIComponent(NAMED)}`)).toContain(subject.id);
+    });
+
+    it('excludes the account when the lower bound is the next millisecond', async () => {
+      const above = '2026-08-11T09:45:00.988Z';
+      expect(await idsFor(`createdFrom=${encodeURIComponent(above)}`)).not.toContain(subject.id);
+    });
+
+    it('does not spill into the millisecond after the upper bound', async () => {
+      const later = await register('micros2.admincust', { staff: false });
+      await pool().query('update app_user set created_at = $2::timestamptz where id = $1', [
+        later.id,
+        '2026-08-11T09:45:00.988000Z',
+      ]);
+
+      const got = await idsFor(`createdTo=${encodeURIComponent(NAMED)}`);
+      expect(got).toContain(subject.id);
+      expect(got).not.toContain(later.id);
+    });
+  });
+
   /* ── 7. Existing behaviour is intact ──────────────────────────────────── */
 
   describe('regression against the existing identity surface', () => {
