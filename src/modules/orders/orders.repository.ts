@@ -7,7 +7,7 @@ import {
   ilike,
   inArray,
   isNull,
-  lte,
+  lt,
   or,
   sql,
   type SQL,
@@ -17,6 +17,7 @@ import type { Database } from '../../db/client.js';
 import { address } from '../../db/schema/address.js';
 import { appUser } from '../../db/schema/identity.js';
 import { order, orderLine, orderStatusHistory } from '../../db/schema/orders.js';
+import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
 import { payment } from '../../db/schema/payments.js';
 import { shipment } from '../../db/schema/shipments.js';
 
@@ -896,10 +897,22 @@ function adminOrderPredicate(storeId: string, filters: AdminOrderFilters): SQL |
     clauses.push(eq(shipment.status, filters.shipmentStatus));
   }
 
-  // Inclusive on both ends: the route parses whole days, and a half-open range would silently
-  // drop every order placed on the `to` date.
+  /*
+   * The lower bound needs no adjustment: every microsecond inside the named millisecond is
+   * already greater than its start, so `>=` admits them all.
+   */
   if (filters.placedFrom !== undefined) clauses.push(gte(order.placedAt, filters.placedFrom));
-  if (filters.placedTo !== undefined) clauses.push(lte(order.placedAt, filters.placedTo));
+  /*
+   * STRICT `<` against the start of the NEXT millisecond, not `<=` against this one.
+   *
+   * `placed_at` is microsecond-precise in the database and millisecond-precise everywhere in
+   * this API, so `<=` dropped every order whose stored microseconds were non-zero — including
+   * the order a client had just read the bound from. `exclusiveEndOfMillisecond` carries the
+   * reasoning; the payment and customer lists use the same helper for the same reason.
+   */
+  if (filters.placedTo !== undefined) {
+    clauses.push(lt(order.placedAt, exclusiveEndOfMillisecond(filters.placedTo)));
+  }
 
   /*
    * The operator's search box: an order number or a customer email, case-insensitively, as a

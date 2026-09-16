@@ -5665,7 +5665,13 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               name: 'placedTo',
               in: 'query',
               required: false,
-              description: 'Inclusive upper bound on `placedAt`. Same format as `placedFrom`.',
+              description:
+                'Inclusive upper bound on `placedAt`, at millisecond granularity. Same format as ' +
+                '`placedFrom`. A bound NAMES A MILLISECOND — the finest instant this API can ' +
+                'express — and includes the whole of it, so an order stored at ' +
+                '`14:20:00.123456Z` and published as `14:20:00.123Z` is returned by ' +
+                '`placedTo=…123Z`: an order’s own timestamp always round-trips as a bound. ' +
+                'The following millisecond is not swept in.',
               schema: { type: 'string', format: 'date-time' },
               example: '2026-09-30T23:59:59+05:30',
             },

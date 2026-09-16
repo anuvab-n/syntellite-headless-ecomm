@@ -513,6 +513,94 @@ describe('admin orders (integration)', () => {
     });
   });
 
+  /**
+   * The precision rule, asserted here as it is on the payment and customer lists.
+   *
+   * PostgreSQL stores `timestamptz` to MICROSECONDS. A JavaScript `Date` cannot represent one,
+   * so a bound can only ever NAME A MILLISECOND, and `placedAt` is published truncated to one.
+   * "Inclusive" therefore means inclusive of the whole millisecond named — otherwise an order
+   * stored at `.123456` is excluded by the very timestamp the API published for it.
+   *
+   * This was the same defect the payments and customers lists carried, fixed with the same
+   * shared helper rather than a second copy of the rule.
+   */
+  describe('date bounds at microsecond precision', () => {
+    const STORED = '2026-08-12T14:20:00.123456Z';
+    const NAMED = '2026-08-12T14:20:00.123Z';
+    let subject = '';
+    let neighbour = '';
+
+    beforeAll(async () => {
+      const addressId = await createAddress(customerToken);
+      subject = await placeOrderInState(customerToken, addressId, 'unpaid');
+      neighbour = await placeOrderInState(customerToken, addressId, 'unpaid');
+
+      const pin = async (orderNumber: string, at: string) => {
+        const { rowCount } = await container.db.pool.query(
+          'update "order" set placed_at = $2::timestamptz where order_number = $1 and store_id = $3',
+          [orderNumber, at, storeId],
+        );
+        expect(rowCount, `failed to pin ${orderNumber}`).toBe(1);
+      };
+
+      await pin(subject, STORED);
+      // One millisecond later, exactly on the boundary the fix must NOT cross.
+      await pin(neighbour, '2026-08-12T14:20:00.124000Z');
+    }, 300_000);
+
+    const numbersFor = async (qs: string): Promise<string[]> => {
+      const res = await api().get(`/api/v1/admin/orders?limit=100&${qs}`).set(asStaff());
+      expect(res.status).toBe(200);
+      return (res.body.orders as { orderNumber: string }[]).map((o) => o.orderNumber);
+    };
+
+    it('stores microseconds the API cannot publish', async () => {
+      const { rows } = await container.db.pool.query<{ exact: string }>(
+        `select to_char(placed_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') as exact
+           from "order" where order_number = $1`,
+        [subject],
+      );
+      expect(rows[0]?.exact).toBe('2026-08-12T14:20:00.123456');
+
+      const detail = await api().get(`/api/v1/admin/orders/${subject}`).set(asStaff());
+      expect(detail.status).toBe(200);
+      // Published truncated, and therefore STRICTLY EARLIER than what is stored.
+      expect(detail.body.order.placedAt).toBe(NAMED);
+    });
+
+    it('includes an order whose stored microseconds exceed the named upper bound', async () => {
+      expect(await numbersFor(`placedTo=${encodeURIComponent(NAMED)}`)).toContain(subject);
+    });
+
+    it('round-trips its own published timestamp as both bounds', async () => {
+      const enc = encodeURIComponent(NAMED);
+      expect(await numbersFor(`placedFrom=${enc}&placedTo=${enc}`)).toEqual([subject]);
+    });
+
+    it('does not include the order one millisecond later', async () => {
+      const got = await numbersFor(`placedTo=${encodeURIComponent(NAMED)}`);
+      expect(got).toContain(subject);
+      expect(got).not.toContain(neighbour);
+    });
+
+    it('excludes the order one millisecond below the named upper bound', async () => {
+      const below = '2026-08-12T14:20:00.122Z';
+      expect(await numbersFor(`placedTo=${encodeURIComponent(below)}`)).not.toContain(subject);
+    });
+
+    it('keeps placedFrom inclusive of the named millisecond', async () => {
+      expect(await numbersFor(`placedFrom=${encodeURIComponent(NAMED)}`)).toContain(subject);
+    });
+
+    it('excludes the order when placedFrom is the next millisecond', async () => {
+      const above = '2026-08-12T14:20:00.124Z';
+      const got = await numbersFor(`placedFrom=${encodeURIComponent(above)}`);
+      expect(got).not.toContain(subject);
+      // The neighbour sits exactly on that boundary, so it MUST still be there.
+      expect(got).toContain(neighbour);
+    });
+  });
+
   describe('the detail route', () => {
     it('returns the customer order document plus the four operator fields', async () => {
       const target = placed.find((p) => p.expected === 'delivered');
