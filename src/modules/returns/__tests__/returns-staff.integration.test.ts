@@ -624,4 +624,184 @@ describe('returns — staff approval and rejection (integration)', () => {
       expect(response.status).toBe(404);
     });
   });
+
+  /* ── GET /admin/returns/summary ───────────────────────────────────────── */
+
+  /**
+   * Return counts by status. Increment 53.
+   *
+   * The arithmetic is what makes the tile trustworthy: each bucket must equal what
+   * `GET /admin/returns?status=…` reports, because a dashboard that disagrees with the page it
+   * links to is worse than no dashboard.
+   *
+   * Tenancy is proven against a REAL foreign row. This suite cannot build a second store over
+   * HTTP — the container caches its store resolver, as the block above records — so the foreign
+   * return is cloned straight into the database. That is enough here: the summary never resolves
+   * a store from a request, it takes one from the token, so the only question is whether the
+   * query filters by it.
+   */
+  describe('operational summary', () => {
+    let foreignReturnCreated = false;
+
+    beforeAll(async () => {
+      const ctx = await givenRequestedReturn();
+      const pool = container.db.pool;
+
+      const otherStoreId = newId();
+      const otherUserId = newId();
+
+      await pool.query(
+        `insert into store (id, slug, name, currency, timezone, is_active)
+         values ($1, $2, 'Summary Other Store', 'INR', 'Asia/Kolkata', true)`,
+        [otherStoreId, `sum-other-${otherStoreId.slice(0, 8)}`],
+      );
+      await pool.query(
+        `insert into app_user (id, store_id, email, password_hash, first_name, last_name)
+         values ($1, $2, $3, 'argon2-placeholder', 'Foreign', 'Returner')`,
+        [otherUserId, otherStoreId, `foreign.sum.${otherUserId}@example.com`],
+      );
+
+      /* Clone the order and the return, moving both to the other store. */
+      const clone = async (
+        table: string,
+        keyColumn: string,
+        keyValue: string,
+        overrides: Record<string, unknown>,
+      ): Promise<void> => {
+        const { rows } = await pool.query<Record<string, unknown>>(
+          `select * from "${table}" where "${keyColumn}" = $1`,
+          [keyValue],
+        );
+        const row = rows[0];
+        expect(row, `no ${table} row for ${keyValue}`).toBeDefined();
+        if (!row) return;
+        const merged = { ...row, ...overrides };
+        const columns = Object.keys(merged);
+        await pool.query(
+          `insert into "${table}" (${columns.map((c) => `"${c}"`).join(', ')})
+           values (${columns.map((_c, i) => `$${i + 1}`).join(', ')})`,
+          columns.map((c) => merged[c]),
+        );
+      };
+
+      const { rows: src } = await pool.query<Record<string, unknown>>(
+        'select * from return_request where return_number = $1',
+        [ctx.returnNumber],
+      );
+      const source = src[0];
+      expect(source).toBeDefined();
+      if (!source) return;
+
+      const foreignOrderId = newId();
+      const foreignCartId = newId();
+      await clone('cart', 'id', String((await orderRow(String(source['order_id'])))['cart_id']), {
+        id: foreignCartId,
+        store_id: otherStoreId,
+        user_id: otherUserId,
+      });
+      await clone('order', 'id', String(source['order_id']), {
+        id: foreignOrderId,
+        store_id: otherStoreId,
+        user_id: otherUserId,
+        cart_id: foreignCartId,
+        address_id: null,
+        order_number: 'ORD-20260101-FFFFFF',
+      });
+      await clone('return_request', 'return_number', ctx.returnNumber, {
+        id: newId(),
+        store_id: otherStoreId,
+        user_id: otherUserId,
+        order_id: foreignOrderId,
+        return_number: 'RET-20260101-FFFFFF',
+      });
+
+      foreignReturnCreated = true;
+
+      async function orderRow(id: string): Promise<Record<string, unknown>> {
+        const { rows } = await pool.query<Record<string, unknown>>(
+          'select * from "order" where id = $1',
+          [id],
+        );
+        return rows[0] ?? {};
+      }
+    }, 300_000);
+
+    const summary = () => api().get('/api/v1/admin/returns/summary').set(asStaff());
+
+    it('refuses an anonymous request with 401', async () => {
+      expect((await api().get('/api/v1/admin/returns/summary')).status).toBe(401);
+    });
+
+    it('refuses an authenticated non-staff customer with 403', async () => {
+      expect((await api().get('/api/v1/admin/returns/summary').set(asCustomer())).status).toBe(403);
+    });
+
+    it('serves active staff with 200', async () => {
+      expect((await summary()).status).toBe(200);
+    });
+
+    it('returns every return status, including the ones at zero', async () => {
+      const body = (await summary()).body.returns as { byStatus: Record<string, number> };
+      expect(Object.keys(body.byStatus).sort()).toEqual([
+        'approved',
+        'cancelled',
+        'completed',
+        'inspected',
+        'received',
+        'rejected',
+        'requested',
+      ]);
+      for (const n of Object.values(body.byStatus)) expect(Number.isInteger(n)).toBe(true);
+    });
+
+    it('agrees exactly with the staff return queue, bucket by bucket', async () => {
+      const body = (await summary()).body.returns as { byStatus: Record<string, number> };
+
+      for (const [status, expected] of Object.entries(body.byStatus)) {
+        const res = await api()
+          .get(`/api/v1/admin/returns?limit=1&status=${status}`)
+          .set(asStaff());
+        expect(res.status).toBe(200);
+        // This list predates the shared `pagination` envelope and reports a flat `total`.
+        expect(res.body.total, `status=${status}`).toBe(expected);
+      }
+    });
+
+    it('counts only this store’s returns', async () => {
+      expect(foreignReturnCreated).toBe(true);
+
+      const body = (await summary()).body.returns as { byStatus: Record<string, number> };
+      const summed = Object.values(body.byStatus).reduce((a, b) => a + b, 0);
+
+      const { rows } = await container.db.pool.query<{ c: string }>(
+        'select count(*)::text c from return_request where store_id = $1',
+        [storeId],
+      );
+      expect(summed).toBe(Number(rows[0]?.c ?? '0'));
+
+      const { rows: foreign } = await container.db.pool.query<{ c: string }>(
+        'select count(*)::text c from return_request where store_id <> $1',
+        [storeId],
+      );
+      expect(Number(foreign[0]?.c ?? '0')).toBeGreaterThan(0);
+    });
+
+    it('writes nothing', async () => {
+      const countOf = async (sql: string): Promise<string> => {
+        const { rows } = await container.db.pool.query<{ c: string }>(sql);
+        return rows[0]?.c ?? '?';
+      };
+      const snapshot = async () => ({
+        returns: await countOf('select count(*)::text c from return_request'),
+        events: await countOf('select count(*)::text c from return_event'),
+        audits: await countOf('select count(*)::text c from audit_log'),
+        outbox: await countOf('select count(*)::text c from outbox_event'),
+      });
+
+      const before = await snapshot();
+      await summary();
+      await summary();
+      expect(await snapshot()).toEqual(before);
+    });
+  });
 });

@@ -444,6 +444,44 @@ export const AdminCustomerOrdersQuerySchema = z.strictObject({
 
 export type AdminCustomerOrdersQuery = z.infer<typeof AdminCustomerOrdersQuerySchema>;
 
+/* ── GET /admin/orders/summary ───────────────────────────────────────────── */
+
+/**
+ * The operational summary: three tallies, whole-store, all-time.
+ *
+ * **Counts only.** No money and no period — these are queue depths, the answer to "what needs
+ * attention now", not a report. Keeping money out also keeps this endpoint clear of the one
+ * question the codebase has no answer to: whether an unpaid or cancelled order contributes to a
+ * total.
+ *
+ * **Every status appears, including at zero.** A response whose keys vary with the data forces
+ * a client to distinguish "absent" from "none", and to defend against both. The service
+ * zero-fills from the published vocabularies, so this shape is fixed.
+ *
+ * `displayStatus` is §49's composed set — the same one `GET /admin/orders` validates its filter
+ * against, so a tile and the list it links to can never offer different statuses.
+ */
+export type AdminOrderStatusSummaryResponse = {
+  /** §49's composed status. `ready_to_ship` and `returned` are not derivable and never appear. */
+  byDisplayStatus: Record<string, number>;
+  /** Raw `payment.status`. Orders with no payment row are counted in no bucket here. */
+  byPaymentStatus: Record<string, number>;
+  /** Raw `shipment.status`. Orders with no shipment are counted in no bucket here. */
+  byShipmentStatus: Record<string, number>;
+};
+
+export function toAdminOrderStatusSummaryResponse(summary: {
+  displayStatus: Record<string, number>;
+  paymentStatus: Record<string, number>;
+  shipmentStatus: Record<string, number>;
+}): AdminOrderStatusSummaryResponse {
+  return {
+    byDisplayStatus: summary.displayStatus,
+    byPaymentStatus: summary.paymentStatus,
+    byShipmentStatus: summary.shipmentStatus,
+  };
+}
+
 /**
  * The customer, as an operator sees them on an order.
  *

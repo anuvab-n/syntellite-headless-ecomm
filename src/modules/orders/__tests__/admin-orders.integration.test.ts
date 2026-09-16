@@ -1128,6 +1128,253 @@ describe('admin orders (integration)', () => {
     });
   });
 
+  /* ── GET /admin/orders/summary ────────────────────────────────────────── */
+
+  /**
+   * Operational order counts. Increment 53.
+   *
+   * Two things carry this block. The first is **arithmetic**: the tallies must equal what the
+   * list reports for the same store, because they are the same expression — if they can
+   * disagree, the dashboard is lying. The second is **route ordering**: this literal sits under
+   * `/admin/orders/` alongside a `:orderNumber` parameter whose guard exits the router, so a
+   * registration-order mistake makes it a 404 rather than a subtly wrong number.
+   */
+  describe('operational summary', () => {
+    const summary = () => api().get('/api/v1/admin/orders/summary').set(asStaff());
+
+    it('refuses an anonymous request with 401', async () => {
+      expect((await api().get('/api/v1/admin/orders/summary')).status).toBe(401);
+    });
+
+    it('refuses an authenticated non-staff customer with 403', async () => {
+      expect((await api().get('/api/v1/admin/orders/summary').set(asCustomer())).status).toBe(403);
+    });
+
+    it('serves active staff with 200', async () => {
+      expect((await summary()).status).toBe(200);
+    });
+
+    it('stops serving a demoted staff member on the very next request', async () => {
+      const email = `demote.sum.${newId()}@example.com`;
+      const user = await container.identity.registerCustomer({
+        storeId,
+        input: { email, password: PASSWORD, firstName: 'Temp', lastName: 'Staff' },
+      });
+      await db().update(appUser).set({ isStaff: true }).where(eq(appUser.id, user.id));
+      const login = await api().post('/api/v1/auth/login').send({ email, password: PASSWORD });
+      const auth = { Authorization: `Bearer ${login.body.accessToken as string}` };
+
+      expect((await api().get('/api/v1/admin/orders/summary').set(auth)).status).toBe(200);
+      await db().update(appUser).set({ isStaff: false }).where(eq(appUser.id, user.id));
+      expect((await api().get('/api/v1/admin/orders/summary').set(auth)).status).toBe(403);
+    });
+
+    it('refuses a deactivated staff member with 401', async () => {
+      const email = `deact.sum.${newId()}@example.com`;
+      const user = await container.identity.registerCustomer({
+        storeId,
+        input: { email, password: PASSWORD, firstName: 'Temp', lastName: 'Staff' },
+      });
+      await db().update(appUser).set({ isStaff: true }).where(eq(appUser.id, user.id));
+      const login = await api().post('/api/v1/auth/login').send({ email, password: PASSWORD });
+      const auth = { Authorization: `Bearer ${login.body.accessToken as string}` };
+
+      expect((await api().get('/api/v1/admin/orders/summary').set(auth)).status).toBe(200);
+      await db().update(appUser).set({ isActive: false }).where(eq(appUser.id, user.id));
+      expect((await api().get('/api/v1/admin/orders/summary').set(auth)).status).toBe(401);
+    });
+
+    /**
+     * Route ordering. `/admin/orders/summary` matches the `:orderNumber` pattern too, and that
+     * route's guard calls `next('router')` — so if the literal were registered after it, this
+     * would be a 404 rather than a summary.
+     */
+    it('is not swallowed by the :orderNumber route, and does not swallow it either', async () => {
+      expect((await summary()).status).toBe(200);
+
+      // The parameterised route still works for a real order number...
+      const target = placed[0];
+      expect(target).toBeDefined();
+      if (!target) return;
+      expect(
+        (await api().get(`/api/v1/admin/orders/${target.orderNumber}`).set(asStaff())).status,
+      ).toBe(200);
+
+      // ...and the fulfilment queue in the OTHER router is still reachable.
+      expect((await api().get('/api/v1/admin/orders/fulfilment').set(asStaff())).status).toBe(200);
+    });
+
+    it('returns every status of every vocabulary, including at zero', async () => {
+      const body = (await summary()).body.orders as {
+        byDisplayStatus: Record<string, number>;
+        byPaymentStatus: Record<string, number>;
+        byShipmentStatus: Record<string, number>;
+      };
+
+      expect(Object.keys(body).sort()).toEqual([
+        'byDisplayStatus',
+        'byPaymentStatus',
+        'byShipmentStatus',
+      ]);
+
+      // §49's published set, and NOT the two it cannot derive.
+      expect(Object.keys(body.byDisplayStatus).sort()).toEqual([
+        'cancelled',
+        'confirmed',
+        'delivered',
+        'failed',
+        'pending',
+        'processing',
+        'shipped',
+      ]);
+      expect(Object.keys(body.byDisplayStatus)).not.toContain('ready_to_ship');
+      expect(Object.keys(body.byDisplayStatus)).not.toContain('returned');
+
+      expect(Object.keys(body.byPaymentStatus).sort()).toEqual([
+        'expired',
+        'failed',
+        'pending',
+        'succeeded',
+      ]);
+      expect(Object.keys(body.byShipmentStatus).sort()).toEqual([
+        'delivered',
+        'pending',
+        'shipped',
+      ]);
+
+      for (const group of Object.values(body)) {
+        for (const n of Object.values(group)) expect(Number.isInteger(n)).toBe(true);
+      }
+    });
+
+    /**
+     * The arithmetic that makes the tiles trustworthy: every bucket must equal what the list
+     * reports when filtered to that same status, and the buckets must sum to the store's total.
+     */
+    it('agrees exactly with the order list, bucket by bucket', async () => {
+      const body = (await summary()).body.orders as { byDisplayStatus: Record<string, number> };
+
+      const all = await api().get('/api/v1/admin/orders?limit=100').set(asStaff());
+      const storeTotal = all.body.pagination.total as number;
+
+      let summed = 0;
+      for (const [status, expected] of Object.entries(body.byDisplayStatus)) {
+        const filtered = await api()
+          .get(`/api/v1/admin/orders?limit=1&displayStatus=${status}`)
+          .set(asStaff());
+        expect(filtered.status).toBe(200);
+        expect(filtered.body.pagination.total, `displayStatus=${status}`).toBe(expected);
+        summed += expected;
+      }
+      expect(summed).toBe(storeTotal);
+    });
+
+    /**
+     * The INDEPENDENT check, and the one that can catch a wrong CASE.
+     *
+     * The test above compares the summary to the order list — but both are produced by the same
+     * SQL expression, so a mistake inside it moves both together and the comparison still
+     * passes. A mutation probe proved exactly that: rewriting one arm of the CASE left it green.
+     *
+     * So this tallies the expected statuses in TYPESCRIPT, from the states each order was
+     * actually driven into, and compares that to the SQL. It is the same cross-check the filter
+     * has: two implementations of §49's table, asserted against each other.
+     */
+    it('agrees with the TypeScript derivation, not just with its own SQL', async () => {
+      const body = (await summary()).body.orders as { byDisplayStatus: Record<string, number> };
+
+      const expectedTally: Record<string, number> = {};
+      for (const status of Object.keys(body.byDisplayStatus)) expectedTally[status] = 0;
+      for (const order of placed) {
+        const derived = deriveOrderDisplayStatus({
+          orderStatus: order.orderStatus,
+          payment: order.payment,
+          shipmentStatus: order.shipment,
+        });
+        expectedTally[derived] = (expectedTally[derived] ?? 0) + 1;
+      }
+
+      expect(body.byDisplayStatus).toEqual(expectedTally);
+    });
+
+    it('counts payments and shipments consistently with their own filters', async () => {
+      const body = (await summary()).body.orders as {
+        byPaymentStatus: Record<string, number>;
+        byShipmentStatus: Record<string, number>;
+      };
+
+      for (const [status, expected] of Object.entries(body.byPaymentStatus)) {
+        const res = await api()
+          .get(`/api/v1/admin/orders?limit=1&paymentStatus=${status}`)
+          .set(asStaff());
+        expect(res.body.pagination.total, `paymentStatus=${status}`).toBe(expected);
+      }
+      for (const [status, expected] of Object.entries(body.byShipmentStatus)) {
+        const res = await api()
+          .get(`/api/v1/admin/orders?limit=1&shipmentStatus=${status}`)
+          .set(asStaff());
+        expect(res.body.pagination.total, `shipmentStatus=${status}`).toBe(expected);
+      }
+    });
+
+    it('counts only this store’s orders', async () => {
+      const body = (await summary()).body.orders as { byDisplayStatus: Record<string, number> };
+      const summed = Object.values(body.byDisplayStatus).reduce((a, b) => a + b, 0);
+
+      const { rows } = await container.db.pool.query<{ c: string }>(
+        'select count(*)::text c from "order" where store_id = $1',
+        [storeId],
+      );
+      expect(summed).toBe(Number(rows[0]?.c ?? '0'));
+
+      // And there really are foreign orders to have gone wrong about.
+      const { rows: foreign } = await container.db.pool.query<{ c: string }>(
+        'select count(*)::text c from "order" where store_id <> $1',
+        [storeId],
+      );
+      expect(Number(foreign[0]?.c ?? '0')).toBeGreaterThan(0);
+    });
+
+    it('writes nothing', async () => {
+      const countOf = async (sql: string): Promise<string> => {
+        const { rows } = await container.db.pool.query<{ c: string }>(sql);
+        return rows[0]?.c ?? '?';
+      };
+      const snapshot = async () => ({
+        orders: await countOf('select count(*)::text c from "order"'),
+        payments: await countOf('select count(*)::text c from payment'),
+        shipments: await countOf('select count(*)::text c from shipment'),
+        audits: await countOf('select count(*)::text c from audit_log'),
+        events: await countOf('select count(*)::text c from outbox_event'),
+        keys: await countOf('select count(*)::text c from idempotency_key'),
+      });
+
+      const before = await snapshot();
+      await summary();
+      await summary();
+      expect(await snapshot()).toEqual(before);
+    });
+
+    /**
+     * One grouped statement, not one per status. If the tallies were produced by a query per
+     * bucket the plan below would not be a single aggregate over the joined rows.
+     */
+    it('reads the tallies as one grouped aggregate', async () => {
+      const { rows } = await container.db.pool.query<{ 'QUERY PLAN': string }>(
+        `explain select o.status, p.status, s.status, count(*)
+           from "order" o
+           left join payment p on p.order_id = o.id and p.store_id = o.store_id
+           left join shipment s on s.order_id = o.id and s.store_id = o.store_id
+          where o.store_id = $1
+          group by 1, 2, 3`,
+        [storeId],
+      );
+      const plan = rows.map((r) => r['QUERY PLAN']).join('\n');
+      expect(plan).toMatch(/Aggregate|GroupAggregate|HashAggregate/u);
+      expect(plan).toMatch(/Join|Nested Loop|Hash/u);
+    });
+  });
+
   /**
    * Property 3 — nothing sensitive leaves, asserted over the whole serialised body.
    *

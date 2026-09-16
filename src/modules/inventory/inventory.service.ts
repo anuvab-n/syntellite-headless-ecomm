@@ -131,6 +131,21 @@ export function createInventoryService(deps: {
       return row;
     },
 
+    /**
+     * **How many live SKUs have nothing sellable left.** Increment 53. Read-only.
+     *
+     * A single number, deliberately. The operator question behind it is "is anything unsellable
+     * right now" — the WHICH is what `GET /admin/inventory` already answers, page by page.
+     *
+     * No low-stock counterpart: there is no reorder threshold in the schema, so "low" has no
+     * definition here and the dashboard must not invent one.
+     *
+     * No transaction, no audit row, no event, no stock movement.
+     */
+    async countOutOfStock(params: { storeId: string }): Promise<number> {
+      return repository.countOutOfStockForStore(params);
+    },
+
     /** A page of this store's stock. Visibility belongs to the repository query. */
     async getStockForStore(params: {
       storeId: string;

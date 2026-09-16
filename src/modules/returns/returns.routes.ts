@@ -213,6 +213,28 @@ export function createReturnsRoutes(deps: {
    * theirs to see. The store comes from the verified token, so one tenant’s staff can never
    * reach another’s returns.
    */
+  /**
+   * `GET /admin/returns/summary` — return counts by status for the store. Increment 53.
+   *
+   * Queue depth, not a report: no money, no period, no filters. Every status in the vocabulary
+   * appears, including the ones at zero, so the response shape does not change with the data.
+   *
+   * Registered BEFORE `/admin/returns/{returnNumber}` below, so the literal is matched before
+   * the parameter is ever considered — the same ordering rule the orders module documents.
+   *
+   * Store-scoped from the verified staff token; no query object at all, so there is nothing for
+   * a client to supply. `401` unauthenticated, `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/returns/summary',
+    auth,
+    requireStaff,
+    asyncHandler(async (req, res) => {
+      const byStatus = await returns.summaryForStore({ storeId: scope(req).storeId });
+      res.status(200).json({ returns: { byStatus } });
+    }),
+  );
+
   router.get(
     '/admin/returns',
     auth,

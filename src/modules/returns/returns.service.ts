@@ -18,6 +18,7 @@ import { RETURN_AUDIT, RETURN_RESOURCE } from './returns.events.js';
 import {
   RETURN_NUMBER_ALPHABET,
   RETURN_NUMBER_SUFFIX_LENGTH,
+  RETURN_STATUSES,
   type ReturnLineRecord,
   type ReturnRecord,
   type ReturnsRepository,
@@ -666,6 +667,28 @@ export function createReturnsService(deps: {
         toStatus: 'rejected',
         auditAction: RETURN_AUDIT.rejected,
       });
+    },
+
+    /**
+     * **Return counts by status for the store.** Increment 53. Read-only.
+     *
+     * Every status in `RETURN_STATUSES` appears, including the ones at zero. Zero-filling happens
+     * here rather than in the repository because the vocabulary is domain knowledge — and it is
+     * the contract: a client rendering queue tiles must not have to tell "absent" from "none".
+     *
+     * A status present in the data but missing from the constant is still reported. That would
+     * mean a migration had introduced a state the code does not know about, and a dashboard is
+     * precisely where you would want to see it rather than have it silently dropped.
+     *
+     * No transaction, no audit row, no event.
+     */
+    async summaryForStore(params: { storeId: string }): Promise<Record<string, number>> {
+      const rows = await repository.countsByStatusForStore(params);
+
+      const totals: Record<string, number> = {};
+      for (const status of RETURN_STATUSES) totals[status] = 0;
+      for (const row of rows) totals[row.status] = (totals[row.status] ?? 0) + row.count;
+      return totals;
     },
 
     /** One return in the store, whoever raised it. Staff read. */

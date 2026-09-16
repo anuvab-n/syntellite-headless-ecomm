@@ -1669,4 +1669,127 @@ describe('inventory (integration)', () => {
       ).toBeUndefined();
     });
   });
+
+  /* ── GET /admin/inventory/summary ─────────────────────────────────────── */
+
+  /**
+   * How many live SKUs have nothing sellable left. Increment 53.
+   *
+   * "Out of stock" is `available <= 0`, where `available` is the stored `on_hand - reserved` —
+   * so a SKU whose entire holding is reserved counts. That is the case most likely to be got
+   * wrong, and it is the one an operator most needs to see: the shelf is not empty, but the next
+   * customer still cannot buy it.
+   *
+   * This suite truncates between tests, so every count below is exact rather than relative.
+   */
+  describe('operational summary', () => {
+    const summary = (app: App, token?: string) => {
+      const req = request(app).get('/api/v1/admin/inventory/summary');
+      return token === undefined ? req : req.set('Authorization', `Bearer ${token}`);
+    };
+
+    it('rejects an unauthenticated request with 401', async () => {
+      const { app } = build();
+      expect((await summary(app)).status).toBe(401);
+    });
+
+    it('rejects a non-staff caller with 403', async () => {
+      const { app, identity } = build();
+      const customer = await signIn(app, identity, { staff: false });
+      expect((await summary(app, customer.token)).status).toBe(403);
+    });
+
+    it('serves active staff with 200', async () => {
+      const { app, identity } = build();
+      const staff = await signIn(app, identity, { staff: true });
+      const res = await summary(app, staff.token);
+      expect(res.status).toBe(200);
+      expect(res.body.inventory).toEqual({ outOfStockSkus: 0 });
+    });
+
+    it('counts a SKU with nothing on hand', async () => {
+      await givenStock({ code: 'OOS-1', onHand: 0 });
+      await givenStock({ code: 'IN-1', onHand: 5 });
+
+      const { app, identity } = build();
+      const staff = await signIn(app, identity, { staff: true });
+      expect((await summary(app, staff.token)).body.inventory.outOfStockSkus).toBe(1);
+    });
+
+    /**
+     * The case the definition turns on. `on_hand` is 5, so the shelf is not empty — but every
+     * unit is spoken for, so `available` is 0 and nothing can be sold. A count that looked at
+     * `on_hand` alone would report this store as healthy while checkout refused every order.
+     */
+    it('counts a SKU whose entire holding is reserved', async () => {
+      await givenStock({ code: 'RESERVED-1', onHand: 5, reserved: 5 });
+      await givenStock({ code: 'PARTIAL-1', onHand: 5, reserved: 4 });
+
+      const { app, identity } = build();
+      const staff = await signIn(app, identity, { staff: true });
+      expect((await summary(app, staff.token)).body.inventory.outOfStockSkus).toBe(1);
+    });
+
+    /** Same visibility rule as the list, so the tile and the page cannot disagree. */
+    it('excludes soft-deleted SKUs, exactly as the list does', async () => {
+      await givenStock({ code: 'DEAD-1', onHand: 0, deletedAt: new Date() });
+
+      const { app, identity } = build();
+      const staff = await signIn(app, identity, { staff: true });
+
+      expect((await summary(app, staff.token)).body.inventory.outOfStockSkus).toBe(0);
+      const listed = await listInventory(app, staff.token);
+      expect(listed.body.pagination.total).toBe(0);
+    });
+
+    it('counts only this store’s SKUs', async () => {
+      await givenStock({ code: 'MINE-OOS', onHand: 0 });
+
+      const otherStoreId = newId();
+      await db()
+        .insert(store)
+        .values({ id: otherStoreId, slug: 'other-summary', name: 'Other', isActive: true });
+      await givenStock({
+        code: 'THEIRS-OOS',
+        onHand: 0,
+        storeId: otherStoreId,
+        productSlug: 'their-summary-shirt',
+      });
+
+      // The foreign row really is there, so a missing store predicate would count 2.
+      const { rows } = await testDb.handle.pool.query<{ c: string }>(
+        'select count(*)::text c from stock_item where store_id <> $1',
+        [storeId],
+      );
+      expect(Number(rows[0]?.c ?? '0')).toBe(1);
+
+      const { app, identity } = build();
+      const staff = await signIn(app, identity, { staff: true });
+      expect((await summary(app, staff.token)).body.inventory.outOfStockSkus).toBe(1);
+    });
+
+    it('writes nothing', async () => {
+      await givenStock({ code: 'OOS-RO', onHand: 0 });
+      const { app, identity } = build();
+      const staff = await signIn(app, identity, { staff: true });
+
+      const countOf = async (sql: string): Promise<string> => {
+        const { rows } = await testDb.handle.pool.query<{ c: string }>(sql);
+        return rows[0]?.c ?? '?';
+      };
+      const snapshot = async () => ({
+        stock: await countOf('select count(*)::text c from stock_item'),
+        onHand: await countOf('select coalesce(sum(on_hand),0)::text c from stock_item'),
+        reserved: await countOf('select coalesce(sum(reserved),0)::text c from stock_item'),
+        ledger: await countOf('select count(*)::text c from stock_ledger'),
+        audits: await countOf('select count(*)::text c from audit_log'),
+        outbox: await countOf('select count(*)::text c from outbox_event'),
+      });
+
+      const before = await snapshot();
+      await summary(app, staff.token);
+      await summary(app, staff.token);
+      expect(await snapshot()).toEqual(before);
+    });
+  });
 });

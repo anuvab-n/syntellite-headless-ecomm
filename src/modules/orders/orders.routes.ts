@@ -18,6 +18,7 @@ import {
   OrderNumberParamsSchema,
   toAdminOrderDetailResponse,
   toAdminOrderListResponse,
+  toAdminOrderStatusSummaryResponse,
   toOrderListResponse,
   toOrderResponse,
   type AdminCustomerOrdersParams,
@@ -444,6 +445,39 @@ export function createOrdersRoutes(deps: {
       });
 
       res.status(200).json(toAdminOrderListResponse(page));
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/summary` — operational counts for the store. Increment 53.
+   *
+   * Three tallies: orders by the composed `displayStatus` (§49), and the raw payment and
+   * shipment statuses underneath it. Queue depths, not a report — no money, no period, no
+   * filters. Every status appears, including at zero, so the response shape is fixed.
+   *
+   * ### REGISTRATION ORDER IS LOAD-BEARING
+   *
+   * This route MUST stay above `/admin/orders/{orderNumber}`. That route's `onlyOrderNumber`
+   * guard calls `next('router')` for a segment that is not shaped like an order number, which
+   * leaves this router ENTIRELY — so a summary route declared after it would never be reached,
+   * and the request would fall through to a `404`. Declaring it first means Express matches the
+   * literal before it ever considers the parameter.
+   *
+   * A test asserts both halves: that this returns `200`, and that `/admin/orders/fulfilment` in
+   * the other router still does too.
+   *
+   * Store-scoped from the verified staff token; there is no `storeId` parameter and no query
+   * object at all, so there is nothing for a client to supply.
+   *
+   * Failure modes: `401` unauthenticated; `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/orders/summary',
+    auth,
+    requireStaff,
+    asyncHandler(async (req, res) => {
+      const summary = await orders.summaryForStore({ storeId: requireUser(req).storeId });
+      res.status(200).json({ orders: toAdminOrderStatusSummaryResponse(summary) });
     }),
   );
 

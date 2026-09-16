@@ -264,6 +264,17 @@ describe('API documentation', () => {
      * DIFFERENT routers — the history in orders, the detail in identity — and cannot collide
      * because their segment counts differ; declaring them in this order keeps that visible.
      */
+    apiRouter.get('/admin/orders/summary', (_req, res) => {
+      res
+        .status(200)
+        .json({ orders: { byDisplayStatus: {}, byPaymentStatus: {}, byShipmentStatus: {} } });
+    });
+    apiRouter.get('/admin/returns/summary', (_req, res) => {
+      res.status(200).json({ returns: { byStatus: {} } });
+    });
+    apiRouter.get('/admin/inventory/summary', (_req, res) => {
+      res.status(200).json({ inventory: { outOfStockSkus: 0 } });
+    });
     apiRouter.get('/admin/customers/:customerId/orders', (_req, res) => {
       res.status(200).json({ orders: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
@@ -461,12 +472,14 @@ describe('API documentation', () => {
         '/api/v1/admin/customers/{customerId}/orders',
         '/api/v1/admin/inventory',
         '/api/v1/admin/inventory/adjustments',
+        '/api/v1/admin/inventory/summary',
         '/api/v1/admin/inventory/{skuCode}/history',
         '/api/v1/admin/option-values/{id}',
         '/api/v1/admin/options/{id}',
         '/api/v1/admin/options/{id}/values',
         '/api/v1/admin/orders',
         '/api/v1/admin/orders/fulfilment',
+        '/api/v1/admin/orders/summary',
         '/api/v1/admin/orders/{orderNumber}',
         '/api/v1/admin/orders/{orderNumber}/invoice',
         '/api/v1/admin/orders/{orderNumber}/shipments',
@@ -480,6 +493,7 @@ describe('API documentation', () => {
         '/api/v1/admin/promotions',
         '/api/v1/admin/promotions/{code}',
         '/api/v1/admin/returns',
+        '/api/v1/admin/returns/summary',
         '/api/v1/admin/returns/{returnNumber}',
         '/api/v1/admin/returns/{returnNumber}/approve',
         '/api/v1/admin/returns/{returnNumber}/reject',

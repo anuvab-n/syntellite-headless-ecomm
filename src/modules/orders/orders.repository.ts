@@ -32,6 +32,22 @@ export {
   CANCELLED_ORDER_STATUS,
   type OrderStatus,
 } from '../../db/schema/orders.js';
+
+/**
+ * The payment and shipment vocabularies, re-exported for the operational summary. Increment 53.
+ *
+ * The summary must report EVERY status, including the ones at zero — a dashboard that omitted
+ * empty buckets would make "none" indistinguishable from "this status does not exist", and the
+ * shape would change as the data changed.
+ *
+ * Re-exported from the SCHEMA rather than restated as literals, and rather than imported from
+ * `modules/payments` or `modules/fulfilment`, which `no-cross-module-imports` forbids. This file
+ * already names both tables (see the note above on Increment 50), so their vocabularies are
+ * already within its reach; taking the constants from the same place as the `CHECK` that
+ * enforces them is what stops the two drifting.
+ */
+export { PAYMENT_STATUSES, type PaymentStatus } from '../../db/schema/payments.js';
+export { SHIPMENT_STATUSES, type ShipmentStatus } from '../../db/schema/shipments.js';
 import { executor } from '../../db/transaction.js';
 
 /**
@@ -725,6 +741,77 @@ export function createOrdersRepository(deps: { db: Database }) {
      * A boolean, not a row. Orders has no business publishing a customer's fields — the detail
      * endpoint in `identity` does that — so this returns only the fact it needs.
      */
+    /**
+     * **Operational counts for the store, in ONE statement.** Increment 53.
+     *
+     * Three groupings the admin dashboard needs, and they are produced together rather than by
+     * three round trips because they share a scan of the same three tables. `FILTER (WHERE …)`
+     * does the work: one pass over the joined rows, one bucket per status.
+     *
+     * The display-status bucket reuses `displayStatusSql` — the SAME expression the order list
+     * filters by — so a queue depth here can never disagree with the page a click on it opens.
+     * That reuse is the whole reason this method belongs to orders rather than to a dashboard
+     * module: the expression and its three tables are already this file's business.
+     *
+     * **Whole-store and all-time.** No date window: these are queue depths, not a report. That
+     * also keeps the endpoint free of the inclusive-bound question the list endpoints answer.
+     *
+     * `store_id` is the driving predicate AND is repeated on both joins. The foreign keys
+     * (`fk_payment_order_store`, `fk_shipment_order_store`) already make a cross-store pairing
+     * unrepresentable, so the join predicates are belt-and-braces — but they are kept because a
+     * predicate that documents tenancy at every join is cheaper to read than a constraint a
+     * reviewer has to go and look up.
+     *
+     * Returns raw rows, not a shaped object: the service owns the vocabulary, and a repository
+     * that returned "the dashboard shape" would be a repository that knew about screens.
+     */
+    async countsForStore(params: { storeId: string }): Promise<{
+      displayStatus: { value: string; count: number }[];
+      paymentStatus: { value: string; count: number }[];
+      shipmentStatus: { value: string; count: number }[];
+    }> {
+      const rows = await executor(db)
+        .select({
+          displayStatus: displayStatusSql,
+          paymentStatus: payment.status,
+          shipmentStatus: shipment.status,
+          count: count(),
+        })
+        .from(order)
+        .leftJoin(payment, and(eq(payment.orderId, order.id), eq(payment.storeId, order.storeId)))
+        .leftJoin(
+          shipment,
+          and(eq(shipment.orderId, order.id), eq(shipment.storeId, order.storeId)),
+        )
+        .where(eq(order.storeId, params.storeId))
+        .groupBy(displayStatusSql, payment.status, shipment.status);
+
+      /*
+       * One grouped read, three tallies. Grouping by all three columns at once and folding in
+       * JavaScript keeps this to a single scan; three separate `GROUP BY` queries would scan the
+       * same joined rows three times for answers that are all derivable from this one.
+       *
+       * A `null` payment or shipment status means the order has none — those rows contribute to
+       * the display-status tally and to nothing else, which is why the two raw tallies skip them
+       * rather than inventing a "none" bucket the vocabularies do not contain.
+       */
+      const fold = (pick: (r: (typeof rows)[number]) => string | null) => {
+        const totals = new Map<string, number>();
+        for (const row of rows) {
+          const key = pick(row);
+          if (key === null) continue;
+          totals.set(key, (totals.get(key) ?? 0) + row.count);
+        }
+        return [...totals].map(([value, c]) => ({ value, count: c }));
+      };
+
+      return {
+        displayStatus: fold((r) => r.displayStatus),
+        paymentStatus: fold((r) => r.paymentStatus),
+        shipmentStatus: fold((r) => r.shipmentStatus),
+      };
+    },
+
     async storeCustomerExists(params: { storeId: string; customerId: string }): Promise<boolean> {
       const [row] = await executor(db)
         .select({ id: appUser.id })

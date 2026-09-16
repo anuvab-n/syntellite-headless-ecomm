@@ -3801,6 +3801,182 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/orders/summary': {
+        get: {
+          tags: ['Orders'],
+          summary: 'Operational order counts (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Three tallies for the whole store. Requires the `staff` scope.',
+            '',
+            '**Queue depths, not a report.** No money, no period, no filters — the question is',
+            '"what needs attention now". Keeping money out also keeps this endpoint clear of the',
+            'one thing the system has no answer for: whether an unpaid or cancelled order should',
+            'contribute to a total.',
+            '',
+            '`byDisplayStatus` uses the SAME composed expression `GET /admin/orders` filters by',
+            '(§49), so a tile and the list it links to can never offer different statuses.',
+            '`byPaymentStatus` and `byShipmentStatus` are the raw underlying statuses; an order',
+            'with no payment or no shipment is counted in neither of those two.',
+            '',
+            '**Every status appears, including at zero**, so the response shape is fixed and a',
+            'client never has to tell "absent" from "none".',
+            '',
+            'Store-scoped from the verified staff token. There is no query object at all.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'Operational counts.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders'],
+                    properties: {
+                      orders: {
+                        type: 'object',
+                        required: ['byDisplayStatus', 'byPaymentStatus', 'byShipmentStatus'],
+                        properties: {
+                          byDisplayStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                            description:
+                              'One key per §49 display status. `ready_to_ship` and `returned` are not derivable and never appear.',
+                          },
+                          byPaymentStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                          },
+                          byShipmentStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/summary': {
+        get: {
+          tags: ['Returns'],
+          summary: 'Operational return counts (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Return counts by status for the whole store. Requires the `staff` scope.',
+            '',
+            'Queue depth, not a report: no money, no period, no filters. Every status in the',
+            'return vocabulary appears, including the ones at zero, so the shape does not change',
+            'with the data.',
+            '',
+            'Store-scoped from the verified staff token; no query object.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'Return counts by status.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['returns'],
+                    properties: {
+                      returns: {
+                        type: 'object',
+                        required: ['byStatus'],
+                        properties: {
+                          byStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/inventory/summary': {
+        get: {
+          tags: ['Inventory'],
+          summary: 'Operational inventory counts (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'How many live SKUs have nothing sellable left. Requires the `staff` scope.',
+            '',
+            '"Out of stock" means `available <= 0`, where `available` is the stored',
+            '`on_hand - reserved`. A SKU whose entire holding is reserved therefore counts: the',
+            'next customer cannot buy it, which is the fact an operator acts on.',
+            '',
+            'Uses the same visibility rule as `GET /admin/inventory`, so this number and that',
+            'list agree on which SKUs exist — soft-deleted SKUs are excluded from both.',
+            '',
+            '**There is no low-stock figure and cannot be one in this version.** `stock_item` has',
+            'no reorder threshold, so "low" has no definition here; supplying one from a dashboard',
+            'would be a business rule arriving by the back door.',
+            '',
+            'Store-scoped from the verified staff token; no query object.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'Inventory counts.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['inventory'],
+                    properties: {
+                      inventory: {
+                        type: 'object',
+                        required: ['outOfStockSkus'],
+                        properties: {
+                          outOfStockSkus: { type: 'integer', minimum: 0 },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/admin/customers/{customerId}': {
         get: {
           tags: ['Users'],

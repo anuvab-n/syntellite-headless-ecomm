@@ -24,9 +24,12 @@ import {
   type Currency,
 } from '../../shared/money.js';
 import { ORDER_AUDIT, ORDER_RESOURCE } from './orders.events.js';
+import { ORDER_DISPLAY_STATUSES } from './order-display-status.js';
 import {
   CANCELLABLE_ORDER_STATUSES,
   CANCELLED_ORDER_STATUS,
+  PAYMENT_STATUSES,
+  SHIPMENT_STATUSES,
   type AdminOrderFilters,
   type AdminOrderRecord,
   type OrderLineRecord,
@@ -1537,6 +1540,52 @@ export function createOrdersService(deps: {
      * Everything after that is `listStoreOrders` with one more filter — same statement, same
      * ordering, same DTO — so a customer's history cannot drift from the store-wide list.
      */
+    /**
+     * **Operational counts for the store.** Increment 53. Read-only.
+     *
+     * Every status in every vocabulary appears, including the ones at zero. That is the contract:
+     * a client rendering queue tiles must not have to distinguish "absent" from "none", and a
+     * response whose KEYS change with the data is one a client ends up defending against.
+     *
+     * The repository returns only the statuses that actually occur; zero-filling happens here
+     * because the vocabulary is domain knowledge, not persistence. `ORDER_DISPLAY_STATUSES` is
+     * §49's published set — the same one the list endpoint validates its filter against — so the
+     * tiles and the filters can never offer different statuses.
+     *
+     * No transaction, no audit row, no event. A read that recorded an audit entry would make
+     * "who looked at the dashboard" indistinguishable from "who changed something".
+     */
+    async summaryForStore(params: { storeId: string }): Promise<{
+      displayStatus: Record<string, number>;
+      paymentStatus: Record<string, number>;
+      shipmentStatus: Record<string, number>;
+    }> {
+      const counts = await repository.countsForStore(params);
+
+      /**
+       * Zero-fill against a vocabulary, then add whatever the data held.
+       *
+       * The second step matters: a status the database contains but the constant does not would
+       * otherwise vanish silently. Reporting it is the honest behaviour — a dashboard is where
+       * you would want to SEE that a migration had introduced a state the code does not know.
+       */
+      const tally = (
+        vocabulary: readonly string[],
+        rows: readonly { value: string; count: number }[],
+      ): Record<string, number> => {
+        const out: Record<string, number> = {};
+        for (const status of vocabulary) out[status] = 0;
+        for (const row of rows) out[row.value] = (out[row.value] ?? 0) + row.count;
+        return out;
+      };
+
+      return {
+        displayStatus: tally(ORDER_DISPLAY_STATUSES, counts.displayStatus),
+        paymentStatus: tally(PAYMENT_STATUSES, counts.paymentStatus),
+        shipmentStatus: tally(SHIPMENT_STATUSES, counts.shipmentStatus),
+      };
+    },
+
     async listStoreOrdersForCustomer(params: {
       storeId: string;
       customerId: string;
