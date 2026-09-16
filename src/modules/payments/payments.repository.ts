@@ -58,6 +58,7 @@ export type PaymentRecord = {
   readonly method: PaymentMethod;
   readonly provider: PaymentProvider | null;
   readonly providerRef: string | null;
+  readonly providerTransactionId: string | null;
   readonly status: PaymentStatus;
   readonly currency: string;
   readonly amount: string;
@@ -94,6 +95,7 @@ const PAYMENT_COLUMNS = {
   method: payment.method,
   provider: payment.provider,
   providerRef: payment.providerRef,
+  providerTransactionId: payment.providerTransactionId,
   status: payment.status,
   currency: payment.currency,
   amount: payment.amount,
@@ -130,6 +132,7 @@ function toPaymentRecord(row: {
   method: string;
   provider: string | null;
   providerRef: string | null;
+  providerTransactionId: string | null;
   status: string;
   currency: string;
   amount: string;
@@ -359,6 +362,15 @@ export function createPaymentsRepository(deps: { db: Database }) {
       fromStatus: PaymentStatus;
       toStatus: PaymentStatus;
       failureCode: string | null;
+      /**
+       * The provider's charge id, when the notification driving this transition carried one.
+       * Increment 55.
+       *
+       * ABSENT means "this caller has nothing to say about it" and leaves the stored value
+       * alone; `null` is not how that is expressed, because a transition with no charge id must
+       * not erase one an earlier delivery recorded. Only the webhook path ever supplies it.
+       */
+      providerTransactionId?: string | null;
       at: Date;
     }): Promise<boolean> {
       const updated = await executor(db)
@@ -366,6 +378,9 @@ export function createPaymentsRepository(deps: { db: Database }) {
         .set({
           status: params.toStatus,
           failureCode: params.failureCode,
+          ...(params.providerTransactionId === undefined || params.providerTransactionId === null
+            ? {}
+            : { providerTransactionId: params.providerTransactionId }),
           updatedAt: params.at,
         })
         .where(
@@ -564,6 +579,36 @@ export function createPaymentsRepository(deps: { db: Database }) {
         : { status: row.status as PaymentStatus, method: row.method as PaymentMethod };
     },
 
+    /**
+     * **One store's payment, addressed by its ORDER NUMBER.** Increment 55.
+     *
+     * The staff counterpart of `findByOrderId`, and deliberately not user-scoped: staff read a
+     * payment regardless of who placed the order. Store-scoped on the payment AND on the join,
+     * so no combination of rows reaches past one tenant.
+     *
+     * Addressed by order number rather than by `payment.id` because the payment's own id is
+     * published nowhere — the staff list omits it, and inventing an address staff cannot obtain
+     * would make the endpoint unreachable. `uq_payment_order` makes the answer at most one row.
+     *
+     * An unknown number, another store's number, and an order with no payment are all
+     * `undefined`, so the caller answers one `404` and distinguishes nothing.
+     */
+    async findByOrderNumberForStore(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<(PaymentRecord & { orderNumber: string }) | undefined> {
+      const [row] = await executor(db)
+        .select({ ...PAYMENT_COLUMNS, orderNumber: order.orderNumber })
+        .from(payment)
+        .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+        .where(and(eq(payment.storeId, params.storeId), eq(order.orderNumber, params.orderNumber)))
+        .limit(1);
+
+      return row === undefined
+        ? undefined
+        : { ...toPaymentRecord(row), orderNumber: row.orderNumber };
+    },
+
     /** The transition timeline for one payment, oldest first. Store-scoped. */
     async listEvents(params: {
       paymentId: string;
@@ -590,6 +635,7 @@ export type AdminPaymentFilters = {
   readonly method?: string;
   readonly provider?: string;
   readonly orderNumber?: string;
+  readonly transactionId?: string;
   readonly createdFrom?: Date;
   readonly createdTo?: Date;
 };
@@ -617,6 +663,17 @@ function adminPaymentPredicate(storeId: string, filters: AdminPaymentFilters): S
    */
   if (filters.orderNumber !== undefined) {
     clauses.push(eq(order.orderNumber, filters.orderNumber));
+  }
+
+  /*
+   * An EXACT match on the provider's charge id, not a search. Increment 55.
+   *
+   * `uq_payment_provider_txn` makes it at most one row per store and serves the lookup, so no
+   * index was added for it. A substring search would be the first unbounded scan in this
+   * module, over a column whose contents this system does not choose.
+   */
+  if (filters.transactionId !== undefined) {
+    clauses.push(eq(payment.providerTransactionId, filters.transactionId));
   }
 
   /*

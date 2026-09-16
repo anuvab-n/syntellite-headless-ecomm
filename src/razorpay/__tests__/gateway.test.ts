@@ -191,9 +191,92 @@ describe('razorpay gateway', () => {
         providerEventId: 'evt_1',
         eventType: 'payment.captured',
         providerRef: 'order_ABC123',
+        providerTransactionId: 'pay_XYZ',
         outcome: 'succeeded',
         failureCode: null,
       });
+    });
+
+    /**
+     * The three provider-side identifiers, kept apart. Increment 55.
+     *
+     * `entity.order_id` and `entity.id` are adjacent fields of one object and are trivially
+     * swappable by a careless edit, which is exactly why this asserts each lands in its own
+     * place — and the delivery header in a third.
+     */
+    it('reads the charge id, the order id and the delivery id into three separate fields', () => {
+      const { gw } = gateway();
+      const body = JSON.stringify({
+        event: 'payment.captured',
+        payload: { payment: { entity: { id: 'pay_CHARGE', order_id: 'order_INTENT' } } },
+      });
+
+      const result = gw.parseVerifiedWebhook({
+        rawBody: Buffer.from(body, 'utf8'),
+        headers: { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_DELIVERY' },
+      });
+
+      expect(result).toMatchObject({
+        providerRef: 'order_INTENT',
+        providerTransactionId: 'pay_CHARGE',
+        providerEventId: 'evt_DELIVERY',
+      });
+    });
+
+    /**
+     * A notification without a charge id still describes a real transition.
+     *
+     * Losing the transition to keep the identifier would be the wrong trade: the payment did
+     * succeed or fail, and the column is nullable precisely so that fact can be recorded.
+     */
+    it('accepts an event whose entity carries no charge id, with a null transaction id', () => {
+      const { gw } = gateway();
+      const body = JSON.stringify({
+        event: 'payment.captured',
+        payload: { payment: { entity: { order_id: 'order_NOID' } } },
+      });
+
+      const result = gw.parseVerifiedWebhook({
+        rawBody: Buffer.from(body, 'utf8'),
+        headers: { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_3' },
+      });
+
+      expect(result).toMatchObject({ kind: 'event', providerTransactionId: null });
+    });
+
+    /**
+     * `provider_transaction_id` is `varchar(255)`. A longer value becomes "no charge id" HERE,
+     * at the adapter boundary — not an insert that fails inside the webhook transaction and
+     * asks the provider to retry something that can never succeed.
+     */
+    it('drops a charge id wider than the column rather than failing the event', () => {
+      const { gw } = gateway();
+      const body = JSON.stringify({
+        event: 'payment.captured',
+        payload: { payment: { entity: { id: `pay_${'x'.repeat(300)}`, order_id: 'order_LONG' } } },
+      });
+
+      const result = gw.parseVerifiedWebhook({
+        rawBody: Buffer.from(body, 'utf8'),
+        headers: { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_4' },
+      });
+
+      expect(result).toMatchObject({ kind: 'event', providerTransactionId: null });
+    });
+
+    it('ignores a non-string charge id', () => {
+      const { gw } = gateway();
+      const body = JSON.stringify({
+        event: 'payment.captured',
+        payload: { payment: { entity: { id: 12345, order_id: 'order_NUM' } } },
+      });
+
+      const result = gw.parseVerifiedWebhook({
+        rawBody: Buffer.from(body, 'utf8'),
+        headers: { 'x-razorpay-signature': sign(body), 'x-razorpay-event-id': 'evt_5' },
+      });
+
+      expect(result).toMatchObject({ kind: 'event', providerTransactionId: null });
     });
 
     it('maps a failed event to the domain failure code, not the provider string', () => {

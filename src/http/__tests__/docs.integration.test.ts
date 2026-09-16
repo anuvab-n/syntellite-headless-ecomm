@@ -250,6 +250,9 @@ describe('API documentation', () => {
     apiRouter.get('/admin/orders/:orderNumber/shipments', (_req, res) => {
       res.status(200).json({ shipments: [] });
     });
+    apiRouter.get('/admin/orders/:orderNumber/payment', (_req, res) => {
+      res.status(200).json({ payment: {} });
+    });
     apiRouter.get('/admin/orders', (_req, res) => {
       res.status(200).json({ orders: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
@@ -492,6 +495,7 @@ describe('API documentation', () => {
         '/api/v1/admin/orders/summary',
         '/api/v1/admin/orders/{orderNumber}',
         '/api/v1/admin/orders/{orderNumber}/invoice',
+        '/api/v1/admin/orders/{orderNumber}/payment',
         '/api/v1/admin/orders/{orderNumber}/shipments',
         '/api/v1/admin/payments',
         '/api/v1/admin/products',

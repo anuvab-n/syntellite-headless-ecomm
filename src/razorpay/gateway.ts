@@ -100,6 +100,15 @@ export type RazorpayGateway = {
         readonly providerEventId: string;
         readonly eventType: string;
         readonly providerRef: string;
+        /**
+         * Razorpay's id for the CHARGE (`pay_…`), from `payload.payment.entity.id`.
+         *
+         * Distinct from `providerRef`, which is the ORDER (`order_…`) this event is matched
+         * against, and from `providerEventId`, which is the delivery header. Nullable because a
+         * notification is free to omit it and a missing charge id must not cost us the
+         * transition the event describes.
+         */
+        readonly providerTransactionId: string | null;
         readonly outcome: 'succeeded' | 'failed';
         readonly failureCode: string | null;
       };
@@ -153,7 +162,9 @@ function verifySignature(params: {
  * checked, and even afterwards a provider is free to add fields. Reading exactly what is needed
  * means an unexpected shape becomes `malformed` instead of a runtime crash inside a handler.
  */
-function readEnvelope(raw: Buffer): { event: string; orderId: string | null } | null {
+function readEnvelope(
+  raw: Buffer,
+): { event: string; orderId: string | null; paymentId: string | null } | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw.toString('utf8'));
@@ -171,12 +182,33 @@ function readEnvelope(raw: Buffer): { event: string; orderId: string | null } | 
    */
   const entity = (parsed as { payload?: { payment?: { entity?: unknown } } }).payload?.payment
     ?.entity;
-  const orderId =
+  const fields =
     typeof entity === 'object' && entity !== null
-      ? (entity as { order_id?: unknown }).order_id
-      : undefined;
+      ? (entity as { order_id?: unknown; id?: unknown })
+      : {};
 
-  return { event, orderId: typeof orderId === 'string' && orderId.length > 0 ? orderId : null };
+  /*
+   * `entity.id` is Razorpay's id for the CHARGE — `pay_…`, the one its dashboard shows. Read
+   * beside `order_id` rather than in a second pass, so the two can never be taken from
+   * different entities.
+   *
+   * Bounded at the column's width HERE, at the adapter boundary, rather than trusted to be
+   * short: the body is the provider's, `provider_transaction_id` is `varchar(255)`, and a
+   * longer value must become "no charge id" rather than an insert that fails inside a webhook
+   * transaction and asks the provider to retry something that can never succeed.
+   */
+  const paymentId = fields.id;
+
+  return {
+    event,
+    orderId: readBoundedString(fields.order_id),
+    paymentId: readBoundedString(paymentId),
+  };
+}
+
+/** A non-empty string no wider than the columns these values land in, or `null`. */
+function readBoundedString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 && value.length <= 255 ? value : null;
 }
 
 /* ── The adapter ─────────────────────────────────────────────────────────── */
@@ -316,6 +348,7 @@ export function createRazorpayGateway(deps: {
         providerEventId: eventId,
         eventType: envelope.event,
         providerRef: envelope.orderId,
+        providerTransactionId: envelope.paymentId,
         outcome: succeeded ? 'succeeded' : 'failed',
         failureCode: succeeded ? null : FAILURE_CODE_DECLINED,
       };

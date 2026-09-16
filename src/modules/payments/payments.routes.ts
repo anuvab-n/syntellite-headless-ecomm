@@ -10,6 +10,7 @@ import {
   InitiatePaymentRequestSchema,
   ListPaymentsQuerySchema,
   OrderNumberParamsSchema,
+  toAdminPaymentDetailResponse,
   toAdminPaymentListResponse,
   toPaymentListResponse,
   toHandoffResponse,
@@ -23,17 +24,20 @@ import type { AdminPaymentFilters } from './payments.repository.js';
 import type { PaymentsService } from './payments.service.js';
 
 /**
- * The payments module's HTTP surface: three customer routes and one staff route.
+ * The payments module's HTTP surface: three customer routes and two staff routes.
  *
- * **The staff surface is exactly one route, and it is a READ** — `GET /admin/payments`, added
- * in Increment 51. The two questions this file previously recorded as undecided now have
- * answers: a support agent may see every payment in their OWN store and none from another, and
- * a provider reference is NOT among the fields — `providerRef` is the handle used to act on the
- * provider side, so it goes to the paying customer for the checkout handoff and to nobody else.
+ * **The staff surface is two routes, and both are READS** — `GET /admin/payments` (Increment 51)
+ * and `GET /admin/orders/{orderNumber}/payment` (Increment 55). A support agent may see every
+ * payment in their OWN store and none from another.
  *
- * **Still deliberately absent:** payment detail, refunds, reconciliation, and any staff
- * mutation at all. Staff may see that a payment exists and what state it reached; changing one
- * is not part of this increment and would need its own decisions about money.
+ * The provider's identifiers appear on the DETAIL only, never on the list and never on any
+ * customer surface. `providerRef` is the provider's ORDER handle and `providerTransactionId` is
+ * its CHARGE id — the one a merchant looks up in the gateway's dashboard. Neither is a
+ * credential, and the secret each pairs with never leaves the adapter's closure.
+ *
+ * **Still deliberately absent:** refunds, reconciliation, the payment transition timeline, and
+ * any staff mutation at all. Staff may see that a payment exists and what state it reached;
+ * changing one is not part of this increment and would need its own decisions about money.
  *
  * ## The middleware chain
  *
@@ -259,6 +263,49 @@ export function createPaymentsRoutes(deps: {
         res.status(200).json(toAdminPaymentListResponse(page));
       }),
     );
+
+    /**
+     * `GET /admin/orders/{orderNumber}/payment` — one payment, for staff. Increment 55.
+     *
+     * The read the list could not give: the list pages and filters, but nothing could answer
+     * "show me THIS order's payment", and the provider's charge id had nowhere to be published.
+     *
+     * ### Addressed by order number, not by `payment.id`
+     *
+     * The payment's own id is published nowhere in this system — the staff list omits it by
+     * design, because a payment is addressed by the order it pays for. A `/admin/payments/{id}`
+     * route would therefore be unreachable by any client that had not first been given an id no
+     * endpoint returns. `uq_payment_order` makes the order number an exact address.
+     *
+     * The path mirrors the customer's `GET /users/me/orders/{orderNumber}/payment` above and
+     * fulfilment's `GET /admin/orders/{orderNumber}/shipments`. It does not collide with the
+     * orders router's `/admin/orders/{orderNumber}`, mounted earlier: that route matches a
+     * SINGLE trailing segment, and this path has two.
+     *
+     * Three fields more than the list row — `provider`, `providerRef` and
+     * `providerTransactionId` — and no history: the transition timeline is a separate surface
+     * that was not part of this increment.
+     *
+     * Failure modes: `400` for a malformed order number; `401` unauthenticated; `403` without
+     * the `staff` scope; `404` for an unknown order, another store's order, and an order with
+     * no payment alike — the query returns nothing for all three, so they cannot be told apart.
+     */
+    router.get(
+      '/admin/orders/:orderNumber/payment',
+      auth,
+      requireStaff,
+      validate({ params: OrderNumberParamsSchema }),
+      asyncHandler(async (req, res) => {
+        const { orderNumber } = validatedParams<OrderNumberParams>(req);
+
+        const record = await payments.getStorePaymentForOrder({
+          orderNumber,
+          storeId: requireUser(req).storeId,
+        });
+
+        res.status(200).json({ payment: toAdminPaymentDetailResponse(record) });
+      }),
+    );
   }
 
   return router;
@@ -280,6 +327,7 @@ function adminPaymentFilters(query: AdminListPaymentsQuery): AdminPaymentFilters
     ...(query.method === undefined ? {} : { method: query.method }),
     ...(query.provider === undefined ? {} : { provider: query.provider }),
     ...(query.orderNumber === undefined ? {} : { orderNumber: query.orderNumber }),
+    ...(query.transactionId === undefined ? {} : { transactionId: query.transactionId }),
     ...(query.createdFrom === undefined ? {} : { createdFrom: new Date(query.createdFrom) }),
     ...(query.createdTo === undefined ? {} : { createdTo: new Date(query.createdTo) }),
   };

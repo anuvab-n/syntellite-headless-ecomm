@@ -130,6 +130,15 @@ export type PaymentGateway = {
         readonly providerEventId: string;
         readonly eventType: string;
         readonly providerRef: string;
+        /**
+         * The provider's id for the CHARGE, if the notification carried one. Increment 55.
+         *
+         * Distinct from `providerRef` — that is the provider ORDER this event is matched
+         * against — and from `providerEventId`, which identifies the delivery. Nullable: a
+         * notification without one still describes a real transition, and losing the transition
+         * to keep the id would be the wrong trade.
+         */
+        readonly providerTransactionId: string | null;
         readonly outcome: 'succeeded' | 'failed';
         readonly failureCode: string | null;
       };
@@ -741,6 +750,28 @@ export function createPaymentsService(deps: {
     },
 
     /**
+     * **One store's payment, for staff, addressed by order number.** Increment 55. Read-only.
+     *
+     * The read the admin surface was missing: `GET /admin/payments` can page and filter, but
+     * nothing could answer "show me THIS order's payment", and the provider's charge id has
+     * nowhere to be published without it.
+     *
+     * Addressed by order number, not by `payment.id`: that id is published nowhere, so an
+     * id-addressed route would be unreachable by any client. `uq_payment_order` makes the
+     * answer at most one payment.
+     *
+     * No transaction, no audit row, no event, no state change.
+     */
+    async getStorePaymentForOrder(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<PaymentRecord & { orderNumber: string }> {
+      const found = await repository.findByOrderNumberForStore(params);
+      if (found === undefined) throw new NotFound('payment');
+      return found;
+    },
+
+    /**
      * The status and method of an order's payment, for a caller deciding what to say or do
      * about that order.
      *
@@ -824,8 +855,14 @@ export function createPaymentsService(deps: {
 
       const target: PaymentStatus = parsed.outcome === 'succeeded' ? 'succeeded' : 'failed';
 
-      try {
-        return await withTransaction(db, logger, async () => {
+      /**
+       * One attempt at the transition. Increment 55.
+       *
+       * `recordTransactionId` exists for exactly one reason, stated at the call site below: the
+       * charge id is SUPPLEMENTARY, and it must never be the thing that costs us a transition.
+       */
+      const attempt = async (recordTransactionId: boolean) =>
+        withTransaction(db, logger, async () => {
           /*
            * The store is resolved HERE, and it comes from our own row — see the repository
            * method's comment. The notification body is never consulted for tenancy.
@@ -915,6 +952,15 @@ export function createPaymentsService(deps: {
             fromStatus: locked.status,
             toStatus: target,
             failureCode: parsed.failureCode,
+            /*
+             * The provider's charge id, recorded on the transition that carried it. Increment 55.
+             *
+             * Written HERE and nowhere else: it is only knowable from a notification whose
+             * signature has already been verified, and `parseVerifiedWebhook` is one call
+             * precisely so that unverified data cannot reach this line. `uq_payment_provider_txn`
+             * is what stops one charge being recorded against two payments.
+             */
+            providerTransactionId: recordTransactionId ? parsed.providerTransactionId : null,
             at: new Date(),
           });
 
@@ -984,6 +1030,36 @@ export function createPaymentsService(deps: {
 
           return { outcome: 'applied', status: target } as const;
         });
+
+      try {
+        try {
+          return await attempt(true);
+        } catch (err) {
+          /**
+           * `uq_payment_provider_txn`: this charge id is already recorded against a DIFFERENT
+           * payment in this store. Increment 55.
+           *
+           * A provider does not reuse a charge id, so reaching here means something is wrong —
+           * a shared provider account, a replayed fixture, a corrupted row. It is logged at
+           * `error` for that reason, exactly as an ambiguous reference is.
+           *
+           * **But the transition is retried without the id rather than abandoned.** The money
+           * moved; the id is how we cross-reference it later. Losing a `succeeded` because we
+           * could not file a reference would leave a paid order unpaid, and refusing would also
+           * answer the provider `500` and invite it to redeliver a notification that can never
+           * succeed — which this module's own rule forbids. Dropping the reference is the
+           * smaller, recoverable harm, and the log is what makes it findable.
+           *
+           * The first attempt's transaction rolled back in full, so the retry starts clean.
+           */
+          if (uniqueViolationConstraint(err) !== 'uq_payment_provider_txn') throw err;
+
+          logger.error(
+            { provider: gateway.provider, eventType: parsed.eventType },
+            'payment_webhook_transaction_id_already_recorded',
+          );
+          return await attempt(false);
+        }
       } catch (err) {
         /*
          * `uq_payment_event_provider`. This exact provider event has already been recorded, so

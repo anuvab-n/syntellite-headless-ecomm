@@ -245,6 +245,25 @@ export const AdminListPaymentsQuerySchema = z.strictObject({
     .regex(/^ORD-\d{8}-[A-Z2-9]{6}$/, 'must be an order number of the form ORD-YYYYMMDD-XXXXXX')
     .optional(),
 
+  /**
+   * An EXACT provider charge id — Razorpay's `pay_…`. Increment 55.
+   *
+   * Validated as a charset and a length, NOT as a `pay_` prefix. `order_number` above is OUR
+   * format, so a shape regex there asserts something this system guarantees; this value is the
+   * provider's, and pinning its shape would turn a provider changing its own identifiers into a
+   * `400` on a lookup that would otherwise have worked. The bound that matters is the column's:
+   * `varchar(255)`.
+   *
+   * Exact, not a search. `uq_payment_provider_txn` makes it at most one row per store.
+   */
+  transactionId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(255)
+    .regex(/^[A-Za-z0-9_-]+$/, 'must be a provider transaction id')
+    .optional(),
+
   createdFrom: instantField.optional(),
   createdTo: instantField.optional(),
 });
@@ -312,5 +331,43 @@ export function toAdminPaymentListResponse(page: {
   return {
     payments: page.items.map(toAdminPaymentResponse),
     pagination: { limit: page.limit, offset: page.offset, total: page.total },
+  };
+}
+
+/* ── GET /admin/orders/{orderNumber}/payment ─────────────────────────────── */
+
+/**
+ * One payment, for staff, with the provider's identifiers. Increment 55.
+ *
+ * **Extended, not modified.** `AdminPaymentResponse` above is the shipped list contract, shared
+ * with `GET /admin/payments`; changing it would change that endpoint's published shape, so this
+ * composes on top of it instead.
+ *
+ * Three fields more than the list row, and each names exactly one thing:
+ *
+ *  - `provider` — which gateway, already on the list row.
+ *  - `providerRef` — the provider's ORDER (`order_…`), created at initiation. Null for COD.
+ *  - `providerTransactionId` — the provider's CHARGE (`pay_…`), the id a merchant pastes into
+ *    the gateway's dashboard. Null for COD, null until a payment succeeds, and null for every
+ *    payment taken before the column existed.
+ *
+ * Deliberately absent, and each for a stated reason: `payment.id` (published nowhere; a payment
+ * is addressed by its order number), `userId`, `orderId`, `storeId` (internal keys; tenancy is
+ * an invariant of the query), `amountMinor` (money leaves as a decimal string), and
+ * `providerEventId` (the webhook DELIVERY id — deduplication material, not a charge reference,
+ * and it lives on the event row, not here).
+ */
+export type AdminPaymentDetailResponse = AdminPaymentResponse & {
+  readonly providerRef: string | null;
+  readonly providerTransactionId: string | null;
+};
+
+export function toAdminPaymentDetailResponse(
+  record: PaymentRecord & { orderNumber: string },
+): AdminPaymentDetailResponse {
+  return {
+    ...toAdminPaymentResponse(record),
+    providerRef: record.providerRef,
+    providerTransactionId: record.providerTransactionId,
   };
 }

@@ -1863,6 +1863,38 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         OrderAddress: ORDER_ADDRESS,
         OrderPromotion: ORDER_PROMOTION,
         AdminPayment: ADMIN_PAYMENT,
+        AdminPaymentDetail: {
+          allOf: [
+            { $ref: '#/components/schemas/AdminPayment' },
+            {
+              type: 'object',
+              required: ['providerRef', 'providerTransactionId'],
+              properties: {
+                providerRef: {
+                  description: [
+                    'The provider’s **order** handle — Razorpay’s `order_…`, created at initiation,',
+                    'before anybody paid. Null for `cod`.',
+                  ].join(' '),
+                  oneOf: [{ type: 'string', maxLength: 255 }, { type: 'null' }],
+                },
+                providerTransactionId: {
+                  description: [
+                    'The provider’s **charge** id — Razorpay’s `pay_…`. This is the “Transaction ID”',
+                    'a merchant looks up in the gateway’s dashboard, and it is a different entity',
+                    'from `providerRef` above.',
+                    '',
+                    'Null in four ordinary cases, all of them permanent for the row concerned: a',
+                    '`cod` payment (no gateway), a payment still `pending` (no charge yet), a',
+                    'failure the provider reported without one, and any payment taken before this',
+                    'field existed — those charges are real and their ids were never captured, so',
+                    'nothing could be backfilled that would not be invented.',
+                  ].join('\n'),
+                  oneOf: [{ type: 'string', maxLength: 255 }, { type: 'null' }],
+                },
+              },
+            },
+          ],
+        },
         AdminCustomer: ADMIN_CUSTOMER,
         AdminOrderCustomer: ADMIN_ORDER_CUSTOMER,
         AdminOrderPayment: ADMIN_ORDER_PAYMENT,
@@ -3760,6 +3792,89 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/orders/{orderNumber}/payment': {
+        get: {
+          tags: ['Payments'],
+          summary: 'Read an order’s payment (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The order’s payment, with the provider’s identifiers. Requires the `staff` scope.',
+            '',
+            'The list above pages and filters; this answers “show me THIS order’s payment”, and it',
+            'is where the provider’s charge id is published.',
+            '',
+            '### Why the order number addresses it',
+            '',
+            'The payment’s own id is published nowhere in this API — the staff list omits it',
+            'because a payment is addressed by the order it pays for — so a `/admin/payments/{id}`',
+            'route would be unreachable by any client that had not first been handed an id no',
+            'endpoint returns. `uq_payment_order` makes one order exactly one payment, so the order',
+            'number is an exact address rather than a filter.',
+            '',
+            '### Three fields the list row does not carry',
+            '',
+            '| Field | What it is |',
+            '| --- | --- |',
+            '| `provider` | Which gateway handled it. Null for `cod`. |',
+            '| `providerRef` | The provider’s **order** — Razorpay `order_…`, written by us at initiation, before anybody paid. |',
+            '| `providerTransactionId` | The provider’s **charge** — Razorpay `pay_…`, the “Transaction ID” its dashboard shows. |',
+            '',
+            'Those last two are routinely confused and are different entities. Neither is a',
+            'credential: acting on the provider requires the API secret, which never leaves the',
+            'server. A third identifier, the webhook **delivery** id, is deduplication material and',
+            'is not published here or anywhere else.',
+            '',
+            '### Still absent',
+            '',
+            '`amountMinor`, the internal payment id, `userId`, `orderId`, `storeId`, and the',
+            'transition timeline — the last is a separate surface that this route does not open.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. An unknown order, another store’s order,',
+            'and an order with no payment are all `404` and indistinguishable.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The order’s payment.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['payment'],
+                    properties: {
+                      payment: { $ref: '#/components/schemas/AdminPaymentDetail' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such order in this store, or the order has no payment. The two are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/admin/payments': {
         get: {
           tags: ['Payments'],
@@ -3781,7 +3896,9 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '| `amountMinor` | The integer mirror kept for the provider call. Money leaves this system as a decimal string; publishing both invites a client to pick one. |',
             '| internal ids | A payment is addressed here by its order number. |',
             '',
-            'There is also **no payment detail route, no refund, no reconciliation and no staff',
+            'The provider’s identifiers live on the DETAIL route, `GET',
+            '/api/v1/admin/orders/{orderNumber}/payment` — one payment read deliberately, rather',
+            'than a page of handles. There is still **no refund, no reconciliation and no staff',
             'mutation of any kind**. Staff may see that a payment exists and what state it reached.',
             '',
             '### Tenancy',
@@ -3841,6 +3958,25 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               description:
                 'An EXACT order number, not a search. `uq_payment_order` means this narrows to at most one payment. An unknown number is an empty page, not a `404` — it is a filter, not a lookup.',
               schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+            {
+              name: 'transactionId',
+              in: 'query',
+              required: false,
+              description: [
+                'An EXACT provider **charge** id — Razorpay’s `pay_…`, the id its dashboard shows',
+                'against a payment. `uq_payment_provider_txn` makes this at most one row per store.',
+                '',
+                'Not `providerRef`, which is the provider **order** (`order_…`) created before',
+                'anybody paid, and not the webhook delivery id. Matches no `cod` payment and no',
+                'payment that has not been charged — both have none.',
+                '',
+                'Validated as a charset and a length, not as a `pay_` prefix: the value belongs to',
+                'the provider, and pinning its shape would turn the provider changing its own',
+                'identifiers into a `400` on a lookup that would otherwise have worked.',
+              ].join('\n'),
+              schema: { type: 'string', minLength: 1, maxLength: 255, pattern: '^[A-Za-z0-9_-]+$' },
+              example: 'pay_MgkB2Xq7RtLmNp',
             },
             {
               name: 'createdFrom',
