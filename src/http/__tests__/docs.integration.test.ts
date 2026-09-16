@@ -260,6 +260,17 @@ describe('API documentation', () => {
       res.status(200).json({ customers: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
     /*
+     * Four segments, declared before the three-segment detail below. In production these live in
+     * DIFFERENT routers — the history in orders, the detail in identity — and cannot collide
+     * because their segment counts differ; declaring them in this order keeps that visible.
+     */
+    apiRouter.get('/admin/customers/:customerId/orders', (_req, res) => {
+      res.status(200).json({ orders: [], pagination: { limit: 25, offset: 0, total: 0 } });
+    });
+    apiRouter.get('/admin/customers/:customerId', (_req, res) => {
+      res.status(200).json({ customer: {} });
+    });
+    /*
      * Registered AFTER `/admin/orders/fulfilment` above, mirroring production: in the real
      * application the fulfilment queue is protected by the `onlyOrderNumber` guard in the orders
      * router, and here by nothing more than declaration order. Either way, a stub that shadowed
@@ -446,6 +457,8 @@ describe('API documentation', () => {
       // — the inverse drift of the test above.
       expect(paths.sort()).toEqual([
         '/api/v1/admin/customers',
+        '/api/v1/admin/customers/{customerId}',
+        '/api/v1/admin/customers/{customerId}/orders',
         '/api/v1/admin/inventory',
         '/api/v1/admin/inventory/adjustments',
         '/api/v1/admin/inventory/{skuCode}/history',

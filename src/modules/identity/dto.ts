@@ -411,6 +411,22 @@ export const AdminListCustomersQuerySchema = z.strictObject({
 
 export type AdminListCustomersQuery = z.infer<typeof AdminListCustomersQuerySchema>;
 
+/* ── GET /admin/customers/{customerId} ───────────────────────────────────── */
+
+/**
+ * The path parameter: the customer's id.
+ *
+ * A UUID by SHAPE only. Whether the row exists, belongs to this store, or has been erased is
+ * decided by the query — never by validation — so a malformed id is a `400` and every other
+ * miss is a `404` that reveals nothing.
+ *
+ * Unlike an order, a customer has no business-facing number to be addressed by, which is why
+ * `id` is the one internal identifier the admin customer contract publishes.
+ */
+export const CustomerIdParamsSchema = z.object({ customerId: z.uuid() });
+
+export type CustomerIdParams = z.infer<typeof CustomerIdParamsSchema>;
+
 /**
  * One row of the staff customer list.
  *

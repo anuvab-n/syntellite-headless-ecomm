@@ -622,6 +622,198 @@ describe('admin customers (integration)', () => {
     });
   });
 
+  /* ── 6c. GET /admin/customers/:customerId — the detail route ──────────── */
+
+  /**
+   * The single-customer read. Increment 52.
+   *
+   * Shares the list's projection and mapper, so most of what could go wrong here is already
+   * covered above. What is genuinely new is the NOT-FOUND surface: three different reasons a
+   * customer is unreachable — unknown, foreign, erased — which must be indistinguishable, and
+   * which a naive implementation would answer differently (404 / 200 / 200).
+   */
+  describe('customer detail', () => {
+    const detail = (id: string) => api().get(`/api/v1/admin/customers/${id}`).set(asStaff());
+
+    it('refuses an anonymous request with 401', async () => {
+      const target = registered[1];
+      expect(target).toBeDefined();
+      if (!target) return;
+      expect((await api().get(`/api/v1/admin/customers/${target.id}`)).status).toBe(401);
+    });
+
+    it('refuses an authenticated non-staff customer with 403', async () => {
+      const target = registered[1];
+      expect(target).toBeDefined();
+      if (!target) return;
+      expect(
+        (await api().get(`/api/v1/admin/customers/${target.id}`).set(asCustomer())).status,
+      ).toBe(403);
+    });
+
+    it('serves active staff with 200 and the seven documented fields', async () => {
+      const target = registered[1];
+      expect(target).toBeDefined();
+      if (!target) return;
+
+      const res = await detail(target.id);
+      expect(res.status).toBe(200);
+      expect(Object.keys(res.body.customer as Record<string, unknown>).sort()).toEqual([
+        'createdAt',
+        'email',
+        'firstName',
+        'id',
+        'isActive',
+        'lastName',
+        'updatedAt',
+      ]);
+      expect(res.body.customer.id).toBe(target.id);
+      expect(res.body.customer.email).toBe(target.email);
+    });
+
+    it('stops serving a demoted staff member on the very next request', async () => {
+      const user = await register('demote.detail.admincust', { staff: true });
+      const auth = { Authorization: `Bearer ${await login(user.email)}` };
+      const path = `/api/v1/admin/customers/${user.id}`;
+
+      expect((await api().get(path).set(auth)).status).toBe(200);
+      await db().update(appUser).set({ isStaff: false }).where(eq(appUser.id, user.id));
+      expect((await api().get(path).set(auth)).status).toBe(403);
+    });
+
+    it('refuses a deactivated staff member with 401', async () => {
+      const user = await register('deactivate.detail.admincust', { staff: true });
+      const auth = { Authorization: `Bearer ${await login(user.email)}` };
+      const path = `/api/v1/admin/customers/${user.id}`;
+
+      expect((await api().get(path).set(auth)).status).toBe(200);
+      await db().update(appUser).set({ isActive: false }).where(eq(appUser.id, user.id));
+      expect((await api().get(path).set(auth)).status).toBe(401);
+    });
+
+    it('rejects a malformed UUID with 400', async () => {
+      const res = await detail('not-a-uuid');
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('answers 404 for an unknown customer', async () => {
+      expect((await detail(newId())).status).toBe(404);
+    });
+
+    /**
+     * The three not-found reasons must be indistinguishable. A soft-deleted customer is the one
+     * most likely to leak: the row is right there, and only the `deleted_at IS NULL` predicate
+     * keeps it from being served.
+     */
+    it('answers 404 for a soft-deleted customer, identically to an unknown one', async () => {
+      const target = await register('erased.detail.admincust', { staff: false });
+      expect((await detail(target.id)).status).toBe(200);
+
+      await pool().query('update app_user set deleted_at = now() where id = $1', [target.id]);
+
+      const erased = await detail(target.id);
+      const unknown = await detail(newId());
+      expect(erased.status).toBe(404);
+      expect(erased.body.error.code).toBe(unknown.body.error.code);
+    });
+
+    /**
+     * Tenancy, proven against a REAL customer in another store rather than against an absence.
+     * Asserting only that an invented id 404s would pass against a repository with no tenant
+     * predicate at all, since an invented id matches nothing either way.
+     */
+    it('answers 404 for a customer belonging to another store', async () => {
+      const otherStoreId = newId();
+      const foreignId = newId();
+      await pool().query(
+        `insert into store (id, slug, name, currency, timezone, is_active)
+         values ($1, $2, 'Detail Other Store', 'INR', 'Asia/Kolkata', true)`,
+        [otherStoreId, `detail-other-${otherStoreId.slice(0, 8)}`],
+      );
+      await pool().query(
+        `insert into app_user (id, store_id, email, password_hash, first_name, last_name)
+         values ($1, $2, $3, 'argon2-placeholder', 'Foreign', 'Detail')`,
+        [foreignId, otherStoreId, `foreign.detail.${foreignId}@example.com`],
+      );
+
+      // The row exists and is live — only the tenant predicate keeps it out.
+      const { rows } = await pool().query<{ c: string }>(
+        'select count(*)::text c from app_user where id = $1 and deleted_at is null',
+        [foreignId],
+      );
+      expect(Number(rows[0]?.c ?? '0')).toBe(1);
+
+      expect((await detail(foreignId)).status).toBe(404);
+    });
+
+    it('never leaks a credential, a privilege flag or a token field', async () => {
+      const target = registered[1];
+      expect(target).toBeDefined();
+      if (!target) return;
+
+      const body = JSON.stringify((await detail(target.id)).body);
+      for (const field of [
+        'passwordHash',
+        'password_hash',
+        'isStaff',
+        'is_staff',
+        'isSuperuser',
+        'is_superuser',
+        'storeId',
+        'store_id',
+        'deletedAt',
+        'deleted_at',
+        'tokenHash',
+        'refreshToken',
+      ]) {
+        expect(body).not.toContain(field);
+      }
+    });
+
+    /** The list and the detail must describe the same customer identically. */
+    it('agrees field for field with the list row for the same customer', async () => {
+      const target = registered[1];
+      expect(target).toBeDefined();
+      if (!target) return;
+
+      const list = await api().get('/api/v1/admin/customers?limit=100').set(asStaff());
+      const fromList = (list.body.customers as { id: string }[]).find((c) => c.id === target.id);
+      expect(fromList).toBeDefined();
+
+      expect((await detail(target.id)).body.customer).toEqual(fromList);
+    });
+
+    it('writes nothing', async () => {
+      const target = registered[1];
+      expect(target).toBeDefined();
+      if (!target) return;
+
+      const countOf = async (sql: string): Promise<string> => {
+        const { rows } = await pool().query<{ c: string }>(sql);
+        return rows[0]?.c ?? '?';
+      };
+      const snapshot = async () => {
+        const { rows: userState } = await pool().query<{ c: string; m: string }>(
+          "select count(*)::text c, coalesce(max(updated_at)::text, '-') m from app_user",
+        );
+        return {
+          users: userState[0],
+          audits: (await db().select({ id: auditLog.id }).from(auditLog)).length,
+          events: (await db().select({ id: outboxEvent.id }).from(outboxEvent)).length,
+          sessions: await countOf('select count(*)::text c from refresh_session'),
+          resets: await countOf('select count(*)::text c from password_reset_token'),
+          keys: await countOf('select count(*)::text c from idempotency_key'),
+        };
+      };
+
+      const before = await snapshot();
+      await detail(target.id);
+      await detail(newId());
+      expect(await snapshot()).toEqual(before);
+    });
+  });
+
   /* ── 7. Existing behaviour is intact ──────────────────────────────────── */
 
   describe('regression against the existing identity surface', () => {

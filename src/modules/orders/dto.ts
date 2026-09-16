@@ -412,6 +412,38 @@ export const AdminListOrdersQuerySchema = z.strictObject({
 
 export type AdminListOrdersQuery = z.infer<typeof AdminListOrdersQuerySchema>;
 
+/* ── GET /admin/customers/{customerId}/orders ────────────────────────────── */
+
+/**
+ * The customer whose history is being read. A UUID by SHAPE only.
+ *
+ * Whether that customer exists, belongs to this store, or has been erased is decided by the
+ * query — so a malformed id is a `400` and every other miss is a `404`.
+ */
+export const AdminCustomerOrdersParamsSchema = z.object({ customerId: z.uuid() });
+
+export type AdminCustomerOrdersParams = z.infer<typeof AdminCustomerOrdersParamsSchema>;
+
+/**
+ * Paging only.
+ *
+ * Deliberately NOT the full `AdminListOrdersQuerySchema`: the store-wide list's filters —
+ * status, dates, the search box — are a different feature, and offering half of them here would
+ * invite a client to discover which half. A customer's history is a chronological list; the
+ * store-wide list is where filtering lives. `strictObject`, so a filter sent here is a `400`
+ * naming it rather than one silently ignored.
+ */
+export const AdminCustomerOrdersQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_ORDER_LIST_MAX_LIMIT,
+    default: ADMIN_ORDER_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+});
+
+export type AdminCustomerOrdersQuery = z.infer<typeof AdminCustomerOrdersQuerySchema>;
+
 /**
  * The customer, as an operator sees them on an order.
  *

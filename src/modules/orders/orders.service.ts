@@ -1526,6 +1526,43 @@ export function createOrdersService(deps: {
     },
 
     /**
+     * **A page of ONE customer's orders, for staff.** Increment 52. Read-only.
+     *
+     * The customer's existence is checked FIRST, and separately: without it an unknown, foreign
+     * or soft-deleted customer would get `200` with an empty page, which asserts "this person
+     * has no orders" about somebody who is not there. The check uses the same tenant and
+     * liveness predicate `identity` uses for its own customer reads, so the two surfaces agree
+     * on who exists.
+     *
+     * Everything after that is `listStoreOrders` with one more filter — same statement, same
+     * ordering, same DTO — so a customer's history cannot drift from the store-wide list.
+     */
+    async listStoreOrdersForCustomer(params: {
+      storeId: string;
+      customerId: string;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly AdminOrderRecord[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const exists = await repository.storeCustomerExists({
+        storeId: params.storeId,
+        customerId: params.customerId,
+      });
+      if (!exists) throw new NotFound('customer');
+
+      return this.listStoreOrders({
+        storeId: params.storeId,
+        limit: params.limit,
+        offset: params.offset,
+        filters: { customerId: params.customerId },
+      });
+    },
+
+    /**
      * One order in this store with its lines, its customer and its lifecycle states. Staff read.
      *
      * Two queries, not one: the header with its joins, then the lines. Folding the lines into the

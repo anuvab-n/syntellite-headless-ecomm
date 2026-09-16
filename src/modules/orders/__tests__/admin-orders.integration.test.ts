@@ -601,6 +601,323 @@ describe('admin orders (integration)', () => {
     });
   });
 
+  /* ── GET /admin/customers/:customerId/orders ──────────────────────────── */
+
+  /**
+   * One customer's order history. Increment 52.
+   *
+   * The route lives in THIS module, not identity, because it returns orders — putting it in
+   * identity would make identity read the `order` table and invert a dependency that already
+   * runs the other way. These cases prove the two predicates that matter: the rows are one
+   * customer's, and they are one store's.
+   *
+   * The subject is `otherCustomerToken`'s account, which has placed nothing until this block —
+   * so the "no orders yet" case is genuine rather than manufactured.
+   */
+  describe('customer order history', () => {
+    let subjectId = '';
+    let subjectOrders: string[] = [];
+    let bystanderId = '';
+
+    const historyOf = (id: string, qs = '') =>
+      api().get(`/api/v1/admin/customers/${id}/orders${qs}`).set(asStaff());
+
+    beforeAll(async () => {
+      // The bystander already owns every order this suite placed so far.
+      const { rows: bys } = await container.db.pool.query<{ id: string }>(
+        `select u.id from app_user u join "order" o on o.user_id = u.id
+          where u.store_id = $1 group by u.id limit 1`,
+        [storeId],
+      );
+      bystanderId = bys[0]?.id ?? '';
+      expect(bystanderId).not.toBe('');
+
+      // The subject: a different customer, with three orders of their own.
+      const me = await api()
+        .get('/api/v1/users/me')
+        .set({ Authorization: `Bearer ${otherCustomerToken}` });
+      expect(me.status).toBe(200);
+      subjectId = me.body.user.id as string;
+
+      const addressId = await createAddress(otherCustomerToken);
+      /*
+       * Six, not three. The tie-breaker test below renumbers all of them and asserts one exact
+       * sequence; with three rows a wrong implementation has a 1-in-6 chance of producing it by
+       * accident, which a mutation probe duly exposed. Six makes that 1 in 720.
+       */
+      subjectOrders = [
+        await placeOrderInState(otherCustomerToken, addressId, 'unpaid'),
+        await placeOrderInState(otherCustomerToken, addressId, 'cod_pending'),
+        await placeOrderInState(otherCustomerToken, addressId, 'unpaid'),
+        await placeOrderInState(otherCustomerToken, addressId, 'unpaid'),
+        await placeOrderInState(otherCustomerToken, addressId, 'cod_pending'),
+        await placeOrderInState(otherCustomerToken, addressId, 'unpaid'),
+      ];
+    }, 300_000);
+
+    it('refuses an anonymous request with 401', async () => {
+      expect((await api().get(`/api/v1/admin/customers/${subjectId}/orders`)).status).toBe(401);
+    });
+
+    it('refuses an authenticated non-staff customer with 403', async () => {
+      expect(
+        (await api().get(`/api/v1/admin/customers/${subjectId}/orders`).set(asCustomer())).status,
+      ).toBe(403);
+    });
+
+    it('stops serving a demoted staff member on the very next request', async () => {
+      const email = `demote.hist.${newId()}@example.com`;
+      const user = await container.identity.registerCustomer({
+        storeId,
+        input: { email, password: PASSWORD, firstName: 'Temp', lastName: 'Staff' },
+      });
+      await db().update(appUser).set({ isStaff: true }).where(eq(appUser.id, user.id));
+      const login = await api().post('/api/v1/auth/login').send({ email, password: PASSWORD });
+      const auth = { Authorization: `Bearer ${login.body.accessToken as string}` };
+      const path = `/api/v1/admin/customers/${subjectId}/orders`;
+
+      expect((await api().get(path).set(auth)).status).toBe(200);
+      await db().update(appUser).set({ isStaff: false }).where(eq(appUser.id, user.id));
+      expect((await api().get(path).set(auth)).status).toBe(403);
+    });
+
+    it('refuses a deactivated staff member with 401', async () => {
+      const email = `deact.hist.${newId()}@example.com`;
+      const user = await container.identity.registerCustomer({
+        storeId,
+        input: { email, password: PASSWORD, firstName: 'Temp', lastName: 'Staff' },
+      });
+      await db().update(appUser).set({ isStaff: true }).where(eq(appUser.id, user.id));
+      const login = await api().post('/api/v1/auth/login').send({ email, password: PASSWORD });
+      const auth = { Authorization: `Bearer ${login.body.accessToken as string}` };
+      const path = `/api/v1/admin/customers/${subjectId}/orders`;
+
+      expect((await api().get(path).set(auth)).status).toBe(200);
+      await db().update(appUser).set({ isActive: false }).where(eq(appUser.id, user.id));
+      expect((await api().get(path).set(auth)).status).toBe(401);
+    });
+
+    it('rejects a malformed UUID with 400', async () => {
+      const res = await historyOf('not-a-uuid');
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('rejects an unknown query parameter and an over-limit page', async () => {
+      expect((await historyOf(subjectId, '?status=pending')).status).toBe(400);
+      expect((await historyOf(subjectId, '?limit=101')).status).toBe(400);
+      expect((await historyOf(subjectId, '?limit=0')).status).toBe(400);
+      expect((await historyOf(subjectId, '?offset=-1')).status).toBe(400);
+    });
+
+    it('answers 404 for an unknown customer', async () => {
+      expect((await historyOf(newId())).status).toBe(404);
+    });
+
+    it('answers 404 for a soft-deleted customer rather than an empty page', async () => {
+      const addressId = await createAddress(customerToken);
+      const email = `erased.hist.${newId()}@example.com`;
+      const user = await container.identity.registerCustomer({
+        storeId,
+        input: { email, password: PASSWORD, firstName: 'Erased', lastName: 'Buyer' },
+      });
+      void addressId;
+
+      expect((await historyOf(user.id)).status).toBe(200);
+      await container.db.pool.query('update app_user set deleted_at = now() where id = $1', [
+        user.id,
+      ]);
+      expect((await historyOf(user.id)).status).toBe(404);
+    });
+
+    it('answers 404 for a customer in another store', async () => {
+      const otherStoreId = newId();
+      const foreignId = newId();
+      await container.db.pool.query(
+        `insert into store (id, slug, name, currency, timezone, is_active)
+         values ($1, $2, 'History Other Store', 'INR', 'Asia/Kolkata', true)`,
+        [otherStoreId, `hist-other-${otherStoreId.slice(0, 8)}`],
+      );
+      await container.db.pool.query(
+        `insert into app_user (id, store_id, email, password_hash, first_name, last_name)
+         values ($1, $2, $3, 'argon2-placeholder', 'Foreign', 'Buyer')`,
+        [foreignId, otherStoreId, `foreign.hist.${foreignId}@example.com`],
+      );
+      expect((await historyOf(foreignId)).status).toBe(404);
+    });
+
+    it('returns ONLY that customer’s orders', async () => {
+      const res = await historyOf(subjectId, '?limit=100');
+      expect(res.status).toBe(200);
+
+      const got = (res.body.orders as { orderNumber: string }[]).map((o) => o.orderNumber).sort();
+      expect(got).toEqual([...subjectOrders].sort());
+      expect(res.body.pagination.total).toBe(subjectOrders.length);
+
+      // And none of the bystander's, which are the majority of the store's orders.
+      const bystander = await historyOf(bystanderId, '?limit=100');
+      for (const n of subjectOrders) {
+        expect(
+          (bystander.body.orders as { orderNumber: string }[]).map((o) => o.orderNumber),
+        ).not.toContain(n);
+      }
+    });
+
+    it('returns the same AdminOrderSummary shape as the store-wide list', async () => {
+      const mine = await historyOf(subjectId, '?limit=1');
+      const store = await api().get('/api/v1/admin/orders?limit=1').set(asStaff());
+
+      const a = Object.keys((mine.body.orders as Record<string, unknown>[])[0] ?? {}).sort();
+      const b = Object.keys((store.body.orders as Record<string, unknown>[])[0] ?? {}).sort();
+      expect(a).toEqual(b);
+      expect(a).toContain('displayStatus');
+      expect(a).not.toContain('items');
+      expect(a).not.toContain('shippingAddress');
+    });
+
+    it('returns 200 with an empty page and total 0 for a customer who has never ordered', async () => {
+      const email = `noorders.hist.${newId()}@example.com`;
+      const user = await container.identity.registerCustomer({
+        storeId,
+        input: { email, password: PASSWORD, firstName: 'No', lastName: 'Orders' },
+      });
+
+      const res = await historyOf(user.id, '?limit=100');
+      expect(res.status).toBe(200);
+      expect(res.body.orders).toEqual([]);
+      expect(res.body.pagination.total).toBe(0);
+    });
+
+    it('pages with limit and offset, and the total stays the customer’s count', async () => {
+      const first = await historyOf(subjectId, '?limit=2&offset=0');
+      expect(first.status).toBe(200);
+      expect((first.body.orders as unknown[]).length).toBe(2);
+      expect(first.body.pagination).toEqual({ limit: 2, offset: 0, total: subjectOrders.length });
+
+      // Walk the remaining pages and assert they reassemble the history exactly once.
+      const all = [...(first.body.orders as { orderNumber: string }[])].map((o) => o.orderNumber);
+      for (let offset = 2; offset < subjectOrders.length; offset += 2) {
+        const page = await historyOf(subjectId, `?limit=2&offset=${offset}`);
+        expect(page.status).toBe(200);
+        expect(page.body.pagination.total).toBe(subjectOrders.length);
+        all.push(...(page.body.orders as { orderNumber: string }[]).map((o) => o.orderNumber));
+      }
+
+      expect(all.length).toBe(subjectOrders.length);
+      expect([...new Set(all)].length).toBe(subjectOrders.length);
+      expect([...all].sort()).toEqual([...subjectOrders].sort());
+
+      // Past the end is an empty page, not an error, and the total is unchanged.
+      const beyond = await historyOf(subjectId, `?limit=2&offset=${subjectOrders.length + 10}`);
+      expect(beyond.status).toBe(200);
+      expect(beyond.body.orders).toEqual([]);
+      expect(beyond.body.pagination.total).toBe(subjectOrders.length);
+    });
+
+    /**
+     * The tie-breaker, with a MANUFACTURED tie — orders placed through checkout never share a
+     * `placed_at`, so a test over natural data proves nothing about the second sort key.
+     */
+    /**
+     * The tie-breaker, with order numbers chosen so the correct answer DIFFERS from scan order.
+     *
+     * Both halves of this matter. The tie is manufactured because orders placed through checkout
+     * never share a `placed_at`. The order NUMBERS are rewritten because, left natural, a
+     * backward index scan over `ix_order_user_placed` returns tied rows in reverse-insertion
+     * order — and a mutation probe confirmed that a test asserting only "descending by number"
+     * still passed with the tie-breaker removed, because the two happened to coincide.
+     *
+     * So the numbers are assigned B, A, C in insertion order. Reverse-insertion is C, A, B;
+     * `order_number DESC` is C, B, A. They disagree, so only a real second sort key produces the
+     * expected sequence — which is what makes removing it a detectable change.
+     */
+    it('resolves a placed_at tie by order_number DESC, not by scan order', async () => {
+      const renumbered = [
+        'ORD-20260404-BBBBBB',
+        'ORD-20260404-AAAAAA',
+        'ORD-20260404-FFFFFF',
+        'ORD-20260404-CCCCCC',
+        'ORD-20260404-EEEEEE',
+        'ORD-20260404-DDDDDD',
+      ];
+      expect(subjectOrders.length).toBe(renumbered.length);
+
+      for (const [i, original] of subjectOrders.entries()) {
+        const { rowCount } = await container.db.pool.query(
+          `update "order"
+              set placed_at = '2026-04-04T00:00:00.000Z'::timestamptz, order_number = $2
+            where order_number = $1 and store_id = $3`,
+          [original, renumbered[i], storeId],
+        );
+        expect(rowCount, `failed to renumber ${original}`).toBe(1);
+      }
+      subjectOrders = renumbered;
+
+      const res = await historyOf(subjectId, '?limit=100');
+      const got = (res.body.orders as { orderNumber: string }[]).map((o) => o.orderNumber);
+
+      // Descending by number: F, E, D, C, B, A — deliberately unlike insertion order
+      // (B, A, F, C, E, D) and unlike its reverse (D, E, C, F, A, B).
+      expect(got).toEqual([
+        'ORD-20260404-FFFFFF',
+        'ORD-20260404-EEEEEE',
+        'ORD-20260404-DDDDDD',
+        'ORD-20260404-CCCCCC',
+        'ORD-20260404-BBBBBB',
+        'ORD-20260404-AAAAAA',
+      ]);
+
+      // Stable across repeated identical requests, and across one-row paging.
+      const walked: string[] = [];
+      for (let offset = 0; offset < got.length; offset += 1) {
+        const one = await historyOf(subjectId, `?limit=1&offset=${offset}`);
+        walked.push((one.body.orders as { orderNumber: string }[])[0]?.orderNumber ?? '');
+      }
+      expect(walked).toEqual(got);
+    });
+
+    /**
+     * No N+1: the page is one statement with its joins, and the count is one more. If the
+     * customer predicate were applied per row the joins would not appear in this plan.
+     */
+    it('reads the page as a single joined statement', async () => {
+      const { rows } = await container.db.pool.query<{ 'QUERY PLAN': string }>(
+        `explain select o.order_number, p.status, s.status
+           from "order" o
+           join app_user u on u.id = o.user_id
+           left join payment p on p.order_id = o.id and p.store_id = o.store_id
+           left join shipment s on s.order_id = o.id and s.store_id = o.store_id
+          where o.store_id = $1 and o.user_id = $2
+          order by o.placed_at desc, o.order_number desc
+          limit 25`,
+        [storeId, subjectId],
+      );
+      const plan = rows.map((r) => r['QUERY PLAN']).join('\n');
+      expect(plan).toMatch(/Join|Nested Loop/u);
+      expect(plan).not.toMatch(/Seq Scan on "?order"?/u);
+    });
+
+    it('writes nothing', async () => {
+      const countOf = async (sql: string): Promise<string> => {
+        const { rows } = await container.db.pool.query<{ c: string }>(sql);
+        return rows[0]?.c ?? '?';
+      };
+      const snapshot = async () => ({
+        orders: await countOf('select count(*)::text c from "order"'),
+        ordersTouched: await countOf(`select coalesce(max(placed_at)::text, '-') c from "order"`),
+        users: await countOf('select count(*)::text c from app_user'),
+        audits: await countOf('select count(*)::text c from audit_log'),
+        events: await countOf('select count(*)::text c from outbox_event'),
+        keys: await countOf('select count(*)::text c from idempotency_key'),
+      });
+
+      const before = await snapshot();
+      await historyOf(subjectId, '?limit=100');
+      await historyOf(newId());
+      expect(await snapshot()).toEqual(before);
+    });
+  });
+
   describe('the detail route', () => {
     it('returns the customer order document plus the four operator fields', async () => {
       const target = placed.find((p) => p.expected === 'delivered');

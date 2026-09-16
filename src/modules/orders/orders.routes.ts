@@ -10,6 +10,8 @@ import { renderInvoice, type InvoiceDocumentRecord, type InvoiceInput } from './
 import type { OrdersService } from './orders.service.js';
 import type { AdminOrderFilters } from './orders.repository.js';
 import {
+  AdminCustomerOrdersParamsSchema,
+  AdminCustomerOrdersQuerySchema,
   AdminListOrdersQuerySchema,
   CheckoutRequestSchema,
   ListOrdersQuerySchema,
@@ -18,6 +20,8 @@ import {
   toAdminOrderListResponse,
   toOrderListResponse,
   toOrderResponse,
+  type AdminCustomerOrdersParams,
+  type AdminCustomerOrdersQuery,
   type AdminListOrdersQuery,
   type CheckoutRequest,
   type ListOrdersQuery,
@@ -481,6 +485,58 @@ export function createOrdersRoutes(deps: {
       });
 
       res.status(200).json({ order: toAdminOrderDetailResponse(view) });
+    }),
+  );
+
+  /**
+   * `GET /admin/customers/{customerId}/orders` — one customer's order history. Increment 52.
+   *
+   * ### Why this route lives in the ORDERS module
+   *
+   * The path reads like identity's, and the customer DETAIL endpoint is indeed there. This one
+   * is not, because it returns ORDERS. Putting it in identity would mean identity reading the
+   * `order` table — inverting a dependency that already runs the other way, since orders
+   * already joins `app_user` for the admin list. Splitting by the data returned rather than by
+   * the path keeps that direction intact and needs no new port.
+   *
+   * The two routers cannot collide: identity's `/admin/customers/{customerId}` is three
+   * segments and this is four, so neither pattern can match the other's path.
+   *
+   * ### What it is
+   *
+   * The store-wide admin order list with one more predicate, so the rows, their ordering and
+   * their DTO are literally the same code. `pagination.total` is therefore the customer's order
+   * count, and a customer with no orders is `200` with an empty page.
+   *
+   * A customer who does not exist in this store — unknown, foreign, or soft-deleted — is a
+   * `404`, NOT an empty page. An empty page is a fact about somebody's history and must not be
+   * the answer for somebody who is not there.
+   *
+   * Store-scoped from the verified staff token; `customerId` names which customer, never which
+   * store.
+   *
+   * Failure modes: `400` for a malformed UUID or an unknown query parameter; `401`
+   * unauthenticated; `403` without the `staff` scope; `404` per above.
+   */
+  router.get(
+    '/admin/customers/:customerId/orders',
+    auth,
+    requireStaff,
+    validate({
+      params: AdminCustomerOrdersParamsSchema,
+      query: AdminCustomerOrdersQuerySchema,
+    }),
+    asyncHandler(async (req, res) => {
+      const { limit, offset } = validatedQuery<AdminCustomerOrdersQuery>(req);
+
+      const page = await orders.listStoreOrdersForCustomer({
+        storeId: requireUser(req).storeId,
+        customerId: validatedParams<AdminCustomerOrdersParams>(req).customerId,
+        limit,
+        offset,
+      });
+
+      res.status(200).json(toAdminOrderListResponse(page));
     }),
   );
 

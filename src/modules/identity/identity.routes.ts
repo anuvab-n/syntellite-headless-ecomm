@@ -8,14 +8,17 @@ import {
 } from '../../http/middleware/rate-limit.js';
 import { requireAuth, requireUser } from '../../http/middleware/auth.js';
 import { requireStore } from '../../http/middleware/store.js';
-import { validate, validatedBody, validatedQuery } from '../../http/validate.js';
+import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
 import type { RateLimiter, RateLimitPolicy } from '../../redis/rate-limiter.js';
 import type { Logger } from '../../shared/logger.js';
 import type { AdminCustomerFilters } from './identity.repository.js';
 import {
   AdminListCustomersQuerySchema,
+  CustomerIdParamsSchema,
   toAdminCustomerListResponse,
+  toAdminCustomerResponse,
   type AdminListCustomersQuery,
+  type CustomerIdParams,
   ChangePasswordRequestSchema,
   LoginRequestSchema,
   ForgotPasswordRequestSchema,
@@ -596,6 +599,50 @@ export function createIdentityRoutes(deps: {
         });
 
         res.status(200).json(toAdminCustomerListResponse(page));
+      }),
+    );
+  }
+
+  /**
+   * `GET /admin/customers/{customerId}` — one customer in the store. Increment 52.
+   *
+   * The single-subject counterpart of the list above, and it publishes the SAME seven fields
+   * through the SAME mapper, so list and detail cannot drift into describing a customer
+   * differently.
+   *
+   * **Read-only, and deliberately narrow.** No order history here — that lives in the orders
+   * module, which owns the `order` table; assembling it here would make identity depend on
+   * orders and invert a dependency that already runs the other way. No activation, no
+   * deactivation, no editing.
+   *
+   * Store-scoped from the verified staff token. `customerId` names WHICH customer, never which
+   * store — there is no store parameter anywhere on this route.
+   *
+   * Failure modes: `400` for a malformed UUID; `401` unauthenticated; `403` without the
+   * `staff` scope; `404` for an unknown customer, another store's customer, and a soft-deleted
+   * one — all three indistinguishable, because the repository returns nothing for each.
+   *
+   * ### Route shape
+   *
+   * Three segments, where the list is two and the order history is four, so none of the three
+   * can match another. This router is mounted FIRST, so a future LITERAL under
+   * `/admin/customers/` — an export, say — would be swallowed by this `:customerId` and die on
+   * the UUID check. `orders.routes.ts` documents the `next('router')` remedy for exactly that;
+   * no literal exists today, so none is applied here.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/customers/:customerId',
+      auth,
+      requireStaff,
+      validate({ params: CustomerIdParamsSchema }),
+      asyncHandler(async (req, res) => {
+        const customer = await identity.getStoreCustomer({
+          storeId: requireUser(req).storeId,
+          customerId: validatedParams<CustomerIdParams>(req).customerId,
+        });
+
+        res.status(200).json({ customer: toAdminCustomerResponse(customer) });
       }),
     );
   }

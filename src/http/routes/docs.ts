@@ -3801,6 +3801,158 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/customers/{customerId}': {
+        get: {
+          tags: ['Users'],
+          summary: 'Read one customer (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'One customer in the store. Requires the `staff` scope.',
+            '',
+            'Publishes the SAME seven fields as `GET /admin/customers`, through the same mapper,',
+            'so the list and the detail cannot drift into describing a customer differently.',
+            '',
+            '`passwordHash`, `isStaff` and `isSuperuser` are absent from the SQL projection, the',
+            'record type and the response mapper alike. Password-reset tokens and refresh sessions',
+            'live in other tables this query never touches.',
+            '',
+            '### Deliberately absent',
+            '',
+            'No order history here — that is `GET /admin/customers/{customerId}/orders`. No',
+            'activity totals, no activation or deactivation, no editing. This is a read.',
+            '',
+            '### Tenancy and not-found',
+            '',
+            'Store-scoped from the verified staff token; `customerId` names which customer, never',
+            'which store. An unknown id, a customer belonging to ANOTHER store, and a soft-deleted',
+            'customer are all `404` and deliberately indistinguishable — the query returns nothing',
+            'for each, so the endpoint cannot confirm that an account exists elsewhere.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              description:
+                'A UUID by shape only. Existence, tenancy and liveness are decided by the query, so a malformed id is a 400 and every other miss is a 404.',
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The customer.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['customer'],
+                    properties: { customer: { $ref: '#/components/schemas/AdminCustomer' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such customer in this store. An unknown id, another store’s customer and a soft-deleted customer are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}/orders': {
+        get: {
+          tags: ['Orders'],
+          summary: 'List one customer’s orders (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of one customer’s order history, newest first. Requires the `staff` scope.',
+            '',
+            'This is `GET /admin/orders` with one more predicate — the same statement, the same',
+            'ordering and the same `AdminOrderSummary` rows — so a customer’s history cannot drift',
+            'from the store-wide list. `pagination.total` is therefore that customer’s order count.',
+            '',
+            '### Paging only',
+            '',
+            'No status, date or search filters. Those belong to `GET /admin/orders`; offering half',
+            'of them here would invite a client to discover which half. The query object is strict,',
+            'so sending one is a `400` naming it.',
+            '',
+            'Ordered by `placedAt` descending, then `orderNumber` descending — a total order, so',
+            '`offset` paging cannot skip or repeat rows when two orders share an instant.',
+            '',
+            '### Not found versus empty',
+            '',
+            'A customer who exists and has never ordered is `200` with an empty `orders` array and',
+            '`total: 0`. A customer who is unknown, belongs to another store, or has been',
+            'soft-deleted is `404` — an empty page is a fact about somebody’s history and must not',
+            'be the answer for somebody who is not there.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              description: 'A UUID by shape only. Same 400/404 rules as the customer detail route.',
+              schema: { type: 'string', format: 'uuid' },
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of that customer’s orders, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders', 'pagination'],
+                    properties: {
+                      orders: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminOrderSummary' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such customer in this store — unknown, another store’s, or soft-deleted. Distinct from a customer who exists with no orders, which is a 200 with an empty page.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/users/me/payments': {
         get: {
           tags: ['Payments'],

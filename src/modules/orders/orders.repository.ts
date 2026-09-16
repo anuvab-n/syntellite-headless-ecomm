@@ -297,6 +297,14 @@ const displayStatusSql: SQL<string> = sql<string>`
 
 /** The filters the admin list accepts. Every one of them is optional. */
 export type AdminOrderFilters = {
+  /**
+   * One customer's orders only — Increment 52, for `GET /admin/customers/{id}/orders`.
+   *
+   * A filter rather than a separate query, so the customer's history is the SAME statement,
+   * ordering and DTO as the store-wide list and cannot drift from it. Served by
+   * `ix_order_user_placed`; see the method below.
+   */
+  readonly customerId?: string;
   readonly displayStatus?: string;
   readonly paymentStatus?: string;
   readonly shipmentStatus?: string;
@@ -704,6 +712,35 @@ export function createOrdersRepository(deps: { db: Database }) {
     },
 
     /**
+     * Does this customer exist, live, in this store? Increment 52.
+     *
+     * So `GET /admin/customers/{id}/orders` can answer `404` for an unknown, foreign or erased
+     * customer instead of `200` with an empty page — an empty page is a fact about their
+     * history, and it must not be the answer to a customer who is not there.
+     *
+     * Uses the `app_user` import this file already carries for the admin order list's customer
+     * join (Increment 50), so it adds no new reach. Predicate and liveness rule match
+     * `identity`'s own customer reads exactly: tenant, id, `deleted_at IS NULL`.
+     *
+     * A boolean, not a row. Orders has no business publishing a customer's fields — the detail
+     * endpoint in `identity` does that — so this returns only the fact it needs.
+     */
+    async storeCustomerExists(params: { storeId: string; customerId: string }): Promise<boolean> {
+      const [row] = await executor(db)
+        .select({ id: appUser.id })
+        .from(appUser)
+        .where(
+          and(
+            eq(appUser.id, params.customerId),
+            eq(appUser.storeId, params.storeId),
+            isNull(appUser.deletedAt),
+          ),
+        )
+        .limit(1);
+      return row !== undefined;
+    },
+
+    /**
      * A page of this customer's orders, newest first, plus the total.
      *
      * Both halves use the SAME predicate, so the page and the count cannot disagree — the §28
@@ -881,6 +918,13 @@ export function createOrdersRepository(deps: { db: Database }) {
  */
 function adminOrderPredicate(storeId: string, filters: AdminOrderFilters): SQL | undefined {
   const clauses: SQL[] = [eq(order.storeId, storeId)];
+
+  /*
+   * One customer's history. Narrows by `user_id` ON TOP of the tenant predicate, never instead
+   * of it — a customer id is not a tenant, and a caller that supplied one from another store
+   * would still see nothing.
+   */
+  if (filters.customerId !== undefined) clauses.push(eq(order.userId, filters.customerId));
 
   /*
    * Compared against the CASE expression itself rather than against a set of raw-column

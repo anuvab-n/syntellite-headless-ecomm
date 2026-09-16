@@ -6,6 +6,7 @@ import {
   Conflict,
   DomainError,
   InvalidCredentials,
+  NotFound,
 } from '../../shared/errors.js';
 import type { AuditTrail } from '../../shared/audit.js';
 import type { EventBus } from '../../shared/events.js';
@@ -620,6 +621,29 @@ export function createIdentityService(deps: {
     }> {
       const page = await repository.listStoreCustomers(params);
       return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
+     * **One customer in this store, for staff.** Increment 52. Read-only.
+     *
+     * The single-subject counterpart of `listStoreCustomers`, and `Store` in the name for the
+     * same reason: the access predicate is tenancy, not the caller's own identity. The
+     * authorization boundary is entirely in the routes file (`auth -> requireStaff`).
+     *
+     * `NotFound` for an unknown id, another store's customer and a soft-deleted one alike — the
+     * repository returns `undefined` for all three, so this cannot accidentally distinguish them.
+     *
+     * No transaction, no audit row, no event, no session touched. A read that recorded an audit
+     * entry would make "who looked at this customer" indistinguishable from "who changed this
+     * customer", and the trail's value is that every row in it is a change.
+     */
+    async getStoreCustomer(params: {
+      storeId: string;
+      customerId: string;
+    }): Promise<AdminCustomerRecord> {
+      const customer = await repository.findStoreCustomerById(params);
+      if (!customer) throw new NotFound('customer');
+      return customer;
     },
 
     async getCurrentUser(params: { storeId: string; userId: string }): Promise<UserSubject> {
