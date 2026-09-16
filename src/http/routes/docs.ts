@@ -1878,6 +1878,61 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         Option: OPTION,
         OptionValue: OPTION_VALUE,
         StaffShipment: STAFF_SHIPMENT,
+        AdminShipment: {
+          allOf: [
+            { $ref: '#/components/schemas/StaffShipment' },
+            {
+              type: 'object',
+              required: ['orderNumber'],
+              properties: {
+                orderNumber: {
+                  type: 'string',
+                  description:
+                    'How staff address the order everywhere else. A shipment list that could only name internal ids would be unusable.',
+                  example: 'ORD-20260904-7QK4M2',
+                },
+              },
+            },
+          ],
+        },
+        ShipmentEvent: {
+          type: 'object',
+          description:
+            'One transition. `actorType` rather than an actor id: the timeline says a STAFF member acted, without naming a colleague on a screen that exists to explain a parcel.',
+          required: ['fromStatus', 'toStatus', 'actorType', 'note', 'occurredAt'],
+          properties: {
+            fromStatus: {
+              description: 'Null for the creation row, which has no previous state.',
+              oneOf: [
+                { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+                { type: 'null' },
+              ],
+            },
+            toStatus: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+            actorType: { type: 'string', example: 'staff' },
+            note: {
+              description: 'Free text a staff member typed at the transition. Staff-only.',
+              oneOf: [{ type: 'string', maxLength: 500 }, { type: 'null' }],
+            },
+            occurredAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        AdminShipmentDetail: {
+          allOf: [
+            { $ref: '#/components/schemas/AdminShipment' },
+            {
+              type: 'object',
+              required: ['history'],
+              properties: {
+                history: {
+                  type: 'array',
+                  description: 'Every transition this shipment has made, OLDEST first.',
+                  items: { $ref: '#/components/schemas/ShipmentEvent' },
+                },
+              },
+            },
+          ],
+        },
         StaffShipmentList: {
           type: 'object',
           required: ['shipments'],
@@ -3157,6 +3212,96 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/shipments': {
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'List the store’s shipments (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every shipment in the store**, newest first. Requires the `staff` scope.',
+            '',
+            'The read this module never had. `PATCH /admin/shipments/{id}` and both transition',
+            'routes have always addressed a shipment by id, so staff could change a shipment they',
+            'had no way to look at — and the only listing was `GET /admin/orders/fulfilment`,',
+            'which is a worklist of orders AWAITING shipment and therefore excludes every',
+            'shipment that already exists.',
+            '',
+            '### Filters are exact, not searches',
+            '',
+            '`status` must be one of the real vocabulary. `orderNumber` must match the generated',
+            'shape; because `uq_shipment_order` allows one shipment per order it selects at most',
+            'one row, and an unknown number is an **empty page, not a `404`** — it is a filter,',
+            'not a lookup.',
+            '',
+            '**No date filters.** None was asked for, and adding one would pull in the',
+            'millisecond-versus-microsecond bound question the order and payment lists answer.',
+            '',
+            'Ordered by `createdAt` descending, then `id` descending — a total order, so `offset`',
+            'paging cannot skip or repeat rows when two shipments share an instant.',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400`.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+            },
+            {
+              name: 'orderNumber',
+              in: 'query',
+              required: false,
+              description:
+                'An EXACT order number, not a search. An unknown number is an empty page, not a 404.',
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s shipments, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['shipments', 'pagination'],
+                    properties: {
+                      shipments: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminShipment' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/admin/orders/{orderNumber}/shipments': {
         post: {
           tags: ['Fulfilment'],
@@ -3411,6 +3556,66 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       },
 
       '/api/v1/admin/shipments/{id}': {
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'Read one shipment with its history (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'One shipment and every transition it has made. Requires the `staff` scope.',
+            '',
+            'The same fields as a list row, plus `history` — the transitions in order, oldest',
+            'first, each with the note a staff member typed at the time. The history is here and',
+            'not on the list because a page of 100 shipments would otherwise carry every',
+            'transition any of them ever made to render a table that shows none of them.',
+            '',
+            'The creation row has `fromStatus: null`; a shipment is created IN `pending` rather',
+            'than transitioning into it.',
+            '',
+            'Store-scoped from the verified staff token. An unknown id and a shipment belonging',
+            'to ANOTHER store are both `404` and deliberately indistinguishable — the query',
+            'returns nothing for either, so the endpoint cannot confirm that a shipment exists',
+            'elsewhere.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              description:
+                'A UUID by shape only. Existence and tenancy are decided by the query, so a malformed id is a 400 and every other miss is a 404.',
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The shipment and its transition history.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['shipment'],
+                    properties: {
+                      shipment: { $ref: '#/components/schemas/AdminShipmentDetail' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such shipment in this store. An unknown id and another store’s shipment are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
         patch: {
           tags: ['Fulfilment'],
           summary: 'Correct tracking details (staff)',

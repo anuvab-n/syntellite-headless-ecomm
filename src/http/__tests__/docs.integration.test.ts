@@ -299,6 +299,16 @@ describe('API documentation', () => {
     apiRouter.patch('/admin/shipments/:id', (_req, res) => {
       res.status(200).json({ ok: true });
     });
+    /*
+     * Two segments, declared before the three-segment read below, mirroring production: the
+     * literal list must be matched before the `:id` parameter is ever considered.
+     */
+    apiRouter.get('/admin/shipments', (_req, res) => {
+      res.status(200).json({ shipments: [], pagination: { limit: 25, offset: 0, total: 0 } });
+    });
+    apiRouter.get('/admin/shipments/:id', (_req, res) => {
+      res.status(200).json({ shipment: {} });
+    });
     apiRouter.get('/users/me/orders/:orderNumber/invoice', (_req, res) => {
       res.status(200).type('html').send('<!doctype html><html></html>');
     });
@@ -497,6 +507,7 @@ describe('API documentation', () => {
         '/api/v1/admin/returns/{returnNumber}',
         '/api/v1/admin/returns/{returnNumber}/approve',
         '/api/v1/admin/returns/{returnNumber}/reject',
+        '/api/v1/admin/shipments',
         '/api/v1/admin/shipments/{id}',
         '/api/v1/admin/shipments/{id}/deliver',
         '/api/v1/admin/shipments/{id}/ship',

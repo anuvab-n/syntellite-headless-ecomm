@@ -6,7 +6,9 @@ import { BusinessRuleViolation, Conflict, NotFound, ValidationError } from '../.
 import type { Logger } from '../../shared/logger.js';
 import { SHIPMENT_AUDIT, SHIPMENT_RESOURCE } from './fulfilment.events.js';
 import type {
+  AdminShipmentFilters,
   FulfilmentRepository,
+  ShipmentEventRecord,
   ShipmentRecord,
   ShipmentStatus,
 } from './fulfilment.repository.js';
@@ -700,6 +702,56 @@ export function createFulfilmentService(deps: {
       const found = await repository.findForStore(params);
       if (!found) throw new NotFound('order');
       return found.shipments;
+    },
+
+    /**
+     * **A page of the STORE's shipments, newest first.** Increment 54. Read-only.
+     *
+     * Distinct from `listForStore` above, which answers "this ORDER's shipments" and is named
+     * for the store only because it is the staff counterpart of the customer read. This one is
+     * the store-wide list the admin surface never had.
+     *
+     * No transaction, no audit row, no event, no stock movement. Every other method on this
+     * service writes something; these two do not.
+     */
+    async listStoreShipments(params: {
+      storeId: string;
+      filters: AdminShipmentFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly (ShipmentRecord & { orderNumber: string })[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listForStorePaged(params);
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
+     * **One shipment and its transition history, for staff.** Increment 54. Read-only.
+     *
+     * The read the admin surface was missing: `PATCH /admin/shipments/{id}`, `/ship` and
+     * `/deliver` have always addressed a shipment by id, so staff could change one they had no
+     * way to look at. This closes that.
+     *
+     * The history is fetched in a SECOND query rather than joined, deliberately: a shipment has
+     * a handful of events, and joining them would multiply the shipment row across its own
+     * history for the caller to de-duplicate. Two small indexed reads are the simpler shape.
+     *
+     * `NotFound` for an unknown id and for another store's shipment alike — the repository
+     * returns `undefined` for both, so this cannot accidentally distinguish them.
+     */
+    async getStoreShipment(params: { shipmentId: string; storeId: string }): Promise<{
+      shipment: ShipmentRecord & { orderNumber: string };
+      events: readonly ShipmentEventRecord[];
+    }> {
+      const found = await repository.findByIdForStore(params);
+      if (!found) throw new NotFound('shipment');
+
+      const events = await repository.listEventsForShipment(params);
+      return { shipment: found, events };
     },
 
     /**

@@ -1,0 +1,1 @@
+CREATE INDEX "ix_shipment_store_created" ON "shipment" USING btree ("store_id","created_at");
