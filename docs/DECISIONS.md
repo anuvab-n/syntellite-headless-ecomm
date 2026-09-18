@@ -5265,3 +5265,549 @@ sampling. No money: the mapping reads a payment's STATUS and METHOD and never it
 the staff member's verified token. No migration and no schema change. The admin order list is the
 surface §46 declined to invent as a side effect of the invoice route; it is invented here, on
 purpose, with its own filtering, pagination and PII decisions.
+
+## 50. Phase 4 increment 58 — completing the admin product surface
+
+The Figma product screens need four things the catalogue did not have: a searchable, status-filtered
+list with tab counts; SKU codes the merchant does not have to invent; lifecycle actions applied to a
+selection; and images. This increment adds all four and nothing else.
+
+### The list: `q`, `status`, and counts that deliberately ignore both
+
+`q` matches name **or** slug, case-insensitively, through the existing `escapeLikePattern` so that
+`%` and `_` are literals — a merchant searching for `50%` finds that product rather than everything.
+No index was added for it. A leading-wildcard `ILIKE` cannot use a btree, and adding a trigram index
+to serve a merchant typing into an admin screen over a catalogue bounded by what one store sells
+would be a speculative index by the definition this project uses.
+
+`counts` is store-wide and **not** narrowed by `q` or `status`. A tab count exists to answer "how
+many rows would I see if I switched to that tab"; a count that moved as the operator typed could not
+answer it. So `counts.total` and `pagination.total` differ whenever a filter is applied, and that is
+correct — one counts the store, the other counts the query. Every status is present at zero, so a
+tab does not vanish when it empties and the response shape does not change with the data.
+
+### SKU codes: redraw, never pre-check
+
+`code` became optional. Omitted, the server generates `BLUE-SHIRT-K7M2QP` — the product slug,
+uppercased and stripped, plus six characters drawn with a CSPRNG from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`.
+The alphabet omits `I`, `O`, `0` and `1` for the reason `generateOrderNumber` omits them: a code read
+off a shelf label must not be mistypable into a *different* SKU.
+
+The flow is deliberately **not** `SELECT -> generate -> INSERT`. Two concurrent creates can both pass
+a pre-check and then race, and the loser gets a 500 from a constraint it was told was clear. Instead
+the insert is attempted and a unique violation on `uq_sku_code_store` is *interpreted*:
+
+- the code was **generated** → redraw and retry, up to five times;
+- the code was **supplied** → `409 SKU_CODE_TAKEN`, because quietly storing something other than what
+  the merchant sent is worse than refusing.
+
+A pre-check survives for a supplied code only, where it buys a cheaper error message; the constraint
+remains the actual authority either way. Any *other* unique violation is rethrown untouched —
+reporting an unrelated constraint failure as a code conflict would hide a real bug.
+
+### Bulk actions are all-or-nothing
+
+`POST /admin/products/bulk` takes one of the three verbs the single-product routes already expose,
+enforced by the same transition table. A bulk action able to do something no individual action can
+would be a second, less-guarded lifecycle.
+
+Everything is resolved before anything is written: an unknown slug is a `404` naming every slug that
+did not resolve, an illegal transition a `409` naming every offender, and in both cases **nothing is
+applied**. There is no partial-success shape. An operator who selected twelve products and got a
+`200` knows all twelve moved; a partial result would leave them reconciling by hand, which is what
+the bulk action exists to avoid. Duplicate slugs are collapsed rather than rejected — a slug named
+twice is one product.
+
+**Bulk records through the same path single does.** The first version of this route called
+`audit.record` directly, which meant a product published in bulk emitted no `product.published` while
+one published individually did. A subscriber invalidating a storefront cache cannot know which route
+a merchant used, so the cache would have gone stale exactly when a merchant published in bulk, and
+the failure would have looked like a caching bug. Bulk delete likewise has to cascade *everything*
+`deleteProduct` cascades, imagery included. Both are pinned by tests that compare the two routes
+against each other rather than against a literal.
+
+### Media: PostgreSQL holds the pointer, never the bytes
+
+`product_media` stores a storage key, a content type, dimensions, a gallery position and a primary
+flag. No `bytea`, and no upload endpoint that accepts a file. The bytes go browser → bucket directly;
+this API records where they landed. A multi-megabyte image travelling through an Express process
+would occupy a connection, a buffer and a backup for no benefit.
+
+Two invariants are the database's, not the application's:
+
+- `uq_product_media_primary`, partial on `is_primary AND deleted_at IS NULL` — **at most one primary
+  per product**, so a promotion that forgot to demote fails rather than producing two.
+- `uq_product_media_key`, partial on `(store_id, storage_key)` — one row per object, so an object
+  cannot acquire two rows that then disagree about what it is.
+
+`ix_product_media_product` is the one index added for speed rather than correctness, and it was
+measured rather than assumed. Over 2,000 products × 5 images: **0.028 ms / 3 buffers** with it,
+**1.179 ms / 164 buffers** without (`Seq Scan`, 9,995 rows discarded).
+
+Removing a primary leaves the product with **no** primary rather than promoting a successor. Which
+image represents a product is a merchandising decision, and choosing one for the merchant would be
+inventing a rule the screen does not express. Deletion is soft, so the row survives as the record
+that a storage object should be reclaimed — a hard delete would lose the only pointer to an object
+still costing money in the bucket.
+
+`contentType` is a closed list, not `image/*`: an SVG is a script container and a TIFF will not
+display, so accepting either would let a merchant upload an image that silently never appears.
+
+### `ck_product_media_dimensions`, and a CHECK that admitted what it forbade
+
+Width and height are a pair — half a measurement cannot lay anything out and is worse than none,
+because it looks usable. The constraint was first written the way it reads in English:
+
+```sql
+(width IS NULL AND height IS NULL) OR (width > 0 AND height > 0)
+```
+
+With a width and no height the first disjunct is `false` and the second is `NULL`, so the whole
+expression is `NULL` — and **a CHECK admits NULL**. The rule was inert for exactly the case it
+existed to forbid. It is now written as an equality of two `IS NULL` tests, which never yield `NULL`:
+
+```sql
+(width IS NULL) = (height IS NULL) AND (width IS NULL OR width > 0) AND (height IS NULL OR height > 0)
+```
+
+The DTO refuses the same shape at the edge, so a caller who sends half a pair gets a `400` naming the
+field rather than a `500` from a constraint. This was found by a test asserting the `400`, not by
+review.
+
+### The upload target returns 503, and that is the honest answer
+
+`POST /admin/products/{slug}/media/upload-target` needs to sign a `PUT`. This project has no S3 SDK,
+so nothing can. Rather than fabricate a URL or omit the endpoint, `MediaStorage` is declared as a
+consumer port and the composition root wires an adapter that refuses with
+`503 DEPENDENCY_UNAVAILABLE`. Registration, the gallery, ordering, the primary flag and deletion all
+work without it; **only this one call requires external S3-compatible configuration**, and supplying
+a real adapter touches no domain module.
+
+The dependency is required rather than optional on the service, so a deployment discovers missing
+wiring at boot rather than at a merchant's first upload.
+
+### Audit without events
+
+Media records audit entries (`product_media.created` / `.updated` / `.deleted`) and emits **no**
+domain events. Nothing in this system subscribes to an image being attached, and publishing an event
+with no consumer would be a guess at one. The operational question — who attached this, and when —
+is what the audit trail answers.
+
+### `uq_product_id_store` exists only to be pointed at
+
+`product_media` carries composite foreign keys `(product_id, store_id)` and `(sku_id, store_id)`, so
+a row cannot reference a product in another store — the tenancy boundary is the database's, not a
+comparison the service performs afterwards. PostgreSQL requires a unique constraint on exactly the
+referenced columns, hence `uq_product_id_store` on `product (id, store_id)`. It is redundant as an
+index (`id` is already the primary key) and is not there to be scanned. The generated migration had
+to be hand-reordered: drizzle-kit emits indexes after constraints, which fails with `42830`.
+
+### Scope of this increment
+
+Product and catalogue only. No orders, payments, shipments, returns, reports, settings or RBAC. One
+migration (`product_media` plus its FK target). `PATCH .../status` is still absent — §26's explicit
+lifecycle verbs stand, and the bulk route uses them rather than routing around them.
+
+## 51. Phase 4 increment 59 — refunds, and the return lifecycle that spends them
+
+`returns.ts` predicted this table by name and deferred it: *"a refund is its own aggregate
+(Increment 40f), linked to the existing `payment` row rather than folded in here."* This is that
+increment. It also closes the half-open transaction the returns module has been carrying since
+40d — `return.state.ts` allowed `approved → received → inspected → completed` while only
+`approve` and `reject` had routes, so every return reached `inspected` and stopped with a
+computed, stored, unpayable `refund_total`.
+
+### Why a table rather than columns
+
+`uq_payment_order` makes a payment unique per order, so a refund cannot be a second payment. A
+column on the return would make "how much was requested" and "how much actually moved" the same
+field, and they diverge the instant a provider refund fails — which is the case the column would
+exist to describe.
+
+One row per **attempt**. A failed attempt is terminal for that row and a retry is a new row, so
+"we tried twice and the first failed" is two rows rather than one row that forgot.
+
+### `processing` is the state this increment is built around
+
+Four statuses: `pending → processing → succeeded | failed`. The third is the one that matters.
+It means **the provider was asked and the answer is not known** — a timeout, an aborted
+connection, a 5xx, a body that did not parse. Recording it as either terminal state is the
+specific way this class of system loses money:
+
+- calling it `failed` invites a retry that refunds twice;
+- calling it `succeeded` closes a return against money that may never have moved.
+
+So the adapter returns three outcomes, not two, and the mapping is explicit: a **4xx** is
+evidence of refusal (`failed`), a **5xx** is an absence of evidence (`unknown`). That one
+`if (status >= 400 && status < 500)` is the whole difference, and two mutation probes exist to
+stop anyone collapsing it.
+
+### The balance invariant, and why in-flight refunds reserve it
+
+**Σ(claimed refunds) ≤ captured**, always. Three things make it true under concurrency rather
+than usually:
+
+1. the **payment** row is locked before the balance is read, so two concurrent refunds serialise
+   and the second sees the first — locking the existing refunds instead would lock nothing at all
+   when there are none, which is exactly the first-double-refund case;
+2. `pending` and `processing` consume balance alongside `succeeded`, so an unresolved attempt
+   cannot be refunded around;
+3. the arithmetic is `money.ts` / Decimal.js end to end.
+
+That is why `refunded` and `claimed` are published as **different** figures. They are equal in
+the ordinary case and differ exactly while an attempt is in flight — the window in which
+reporting either as the other would be a lie, and the reason a payment can refuse a further
+refund while showing nothing refunded.
+
+### Two bugs the increment found in itself
+
+**The refund row was being rolled back with the completion that refused it.** `withTransaction`
+is re-entrant, so the claim raised from inside the returns module's transaction JOINED it — and a
+completion that then threw `ReturnRefundNotSettled` erased the refund. An unresolved attempt that
+leaves no trace is money that may have moved with nothing to reconcile it against, which is the
+exact failure the `processing` state exists to prevent. The claim and the dispatch now commit
+`{ independent: true }`. The trade runs the safe way: a refund recorded for a return that did not
+complete is visible and blocks a duplicate; the reverse would be neither.
+
+**That fix then deadlocked.** `lockStoreReturnByNumber` took `FOR UPDATE`, which blocks
+`FOR KEY SHARE` — the lock PostgreSQL takes on a parent row when a child referencing it is
+inserted. The independent refund transaction inserting a row with `fk_refund_return_store` waited
+on the return lock while the return transaction waited on the refund. Every completion test hit
+the 30-second timeout. The lock is now `FOR NO KEY UPDATE`, which is sufficient for mutual
+exclusion between staff — every staff transition writes non-key columns only — and does not
+conflict with the FK check. Observed, then fixed; not reasoned about in advance.
+
+### Completion is not "set status = completed"
+
+1. raise a refund for the **frozen** `refund_total` — never recomputed from today's catalogue;
+2. stop unless it succeeded;
+3. restock the good-to-sell units decided at inspection;
+4. close the return.
+
+Refund before restock deliberately: if the refund fails nothing has moved, whereas a restock that
+failed after a successful refund would have given money back for goods the system still believes
+are with the customer. The cheaper failure goes first.
+
+**Restock happens exactly once**, and the guarantee is the `inspected → completed` compare-and-swap
+inside the transaction, not a flag: a second completion matches no row, throws, and rolls back its
+own stock movement. `uq_refund_return_live` — partial on `status <> 'failed'` — is the second
+line, making a duplicate live refund per return impossible at the database rather than at a check.
+A blind retry after an unresolved outcome hits it and gets a clean `409`.
+
+Reservations are untouched, which is both the approved rule and the only correct answer: these
+units shipped, so their reservation was settled at fulfilment.
+
+### Inspection records counts, not a verdict
+
+A single line legitimately splits — three jars returned, one smashed — and a label would force
+staff to either lie about the good two or raise a second return for the broken one. Neither count
+changes what the customer is owed: a smashed jar is still a jar they sent back, and the frozen
+snapshot is never touched. Every line must be present and each line's counts must sum exactly to
+what came back; a partial inspection is refused rather than defaulted, because completion would
+otherwise restock a number nobody decided.
+
+### COD, and the capture rule that is not a state-machine change
+
+A COD payment **never leaves `pending`** — nothing in this system records cash collection, and
+§14 requires the payment state machine be preserved. Reading `status` alone would therefore make
+every COD order permanently unrefundable and leave the Returns screen broken for the majority of
+Indian orders.
+
+Delivery is the COD money event, and this repository already says so twice: fulfilment's
+`allowUncommittedCod` exists precisely because a COD order ships *before* its money arrives, and
+`order-display-status.ts` reports a pending COD payment as `confirmed` rather than as awaiting
+payment. So the refunds service declares a `RefundDelivery` port — one read, adapted in
+`container.ts` — and a COD payment's refundable base is its amount once the order was delivered.
+Nothing here writes `payment.status`.
+
+A COD refund is `manual`: a recorded obligation, not a transfer. No gateway is called and none is
+faked. The return completes with the obligation outstanding, because blocking on a disbursement
+this backend has no visibility of would mean a COD return could never close; staff record the
+payout with `POST /admin/refunds/{refundNumber}/settle`. A `provider` refund cannot be settled
+that way — its outcome is the gateway's to report, and letting staff declare one succeeded would
+make `processing` pointless.
+
+### Payment status is never written
+
+Not once, on any path. A refund is its own aggregate; `payment.status` continues to mean "did the
+original collection succeed", which stays true after any amount of money goes back.
+`payments.state.ts` makes `succeeded` absorbing and this module does not argue with it. There is
+no code in the refunds module that could write it, which is why the corresponding mutation probe
+is structurally unwritable rather than merely unkilled.
+
+### Audit without events
+
+Five audit actions — `refund.raised`, `.succeeded`, `.failed`, `.unresolved`, `.settled` — and no
+domain events, for the reason `payments.events.ts` and `returns.events.ts` both give: the handler
+registry is empty, so nothing would consume them, and an event with no consumer is a guess at one.
+`refund.unresolved` is not noise; it is the entry an operator filters for.
+
+### Scope
+
+Refunds and the returns completion path only. No order status model, no carrier work, no
+locations, no RBAC. One migration: the `refund` table plus `return_restock` added to
+`ck_stock_ledger_reason`. No new return columns — `return_event` is already the append-only record
+of when each transition happened, and a second timestamp on the header would be the same fact
+stored twice and free to disagree.
+
+## 52. Phase 4 increment 60 — resolving the refunds increment 59 could not answer
+
+Increment 59 shipped a state it could not leave: `processing`, meaning *the provider was asked
+and the answer is not known*. That was the honest record, but it was a dead end — the only way
+out was a human reading Razorpay's dashboard. This increment is the way out.
+
+### The correlation problem, which is the whole increment
+
+A `processing` refund has **`provider_refund_id = NULL`**. It has to: the row reaches that state
+precisely because the REST call never returned an id. So the obvious design — match the webhook's
+`rfnd_…` against our column — resolves exactly nothing, because the rows needing resolution are
+the rows that column is empty on.
+
+What we send is `x-razorpay-idempotency`, and **Razorpay does not echo headers**. So before this
+increment there was no identifier of ours anywhere inside the refund entity. The fix is one field
+on the refund POST: `notes: { refund_id: <our uuid> }`. `notes` is provider-persisted and echoed
+on every later refund entity, including the one inside a webhook payload.
+
+That choice has a consequence worth stating plainly: **refunds raised before this change carry no
+note and can never be auto-resolved.** They stay manual, forever. The alternative — matching on
+`payment_id` plus amount — would have covered them, and was rejected: two partial refunds of the
+same size can both be `processing` on one charge, and a heuristic that picks one would resolve the
+wrong attempt. A permanent, visible, bounded gap beats an occasional silent mis-resolution of
+money.
+
+### Why the lookup takes no store
+
+It is the only query in `refunds.repository.ts` with no `store_id` predicate, and it is the only
+one that may have none. A webhook has no tenant to pass: the route is deliberately not
+store-scoped, so a store could only come from the body — the one thing that must never be
+trusted. The reference is a UUIDv7 we generated, so it is globally unique on its own, and the
+store is then **read off the row that comes back**. Nothing the provider says selects a tenant; it
+only names a row whose tenant we already recorded. A forged note names no row.
+
+This also answers the index question: the lookup is by primary key, so **no migration, no new
+index**. `drizzle-kit generate` reports no schema changes.
+
+### Four guards, and which one actually fires
+
+`processing`-only, `provider`-mode-only, exact amount, compare-and-swap. The mutation probes made
+the layering legible rather than assumed:
+
+- removing the `processing` guard is killed by the **CAS**, not by a guard test;
+- removing the CAS is an **equivalent mutant** — the guard above has already narrowed
+  `record.status` to `'processing'`, so the two expressions are identical at that line;
+- removing **both** fails five tests.
+
+So the guard and the CAS are genuinely complementary rather than one being decoration, and the
+suite can tell. The CAS earns its place against concurrency the guard cannot see; the guard earns
+its place by refusing a `pending` row the CAS would otherwise silently skip.
+
+Amount equality is integer, on `amount_minor`, with no tolerance. A refund that came back for a
+different sum is not this refund's outcome, and leaving the row `processing` is the honest answer.
+
+### What a webhook cannot do
+
+It cannot create a refund — there is no insert on the path. It therefore cannot change the claimed
+total at all, which is why the balance invariant is not re-checked here: `processing` and
+`succeeded` both consume balance, and `failed` only releases it.
+
+It cannot write `payment.status`. Not by policy — by construction: `RefundsRepository` exposes no
+payment mutation, and the probe that introduces one had to add a repository method to exist at
+all. It failed three tests immediately.
+
+It cannot settle a COD obligation. A manual refund's money never went through a gateway, so no
+gateway may declare it paid; that remains staff's assertion through `settleManualRefund`.
+
+### `refund.created` is not confirmation
+
+Razorpay emits four refund events. Only two are outcomes. `refund.created` merely acknowledges
+the request we already recorded, and `refund.speed_changed` is a delivery-time detail; reading
+either as success would close a return against money that has not moved. Both are answered
+`unsupported_event`, which is a `200` — a `5xx` would ask the provider to retry something no
+redelivery can fix.
+
+The event-id header is used for audit metadata and nothing else. It is not covered by the
+signature, so trusting it for correctness would be trusting an attacker; the row lock and the
+state machine are what make a second resolution impossible, and a test rewrites the header to
+prove the header buys nothing.
+
+## 53. Phase 4 increment 61 — making the return queue usable without inventing logistics
+
+The return lifecycle was complete after Increment 59; the screens over it were not. Staff could
+approve, receive, inspect and complete a return, but the queue could only be filtered by status,
+showed no customer, and the detail page did not say who raised the return, where the parcel came
+from, what had happened to it, or whether the money had moved. This increment is reads only: no
+new state, no new transition, no migration.
+
+### No ports were added, and that was the finding
+
+The obvious design was two consumer-declared ports — one for the customer, one for the product —
+adapted in `container.ts`. That would have been a second abstraction over something this file is
+already allowed to do: `returns.repository.ts` has imported `order` and `sku` since 40d, and
+`orders.repository.ts` searches `app_user.email` directly. `no-cross-module-imports` governs
+`src/modules/*`; `db/schema/*` is the shared persistence layer beneath every module.
+
+So the queue joins `app_user` and `product` and reads `order_line`. A port would have been
+ceremony, and the rule against a parallel abstraction where an existing one fits says so.
+
+### What is snapshot and what is live
+
+The address is the ORDER'S snapshot (`order.ship_*`), never the live `address` row — a parcel is
+coming back from where it was actually sent, and the orders schema already states the rule.
+
+The product NAME is live, and that is the one deliberate exception. Staff holding a parcel need
+the name on the shelf today, not the name at checkout. Nothing financial is read this way: every
+figure on a return line is still the frozen snapshot beside it.
+
+### The timeline already existed
+
+`return_event` has been written on every transition since 40d and read by nothing. This exposes
+it. No second history table, no backfill, no rewrite — one `SELECT`, ordered
+`(created_at, id)` because the timestamp alone is not a total order: two transitions inside one
+transaction share `now()`, and `id` is UUIDv7, so it breaks the tie in creation order.
+
+`actorType` is published; the actor's user id is not. Which KIND of actor moved a return is
+operational, and attributing it to a named colleague on a read that every staff member can see is
+a disclosure with no benefit — `audit_log` already answers that question for the people entitled
+to ask it.
+
+### Search: four handles, contains, escaped
+
+Return number, order number, customer email, SKU code. Case-insensitive substring. Not names, not
+addresses, not notes — a wider search is a wider disclosure, and the orders list drew the line in
+the same place.
+
+The SKU arm is an `EXISTS`, not a join. A return has many lines; joining them to filter would emit
+one row per matching line, duplicating headers in the page and inflating the total. The count
+query repeats the same joins as the page for the same reason — a total computed from a different
+predicate is how an operator pages past the end of a filter.
+
+`%` and `_` are escaped. An unescaped `%` turns a typo into a pattern matching everything, which
+reads as "the filter is broken" rather than as a wide match.
+
+### Dates, and the bound that was already decided
+
+`requestedTo` is inclusive of the whole millisecond named, expressed as
+`< exclusiveEndOfMillisecond(bound)`. `requested_at` is microsecond-precise in PostgreSQL and
+millisecond-precise in this API, so a plain `<=` drops every return whose stored microseconds are
+non-zero — including the one an operator copied the bound from. That is not a new convention; it
+is the same helper the orders, payments and customer lists already use, and the mutation probe
+that swaps it for `<=` kills three tests.
+
+### Two probes that did not die, and why only one is a real equivalence
+
+**Dropping the tenant predicate inside the SKU `EXISTS` survives, and is genuinely equivalent.**
+`fk_return_line_return_store` is composite on `(return_id, store_id)`, and `return_request.id` is
+the primary key — so `return_line.return_id = return_request.id` already determines the store. The
+predicate stays because it states intent and costs nothing, but the database, not the code, is
+what makes it redundant.
+
+**Dropping the `return_number` tie-breaker from the ordering also survives, and is NOT equivalent
+— it is unkillable.** Without it, two returns sharing a `requested_at` microsecond come back in
+whatever order the plan emits: *unspecified*, not wrong. A test asserting a specific order under
+that mutation would be asserting on undefined behaviour and would pass or fail by luck. A fixture
+that forces a genuine tie exists and locks the documented order, and the mutant still survives it.
+Recorded as a survivor rather than dressed up as an equivalence.
+
+A third probe survived at first for an honest reason: the tenant predicate on the timeline read
+was untestable because the fixture had no `return_event` rows, so an empty table answered `[]` for
+every store. The fixture now inserts one and the probe dies.
+
+### No index
+
+Measured at 20,000 returns in one store: the default page is 14.65 ms / 1078 buffers, a date
+window 2.49 ms / 601 buffers, a search 28.8 ms / 1078 buffers. An admin search box at that size
+does not justify a new index, and an `ILIKE '%term%'` cannot use a b-tree one anyway — a trigram
+index would be the only thing that helped, which is speculative until the workload asks for it.
+The unindexed `requested_at DESC` sort predates this increment and is unchanged by it.
+
+### Scope
+
+Reads only. Pickup scheduling, AWB, return shipments and carriers were NOT implemented: `shipment`
+is outbound-only — it has `order_id`, no `return_id`, no direction, and statuses
+`pending -> shipped -> delivered` with nothing for a failed pickup. Reusing it for reverse
+logistics is a migration and a second lifecycle in one table, and the carrier integration behind it
+does not exist. That is a dependency, documented, not a gap quietly filled.
+
+## 54. Phase 4 increment 62 — the remaining admin operations, and what a table already knew
+
+Six endpoints, no migration, and not one new table. That is the finding rather than the
+constraint: `order_status_history` and `audit_log` had both been written on every relevant path
+for dozens of increments and read by nothing, and `app_user.is_active` was already consulted by
+login. The gap was never persistence; it was that nothing exposed what was already recorded.
+
+### Staff cancellation shares the customer's guards, exactly
+
+`cancelOrder` now takes an OPTIONAL `userId`. Present means a customer cancelling their own
+order, absent means staff cancelling for the tenant, and only the LOOKUP differs — an
+owner-scoped lock versus a store-scoped one. Everything after it is shared: the shipped check
+under the order lock, the paid and payment-in-progress checks, the status compare-and-swap, and
+the reservation release positioned AFTER the CAS so stock is only returned by the request that
+actually cancelled.
+
+A second copy of those rules for the admin path is how the two drift until one of them is wrong,
+and the one that is wrong is the one that gives stock back twice.
+
+`payment.status` is not written on either path. A cancellation that would have needed money
+reversed is refused by the paid guard, so there is nothing to reverse.
+
+**The documented status code was wrong before it was written down.** `OrderNotCancellable`
+extends `Conflict`, so every refusal — already cancelled, shipped, paid, payment in flight — is a
+`409`, not the `422` the first draft of the OpenAPI claimed. The test caught it. The repository
+is the authority; the document follows it.
+
+### `audit_log` gets a reader, and `metadata` does not
+
+`GET /admin/audit-logs` publishes who did what, to which resource, and when. It does NOT publish
+`metadata`. Each module writes its own per-action context, reviewed at its own call site;
+exposing the union of all of it through one endpoint would turn every future `audit.record` call
+into a disclosure decision on this route, made by whoever adds it and noticed by nobody.
+
+The tenant predicate is a plain equality, and that is load-bearing in a way it usually is not:
+`audit_log.store_id` is NULLABLE, because platform-level entries carry none. An `OR IS NULL`
+would have handed one tenant's admin the platform's trail. A NULL satisfies no equality, so the
+row reaches neither tenant — and there is a test with exactly that row in it.
+
+Filters are EXACT matches, not substrings. A substring search over `action` would let `payment`
+quietly match every payment action a future module adds, so the filter's meaning would change as
+the codebase grew.
+
+### Activation is a state, not two verbs
+
+`POST /admin/customers/{id}/activation` takes `{ isActive }`. One endpoint cannot be called in
+the wrong direction by a client that guessed a path, which two verb routes can.
+
+The update carries `ne(is_active, :next)`, so a redundant request matches no row and answers
+`409`. Without it, deactivating an already deactivated account would write an audit entry for a
+decision nobody made, and the trail would record clicks rather than decisions.
+
+It is not a privilege operation and the type system says so: the repository method writes one
+boolean, `is_staff` and `is_superuser` are neither selected nor settable, and the strict schema
+rejects both by name at the boundary. Two independent defences, because the cost of losing this
+one is an account granting itself staff.
+
+### The business profile is split from the tax profile on purpose
+
+`legal_name`, `gstin`, `pan` and the origin address stay with `PUT /admin/store/tax-profile`,
+which validates a GSTIN against its checksum and a state against the place-of-supply rules. The
+new endpoint owns name, domain, locale and timezone and rejects every GST field by name.
+
+Two endpoints writing the same columns with different validation is how one of them becomes the
+weak one, and the weak one is the one an attacker uses. `slug` and `currency` are published but
+read-only: the slug resolves the store on every request, and the currency denominates money
+already written to every order, payment, refund and invoice. Changing either is a migration.
+
+`timezone` is validated by constructing an `Intl.DateTimeFormat` rather than by regex, so a value
+this accepts is one the invoice renderer can actually format against — a regex would admit
+`Asia/Atlantis` and fail later, on an order already placed.
+
+### The probe that survived, and what it meant
+
+Removing the tenant predicate from the audit-log filter passed the entire new HTTP suite. That
+suite has one store, and the container's store-resolver cache makes a second tenant unreachable
+over HTTP — the same limitation `tenant-isolation.test.ts` was created for two increments ago.
+
+So the predicates moved there, where two tenants are explicit: the audit log read, the
+store-scoped order lock behind staff cancellation, the timeline read, and the activation write.
+All four probes now die. The store-scoped order lock deserves the note: unlike the owner-scoped
+one, nothing else about it incidentally lands inside a tenant, so `store_id` is the only thing
+between one merchant's admin and another merchant's order.

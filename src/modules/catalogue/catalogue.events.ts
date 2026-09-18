@@ -220,3 +220,20 @@ export const SKU_OPTIONS_EVENT = 'sku.options_updated';
 
 /** The matching audit action, beside `sku.price_changed` for the same reason. */
 export const SKU_OPTIONS_AUDIT = 'sku.options_updated';
+
+/* ── Media. Increment 58. ────────────────────────────────────────────────── */
+
+/**
+ * The audit vocabulary for product imagery.
+ *
+ * Audit actions only — **no domain events.** Nothing in this system subscribes to an image being
+ * attached or removed, and publishing an event with no consumer would be a guess at one. The
+ * audit trail is what the operational question actually needs: who attached this, and when.
+ */
+export const MEDIA_RESOURCE = 'product_media';
+
+export const MEDIA_AUDIT = {
+  created: 'product_media.created',
+  updated: 'product_media.updated',
+  deleted: 'product_media.deleted',
+} as const;

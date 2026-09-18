@@ -1,4 +1,4 @@
-import { and, eq, gt, inArray, isNull } from 'drizzle-orm';
+import { and, count, desc, eq, gt, inArray, isNull } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { refreshSession } from '../../db/schema/identity.js';
@@ -335,5 +335,138 @@ export function createRefreshSessionRepository(deps: { db: Database }) {
 
       return revoked.length;
     },
+
+    /**
+     * One customer's refresh sessions, newest first. Increment 63.
+     *
+     * **`token_hash` is not in the projection.** Not redacted downstream, not mapped away in a
+     * DTO — never selected. A read model that cannot carry credential material cannot leak it
+     * through a later careless response change, which is the same discipline
+     * `PUBLIC_COLUMNS` applies to `password_hash` in the identity repository.
+     *
+     * Scoped by `(store_id, user_id)`. Both are mandatory: the store because it is the tenant,
+     * the user because staff ask about ONE customer and a store-only predicate would hand back
+     * every session in the tenant.
+     *
+     * Ordered `(created_at DESC, id DESC)`. `id` is UUIDv7, so sessions minted in the same
+     * instant — which a single sign-in can produce — still order deterministically.
+     */
+    async listSessionsForUser(params: {
+      storeId: string;
+      userId: string;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: AdminSessionRecord[]; total: number }> {
+      const scope = and(
+        eq(refreshSession.storeId, params.storeId),
+        eq(refreshSession.userId, params.userId),
+      );
+
+      const [items, [counted]] = await Promise.all([
+        executor(db)
+          .select({
+            id: refreshSession.id,
+            familyId: refreshSession.familyId,
+            expiresAt: refreshSession.expiresAt,
+            consumedAt: refreshSession.consumedAt,
+            revokedAt: refreshSession.revokedAt,
+            revokedReason: refreshSession.revokedReason,
+            userAgent: refreshSession.userAgent,
+            ipAddress: refreshSession.ipAddress,
+            createdAt: refreshSession.createdAt,
+            updatedAt: refreshSession.updatedAt,
+          })
+          .from(refreshSession)
+          .where(scope)
+          .orderBy(desc(refreshSession.createdAt), desc(refreshSession.id))
+          .limit(params.limit)
+          .offset(params.offset),
+        executor(db).select({ total: count() }).from(refreshSession).where(scope),
+      ]);
+
+      return { items, total: Number(counted?.total ?? 0) };
+    },
+
+    /**
+     * Revoke one session's whole FAMILY, for a named customer in a named store. Increment 63.
+     *
+     * Distinct from `revokeFamilyBySessionId` above, which is store-scoped but NOT user-scoped
+     * because its caller — token rotation — already holds a verified session. A staff caller
+     * holds only two ids from a URL, so the customer predicate has to be in the query: without
+     * it, a staff member could revoke any session in their store by guessing its id while the
+     * path claimed a different customer.
+     *
+     * The FAMILY rather than the row, matching rotation's own semantics: a refresh token is
+     * rotated on every use, so one sign-in is a chain of rows sharing a `family_id`. Revoking
+     * only the named row would leave its successor live and the session still usable, which is
+     * precisely the opposite of what "revoke this session" means to an operator.
+     *
+     * Returns the number of rows revoked. Zero means no such live session for that customer —
+     * unknown id, another customer's, another tenant's, or already revoked — and the caller
+     * turns all four into one answer rather than distinguishing them.
+     */
+    async revokeFamilyForUserSession(params: {
+      storeId: string;
+      userId: string;
+      sessionId: string;
+      reason: string;
+      at: Date;
+    }): Promise<number> {
+      /*
+       * The subquery carries the user predicate too. Selecting the family by id alone and then
+       * filtering the UPDATE by user would revoke nothing but would still have READ another
+       * customer's family id, and a later refactor could easily drop the second predicate.
+       */
+      const family = executor(db)
+        .select({ familyId: refreshSession.familyId })
+        .from(refreshSession)
+        .where(
+          and(
+            eq(refreshSession.id, params.sessionId),
+            eq(refreshSession.storeId, params.storeId),
+            eq(refreshSession.userId, params.userId),
+          ),
+        );
+
+      const revoked = await executor(db)
+        .update(refreshSession)
+        .set({ revokedAt: params.at, revokedReason: params.reason, updatedAt: params.at })
+        .where(
+          and(
+            eq(refreshSession.storeId, params.storeId),
+            eq(refreshSession.userId, params.userId),
+            inArray(refreshSession.familyId, family),
+            isNull(refreshSession.revokedAt),
+          ),
+        )
+        .returning({ id: refreshSession.id });
+
+      return revoked.length;
+    },
   };
 }
+
+/**
+ * One refresh session, as the ADMIN API publishes it. Increment 63.
+ *
+ * `tokenHash` is absent from the shape, not merely from the response. So is `userId` — the
+ * caller named the customer in the path, so echoing the id back adds nothing and publishes an
+ * internal identifier.
+ *
+ * Everything here is already persisted; nothing is invented. `userAgent` and `ipAddress` are
+ * recorded at sign-in by the existing session write, and are published because "which device
+ * is this and where did it sign in from" is the question an operator revoking a session is
+ * trying to answer.
+ */
+export type AdminSessionRecord = {
+  readonly id: string;
+  readonly familyId: string;
+  readonly expiresAt: Date;
+  readonly consumedAt: Date | null;
+  readonly revokedAt: Date | null;
+  readonly revokedReason: string | null;
+  readonly userAgent: string | null;
+  readonly ipAddress: string | null;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+};

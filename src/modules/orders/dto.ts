@@ -624,3 +624,37 @@ export function toAdminOrderListResponse(page: {
     pagination: { limit: page.limit, offset: page.offset, total: page.total },
   };
 }
+
+/* ── The admin order timeline. Increment 62. ─────────────────────────────── */
+
+/**
+ * One entry of an order's append-only status history.
+ *
+ * `actorType` says what KIND of actor caused the transition — `customer`, `staff`, `system`,
+ * `job`. The actor's user id is deliberately absent: attributing a transition to a named
+ * colleague is an `audit_log` question, answered where the access controls for it already are,
+ * and this read is visible to every staff member in the store.
+ */
+export type OrderTimelineResponse = {
+  fromStatus: string | null;
+  toStatus: string;
+  actorType: string;
+  note: string | null;
+  at: string;
+};
+
+export function toOrderTimelineResponse(event: {
+  readonly fromStatus: string | null;
+  readonly toStatus: string;
+  readonly actorType: string;
+  readonly note: string | null;
+  readonly createdAt: Date;
+}): OrderTimelineResponse {
+  return {
+    fromStatus: event.fromStatus,
+    toStatus: event.toStatus,
+    actorType: event.actorType,
+    note: event.note,
+    at: event.createdAt.toISOString(),
+  };
+}

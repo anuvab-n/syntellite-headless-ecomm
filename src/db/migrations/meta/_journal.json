@@ -190,6 +190,27 @@
       "when": 1789556391470,
       "tag": "20260916105951_razorpay_payment_id",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1789580827867,
+      "tag": "20260916174707_sku_low_stock_threshold",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1789633172246,
+      "tag": "20260917081932_product_media",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1789643436182,
+      "tag": "20260917111036_refunds",
+      "breakpoints": true
     }
   ]
 }

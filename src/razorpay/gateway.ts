@@ -19,11 +19,12 @@ import type { Logger } from '../shared/logger.js';
  *
  * ## No SDK dependency, deliberately
  *
- * The approved integration needs exactly two provider operations, and both are one function
- * call against Node's standard library:
+ * The approved integration needs three provider operations, and each is one function call
+ * against Node's standard library:
  *
  *  - **Create an order** — a single authenticated `POST /v1/orders`. `fetch` is global in
  *    Node 22 (the engine this project pins), so there is nothing to install.
+ *  - **Refund a charge** — a single authenticated `POST /v1/payments/{id}/refund`.
  *  - **Verify a webhook** — `HMAC-SHA256(rawBody, webhookSecret)` compared in constant time,
  *    which is `node:crypto`.
  *
@@ -56,12 +57,32 @@ const REQUEST_TIMEOUT_MS = 10_000;
  * Razorpay event names this integration acts on.
  *
  * `payment.captured` is success and `payment.failed` is failure, for the approved single-step
- * lifecycle: there is no separate authorisation, so `payment.authorized` is not acted on. Every
- * other event — refunds, settlements, disputes, subscriptions — is out of the approved scope
- * and is answered as `unsupported` rather than guessed at.
+ * lifecycle: there is no separate authorisation, so `payment.authorized` is not acted on.
+ *
+ * `refund.processed` and `refund.failed` are the refund lifecycle's two TERMINAL events, added
+ * by Increment 60 to resolve attempts left `processing` by an unanswered provider call.
+ * Razorpay also emits `refund.created` and `refund.speed_changed`; neither is an outcome —
+ * `created` merely acknowledges the request we already recorded, and `speed_changed` is a
+ * delivery-time detail — so both stay `unsupported` rather than being read as confirmation.
+ *
+ * Every other event — settlements, disputes, subscriptions — is out of the approved scope and
+ * is answered as `unsupported` rather than guessed at.
  */
 const EVENT_CAPTURED = 'payment.captured';
 const EVENT_FAILED = 'payment.failed';
+const EVENT_REFUND_PROCESSED = 'refund.processed';
+const EVENT_REFUND_FAILED = 'refund.failed';
+
+/**
+ * The key our own refund id travels under, inside the refund entity's `notes`.
+ *
+ * `notes` is a provider-persisted key/value map that Razorpay echoes back on every refund
+ * entity, including the one inside a webhook payload. It is the ONLY field in that entity we
+ * control, which is what makes it the correlation mechanism: the `x-razorpay-idempotency`
+ * header we also send is never echoed, and the refund id Razorpay assigns is unknown to us
+ * precisely in the `processing` case this exists to resolve.
+ */
+const REFUND_NOTE_KEY = 'refund_id';
 
 /**
  * The domain-facing failure code for a declined payment.
@@ -74,6 +95,15 @@ const EVENT_FAILED = 'payment.failed';
  */
 const FAILURE_CODE_DECLINED = 'declined';
 
+/**
+ * The domain-facing failure code for a refund Razorpay reports as terminally failed.
+ *
+ * Distinct from `declined`, which is about a charge, and from the `http_4xx` codes the refund
+ * REST call produces: those say our REQUEST was refused, this says an accepted refund did not
+ * complete at the bank. An operator reading the column needs to tell those apart.
+ */
+const FAILURE_CODE_REFUND_FAILED = 'provider_refund_failed';
+
 /* ── The port this adapter satisfies ─────────────────────────────────────── */
 
 /**
@@ -81,8 +111,43 @@ const FAILURE_CODE_DECLINED = 'declined';
  * this file imports nothing from a domain module — `no-cross-module-imports` is satisfied by
  * construction, and the compiler still checks the two agree where `container.ts` joins them.
  */
+/**
+ * What asking the provider to refund a charge told us.
+ *
+ * **Three outcomes, not two.** `unknown` is the one this type exists for: a timeout, an
+ * aborted connection, a 5xx, or a body that did not parse all mean the request may or may not
+ * have moved money. Collapsing that into `failed` would invite a retry that refunds twice, and
+ * collapsing it into `succeeded` would close a return against money that never moved. The
+ * caller persists it as its own state and resolves it out of band.
+ *
+ * A 4xx from the provider IS evidence of failure — the request was understood and refused — so
+ * that maps to `failed` with the provider's normalised code. A 5xx is not evidence of
+ * anything, and maps to `unknown`.
+ */
+export type RazorpayRefundResult =
+  | { readonly kind: 'succeeded'; readonly providerRefundId: string }
+  | { readonly kind: 'failed'; readonly failureCode: string | null }
+  | { readonly kind: 'unknown' };
+
 export type RazorpayGateway = {
   readonly provider: 'razorpay';
+  /**
+   * Refund a CHARGE, addressed by the provider's payment id (`pay_…`).
+   *
+   * Not `providerRef` — that is the Razorpay ORDER (`order_…`), which cannot be refunded and
+   * would be rejected by the API. The distinction is the reason `payment.provider_transaction_id`
+   * exists as a separate column, and getting it wrong here would be a refund issued against the
+   * wrong object.
+   *
+   * `reference` is sent as Razorpay's `Idempotency-Key` header, so a retry of a request whose
+   * answer was lost returns the ORIGINAL refund rather than creating a second one. That is what
+   * makes a `processing` row recoverable instead of merely recorded.
+   */
+  refund(params: {
+    providerTransactionId: string;
+    amountMinor: number;
+    reference: string;
+  }): Promise<RazorpayRefundResult>;
   createOrder(params: {
     amountMinor: number;
     currency: string;
@@ -109,6 +174,32 @@ export type RazorpayGateway = {
          * transition the event describes.
          */
         readonly providerTransactionId: string | null;
+        readonly outcome: 'succeeded' | 'failed';
+        readonly failureCode: string | null;
+      }
+    /**
+     * A terminal REFUND notification. Increment 60.
+     *
+     * Deliberately a distinct variant rather than a flag on `event`: a refund event resolves a
+     * different aggregate, against a different state machine, and merging the two would let a
+     * future edit apply a refund outcome to a payment row. The discriminant makes that
+     * unexpressible.
+     */
+    | {
+        readonly kind: 'refund_event';
+        readonly providerEventId: string;
+        readonly eventType: string;
+        /** Razorpay's id for the refund (`rfnd_…`), from `payload.refund.entity.id`. */
+        readonly providerRefundId: string;
+        /**
+         * OUR refund id, read back out of `payload.refund.entity.notes.refund_id`.
+         *
+         * The lookup key, and the only one. It is a value this system generated and sent; a
+         * notification that does not carry one names no attempt we can safely resolve.
+         */
+        readonly refundReference: string;
+        /** The provider's figure, in minor units, checked against the frozen row by the caller. */
+        readonly amountMinor: number | null;
         readonly outcome: 'succeeded' | 'failed';
         readonly failureCode: string | null;
       };
@@ -162,9 +253,57 @@ function verifySignature(params: {
  * checked, and even afterwards a provider is free to add fields. Reading exactly what is needed
  * means an unexpected shape becomes `malformed` instead of a runtime crash inside a handler.
  */
-function readEnvelope(
-  raw: Buffer,
-): { event: string; orderId: string | null; paymentId: string | null } | null {
+type RefundEntity = {
+  readonly refundId: string | null;
+  readonly reference: string | null;
+  readonly amountMinor: number | null;
+};
+
+/**
+ * `payload.refund.entity`, narrowed to the three fields Increment 60 reads.
+ *
+ * Returned as `null` for every event that is not about a refund, which is the ordinary case:
+ * a `payment.captured` body has no `payload.refund` at all.
+ */
+function readRefundEntity(parsed: unknown): RefundEntity | null {
+  const entity = (parsed as { payload?: { refund?: { entity?: unknown } } }).payload?.refund
+    ?.entity;
+  if (typeof entity !== 'object' || entity === null) return null;
+
+  const fields = entity as { id?: unknown; amount?: unknown; notes?: unknown };
+
+  /*
+   * `notes` is a free-form map. Ours is the one key we put there; anything else the merchant or
+   * a future increment adds is ignored rather than merged, and a `notes` that is absent, not an
+   * object, or carries a non-string value yields `null` — which the caller turns into
+   * "unmatchable", never into a guess.
+   */
+  const notes = fields.notes;
+  const reference =
+    typeof notes === 'object' && notes !== null
+      ? readBoundedString((notes as Record<string, unknown>)[REFUND_NOTE_KEY])
+      : null;
+
+  /*
+   * Minor units, as an integer. Anything else — a float, a string, a negative, a value beyond
+   * safe-integer range — becomes `null`, and the caller refuses to resolve rather than
+   * comparing a number it cannot trust against money.
+   */
+  const rawAmount = fields.amount;
+  const amountMinor =
+    typeof rawAmount === 'number' && Number.isSafeInteger(rawAmount) && rawAmount > 0
+      ? rawAmount
+      : null;
+
+  return { refundId: readBoundedString(fields.id), reference, amountMinor };
+}
+
+function readEnvelope(raw: Buffer): {
+  event: string;
+  orderId: string | null;
+  paymentId: string | null;
+  refund: RefundEntity | null;
+} | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw.toString('utf8'));
@@ -203,6 +342,7 @@ function readEnvelope(
     event,
     orderId: readBoundedString(fields.order_id),
     paymentId: readBoundedString(paymentId),
+    refund: readRefundEntity(parsed),
   };
 }
 
@@ -228,6 +368,100 @@ export function createRazorpayGateway(deps: {
 
   return {
     provider: 'razorpay',
+
+    /**
+     * Refund a charge.
+     *
+     * `POST /v1/payments/{pay_id}/refund` with `{ amount }` in minor units — which arrives
+     * already converted by `money.ts`. **This file does not multiply by 100**, for the same
+     * reason `createOrder` does not: a hard-coded factor here would be wrong for a zero-decimal
+     * currency and would put a second, unreviewed rounding rule beside the documented one.
+     *
+     * The three-way return is the contract. Note which branch each failure takes:
+     *
+     *  - **4xx** — the provider understood and refused. That is evidence, so `failed`.
+     *  - **5xx** — the provider broke. That is not evidence of anything, so `unknown`.
+     *  - **timeout / abort / network** — the request may have been received and processed.
+     *    `unknown`.
+     *  - **200 with an unusable body** — something happened and we cannot say what. `unknown`,
+     *    not `failed`: a refund id we failed to parse is still a refund that may exist.
+     */
+    async refund(params) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      try {
+        const response = await fetchImpl(
+          `${API_BASE}/payments/${encodeURIComponent(params.providerTransactionId)}/refund`,
+          {
+            method: 'POST',
+            headers: {
+              authorization: authHeader(),
+              'content-type': 'application/json',
+              /* The provider's own idempotency, so a lost answer does not become a second refund. */
+              'x-razorpay-idempotency': params.reference,
+            },
+            /*
+             * `notes` carries OUR refund id into the provider's copy of the refund, and
+             * Razorpay echoes it on every later refund entity — including the one inside a
+             * `refund.processed` / `refund.failed` webhook. That is what lets Increment 60
+             * resolve an attempt whose `provider_refund_id` we never learned, which is exactly
+             * the `processing` rows this whole mechanism exists for.
+             *
+             * The idempotency header above cannot serve: Razorpay does not echo headers.
+             */
+            body: JSON.stringify({
+              amount: params.amountMinor,
+              notes: { [REFUND_NOTE_KEY]: params.reference },
+            }),
+            signal: controller.signal,
+          },
+        );
+
+        if (!response.ok) {
+          /*
+           * Status only, never the body. A Razorpay error body echoes the request, and the
+           * request is about money; there is no version of logging it that is safe by default.
+           */
+          logger.error(
+            { provider: 'razorpay', operation: 'refund', status: response.status },
+            'payment_provider_request_failed',
+          );
+
+          /*
+           * The one place in this file where the status CLASS changes the domain answer. A
+           * refusal is a fact; a server fault is an absence of one.
+           */
+          if (response.status >= 400 && response.status < 500) {
+            return { kind: 'failed', failureCode: `http_${String(response.status)}` };
+          }
+          return { kind: 'unknown' };
+        }
+
+        const body: unknown = await response.json();
+        const id =
+          typeof body === 'object' && body !== null ? (body as { id?: unknown }).id : undefined;
+
+        if (typeof id !== 'string' || id.length === 0) {
+          logger.error(
+            { provider: 'razorpay', operation: 'refund' },
+            'payment_provider_response_unusable',
+          );
+          return { kind: 'unknown' };
+        }
+
+        return { kind: 'succeeded', providerRefundId: id };
+      } catch (err) {
+        /* Network failure, timeout, abort. The error itself is safe — it carries no body. */
+        logger.error(
+          { err, provider: 'razorpay', operation: 'refund' },
+          'payment_provider_unreachable',
+        );
+        return { kind: 'unknown' };
+      } finally {
+        clearTimeout(timer);
+      }
+    },
 
     /**
      * Create the Razorpay order the client-side checkout needs.
@@ -335,6 +569,34 @@ export function createRazorpayGateway(deps: {
       const envelope = readEnvelope(params.rawBody);
       if (envelope === null) return { kind: 'malformed' };
 
+      /*
+       * Refunds first, and they return before the payment branch can see them. Increment 60.
+       *
+       * A refund notification that cannot be correlated — no `notes.refund_id`, no `rfnd_` id —
+       * is `unsupported`, NOT `malformed`: the body is perfectly well-formed, it simply names
+       * no attempt of ours. `malformed` would be a `400`, and a `400` asks Razorpay to retry
+       * something no redelivery can fix. This is the case a refund raised before Increment 60
+       * lands in, and it is answered as an acknowledged no-op by design.
+       */
+      if (envelope.event === EVENT_REFUND_PROCESSED || envelope.event === EVENT_REFUND_FAILED) {
+        const entity = envelope.refund;
+        if (entity === null || entity.reference === null || entity.refundId === null) {
+          return { kind: 'unsupported', providerEventId: eventId, eventType: envelope.event };
+        }
+
+        const refundSucceeded = envelope.event === EVENT_REFUND_PROCESSED;
+        return {
+          kind: 'refund_event',
+          providerEventId: eventId,
+          eventType: envelope.event,
+          providerRefundId: entity.refundId,
+          refundReference: entity.reference,
+          amountMinor: entity.amountMinor,
+          outcome: refundSucceeded ? 'succeeded' : 'failed',
+          failureCode: refundSucceeded ? null : FAILURE_CODE_REFUND_FAILED,
+        };
+      }
+
       if (envelope.event !== EVENT_CAPTURED && envelope.event !== EVENT_FAILED) {
         return { kind: 'unsupported', providerEventId: eventId, eventType: envelope.event };
       }
@@ -373,6 +635,19 @@ export function createUnconfiguredGateway(deps: { logger: Logger }): RazorpayGat
   return {
     provider: 'razorpay',
     createOrder() {
+      logger.error({ provider: 'razorpay' }, 'payment_provider_not_configured');
+      return Promise.reject(new DependencyUnavailable('payment provider'));
+    },
+    /**
+     * Rejects rather than answering `failed`.
+     *
+     * `failed` would be a claim about what the provider decided, and there is no provider. The
+     * caller turns this into a `503` and writes no refund row, which leaves the return exactly
+     * where it was — recoverable once credentials are configured. Answering `unknown` would be
+     * worse still: it would strand the refund in a reconciliation state against a gateway that
+     * was never contacted.
+     */
+    refund() {
       logger.error({ provider: 'razorpay' }, 'payment_provider_not_configured');
       return Promise.reject(new DependencyUnavailable('payment provider'));
     },

@@ -5,7 +5,9 @@ import {
   eq,
   gte,
   ilike,
+  asc,
   inArray,
+  ne,
   isNull,
   lt,
   or,
@@ -16,7 +18,12 @@ import {
 import type { Database } from '../../db/client.js';
 import { address } from '../../db/schema/address.js';
 import { appUser } from '../../db/schema/identity.js';
-import { order, orderLine, orderStatusHistory } from '../../db/schema/orders.js';
+import {
+  CANCELLED_ORDER_STATUS,
+  order,
+  orderLine,
+  orderStatusHistory,
+} from '../../db/schema/orders.js';
 import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
 import { payment } from '../../db/schema/payments.js';
 import { shipment } from '../../db/schema/shipments.js';
@@ -142,6 +149,20 @@ export type OrderRecord = {
   readonly shipPostalCode: string;
   readonly shipCountryCode: string;
   readonly placedAt: Date;
+};
+
+/**
+ * One entry of an order's append-only status history. Increment 62.
+ *
+ * `actorUserId` is deliberately absent from this shape, not merely from the response: a read
+ * model that never carries it cannot leak it by a later careless DTO change.
+ */
+export type OrderTimelineRecord = {
+  readonly fromStatus: string | null;
+  readonly toStatus: string;
+  readonly actorType: string;
+  readonly note: string | null;
+  readonly createdAt: Date;
 };
 
 /** One order line, exactly as it was snapshotted. Nothing here is ever recomputed. */
@@ -607,6 +628,61 @@ export function createOrdersRepository(deps: { db: Database }) {
      * read-then-decide shape this codebase refuses. Returns only the three fields fulfilment
      * needs; handing over the whole row would let another module reason about money.
      */
+    /**
+     * The FULL order row, locked, store-scoped and not owner-scoped. Increment 62.
+     *
+     * Distinct from `lockOrderByNumberForStore` below, which selects three columns because the
+     * ship and deliver paths only need to know the order exists and what state it is in. Staff
+     * cancellation runs the same guards as customer cancellation and returns the same view, so
+     * it needs the same columns the owner-scoped lock returns.
+     *
+     * No `user_id` predicate, deliberately: staff act for a tenant rather than for a person, so
+     * scoping by the staff member's own id would hide every order but their own. `store_id` is
+     * still mandatory and still comes from the verified token.
+     */
+    /**
+     * The append-only status history of one order, oldest first. Increment 62.
+     *
+     * Ordered `(created_at, id)`. The timestamp alone is not a total order — two transitions
+     * inside one transaction share `now()` — and `id` is UUIDv7, so it breaks the tie in
+     * creation order. `ix_order_status_history_order (order_id, created_at)` serves the leading
+     * column; no new index is needed.
+     */
+    async listOrderStatusHistory(params: {
+      orderId: string;
+      storeId: string;
+    }): Promise<OrderTimelineRecord[]> {
+      return executor(db)
+        .select({
+          fromStatus: orderStatusHistory.fromStatus,
+          toStatus: orderStatusHistory.toStatus,
+          actorType: orderStatusHistory.actorType,
+          note: orderStatusHistory.note,
+          createdAt: orderStatusHistory.createdAt,
+        })
+        .from(orderStatusHistory)
+        .where(
+          and(
+            eq(orderStatusHistory.orderId, params.orderId),
+            eq(orderStatusHistory.storeId, params.storeId),
+          ),
+        )
+        .orderBy(asc(orderStatusHistory.createdAt), asc(orderStatusHistory.id));
+    },
+
+    async lockStoreOrderByNumber(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<OrderRecord | undefined> {
+      const [row] = await executor(db)
+        .select(ORDER_COLUMNS)
+        .from(order)
+        .where(and(eq(order.orderNumber, params.orderNumber), eq(order.storeId, params.storeId)))
+        .limit(1)
+        .for('update');
+      return row;
+    },
+
     async lockOrderByNumberForStore(params: {
       orderNumber: string;
       storeId: string;
@@ -810,6 +886,251 @@ export function createOrdersRepository(deps: { db: Database }) {
         paymentStatus: fold((r) => r.paymentStatus),
         shipmentStatus: fold((r) => r.shipmentStatus),
       };
+    },
+
+    /**
+     * **Billed value and order count for a window, plus the window before it.** Increment 57.
+     *
+     * Both periods in ONE statement. Two statements would read the same index twice and leave
+     * the two figures free to disagree if an order were placed between them — a comparison whose
+     * halves were measured at different instants is not a comparison.
+     *
+     * `FILTER` rather than two subqueries so the planner walks `ix_order_store_placed` once
+     * across the union of the two windows, which are adjacent by construction.
+     *
+     * **Cancelled orders are excluded from both figures.** That is the approved definition of
+     * revenue: `SUM(grand_total)` over non-cancelled orders placed in the window — tax-inclusive
+     * because `grand_total` is, and BILLED value rather than cash received. A COD payment never
+     * terminalises in this system, so a captured-money definition would report zero for every
+     * cash-on-delivery sale; this one instead counts an order whose online payment later failed.
+     * Returns are not deducted because no refund has ever been executed here.
+     *
+     * `sum()` returns a `NUMERIC` string from the driver and is never touched by JavaScript
+     * arithmetic — `money.ts`'s rule. `coalesce` makes an empty window `'0'` rather than null, so
+     * the caller never has to decide what "no orders" is worth.
+     */
+    async revenueAndOrderCounts(params: {
+      storeId: string;
+      from: Date;
+      toExclusive: Date;
+      previousFrom: Date;
+      previousToExclusive: Date;
+    }): Promise<{
+      revenue: string;
+      orders: number;
+      previousRevenue: string;
+      previousOrders: number;
+    }> {
+      const live = ne(order.status, CANCELLED_ORDER_STATUS);
+      const current = sql`${order.placedAt} >= ${params.from} and ${order.placedAt} < ${params.toExclusive}`;
+      const previous = sql`${order.placedAt} >= ${params.previousFrom} and ${order.placedAt} < ${params.previousToExclusive}`;
+
+      const [row] = await executor(db)
+        .select({
+          revenue: sql<string>`coalesce(sum(${order.grandTotal}) filter (where ${current}), '0')`,
+          orders: sql<string>`count(*) filter (where ${current})`,
+          previousRevenue: sql<string>`coalesce(sum(${order.grandTotal}) filter (where ${previous}), '0')`,
+          previousOrders: sql<string>`count(*) filter (where ${previous})`,
+        })
+        .from(order)
+        .where(
+          and(
+            eq(order.storeId, params.storeId),
+            live,
+            sql`${order.placedAt} >= ${params.previousFrom} and ${order.placedAt} < ${params.toExclusive}`,
+          ),
+        );
+
+      return {
+        revenue: row?.revenue ?? '0',
+        orders: Number(row?.orders ?? 0),
+        previousRevenue: row?.previousRevenue ?? '0',
+        previousOrders: Number(row?.previousOrders ?? 0),
+      };
+    },
+
+    /**
+     * **Revenue and order count per calendar bucket, in the STORE's timezone.** Increment 57.
+     *
+     * `date_trunc(unit, placed_at AT TIME ZONE tz)` — the conversion is not optional. Bucketing
+     * in UTC misfiles every order placed after 18:30 IST on the last day of a month into the
+     * next one, which is a reporting error a merchant notices and cannot explain.
+     *
+     * The unit reaches SQL through `sql.raw` and is therefore the one value here that must never
+     * come from a request. The caller passes a member of a closed set validated at the boundary;
+     * this method takes it as a union type so a string cannot be handed over by accident.
+     *
+     * Only non-empty buckets come back. The caller fills the gaps, because a bucket with no
+     * orders is a fact about the calendar rather than about the data, and the calendar is not
+     * something a `GROUP BY` knows.
+     */
+    async revenueSeries(params: {
+      storeId: string;
+      from: Date;
+      toExclusive: Date;
+      unit: 'day' | 'week' | 'month';
+      timezone: string;
+    }): Promise<{ bucket: string; revenue: string; orders: number }[]> {
+      /*
+       * Raw SQL, and the SUBQUERY is the reason.
+       *
+       * Through the query builder the `date_trunc` expression is rendered once per clause, and
+       * each rendering binds the timezone as a NEW parameter — `$1` in the select list, `$6` in
+       * the GROUP BY. PostgreSQL matches a grouped expression by parse tree, and `$1` and `$6`
+       * are different nodes even when they carry the same value, so it refuses the statement as
+       * an ungrouped column. Computing the bucket once in a subquery makes the expression appear
+       * exactly once, which is both correct and easier to read than the alternative.
+       *
+       * The unit is interpolated rather than bound because `date_trunc`'s first argument must be
+       * a literal. It is a member of a closed set validated at the HTTP boundary and typed as a
+       * union here, so a string from a request cannot reach it; the timezone beside it stays a
+       * bound parameter.
+       */
+      const result = await executor(db).execute(sql`
+        select to_char(bucket, 'YYYY-MM-DD') as bucket,
+               coalesce(sum(grand_total), '0')::text as revenue,
+               count(*)::text as orders
+          from (
+            select date_trunc(${sql.raw(`'${params.unit}'`)},
+                              ${order.placedAt} at time zone ${params.timezone}) as bucket,
+                   ${order.grandTotal} as grand_total
+              from ${order}
+             where ${order.storeId} = ${params.storeId}
+               and ${order.status} <> ${CANCELLED_ORDER_STATUS}
+               and ${order.placedAt} >= ${params.from}
+               and ${order.placedAt} < ${params.toExclusive}
+          ) buckets
+         group by bucket
+         order by bucket
+      `);
+
+      const rows = result.rows as { bucket: string; revenue: string; orders: string }[];
+      return rows.map((row) => ({
+        bucket: row.bucket,
+        revenue: row.revenue,
+        orders: Number(row.orders),
+      }));
+    },
+
+    /**
+     * **The best-selling SKUs of a window, by quantity.** Increment 57.
+     *
+     * Grouped by the SNAPSHOTTED `sku_code`, `product_name` and `sku_name` on the order line —
+     * never by joining today's `sku` or `product`. Those columns are denormalised onto the line
+     * precisely so a rename cannot rewrite history, and a dashboard that joined the live tables
+     * would report last quarter's sales under this quarter's names.
+     *
+     * Revenue is `taxable_value + tax_total`, which is the line's contribution to the order's
+     * `grand_total`: `taxable_value` is already `line_total - discount_amount` materialised, so
+     * discounts are deducted and tax is included, consistent with the revenue KPI above.
+     *
+     * Cancelled orders are excluded, matching every other figure on this dashboard.
+     *
+     * Ordered by quantity descending then `sku_code` ascending. The tiebreaker is load-bearing:
+     * without it two SKUs that sold the same number of units swap places between requests, and a
+     * "top 5" that reshuffles on refresh reads as a bug.
+     */
+    async topSellingSkus(params: {
+      storeId: string;
+      from: Date;
+      toExclusive: Date;
+      limit: number;
+    }): Promise<
+      { skuCode: string; productName: string; skuName: string; quantity: number; revenue: string }[]
+    > {
+      const rows = await executor(db)
+        .select({
+          skuCode: orderLine.skuCode,
+          productName: orderLine.productName,
+          skuName: orderLine.skuName,
+          quantity: sql<string>`sum(${orderLine.quantity})`,
+          revenue: sql<string>`coalesce(sum(${orderLine.taxableValue} + ${orderLine.taxTotal}), '0')`,
+        })
+        .from(orderLine)
+        .innerJoin(
+          order,
+          and(eq(order.id, orderLine.orderId), eq(order.storeId, orderLine.storeId)),
+        )
+        .where(
+          and(
+            eq(orderLine.storeId, params.storeId),
+            ne(order.status, CANCELLED_ORDER_STATUS),
+            gte(order.placedAt, params.from),
+            lt(order.placedAt, params.toExclusive),
+          ),
+        )
+        .groupBy(orderLine.skuCode, orderLine.productName, orderLine.skuName)
+        .orderBy(sql`sum(${orderLine.quantity}) desc`, asc(orderLine.skuCode))
+        .limit(params.limit);
+
+      return rows.map((row) => ({
+        skuCode: row.skuCode,
+        productName: row.productName,
+        skuName: row.skuName,
+        quantity: Number(row.quantity),
+        revenue: row.revenue,
+      }));
+    },
+
+    /**
+     * **Order aggregates for a SET of customers, in one statement.** Increment 56.
+     *
+     * The staff customer list publishes `orderCount`, `totalSpent` and `lastOrderAt` per row.
+     * Those are order facts, and `app_user` belongs to identity — so identity declares a port
+     * and this answers it. A set of ids rather than one, because a page of 25 customers asking
+     * this 25 times is the N+1 the list exists to avoid; one `IN` and one `GROUP BY` is the
+     * whole cost.
+     *
+     * **Cancelled orders are excluded from all three**, which is the approved definition of
+     * `totalSpent`. Stated once, here, in a single `WHERE` rather than three `FILTER` clauses,
+     * so the count, the sum and the instant cannot drift apart.
+     *
+     * A customer with no qualifying orders is simply ABSENT from the result. The caller fills in
+     * zero and null; returning a fabricated row per requested id would put "no orders" and "all
+     * cancelled" into the same shape as a real aggregate and hide the difference from the caller.
+     *
+     * `sum()` returns a `NUMERIC` string from the driver, never a float — `money.ts`'s rule, and
+     * the reason the total is not touched by JavaScript arithmetic on the way out.
+     *
+     * Store-scoped in its own right, not merely via the ids the caller passed: a caller holding
+     * an id from another tenant must not be able to learn what that customer spent.
+     */
+    async orderStatsForUsers(params: {
+      storeId: string;
+      userIds: readonly string[];
+    }): Promise<{ userId: string; orderCount: number; totalSpent: string; lastOrderAt: Date }[]> {
+      if (params.userIds.length === 0) return [];
+
+      const rows = await executor(db)
+        .select({
+          userId: order.userId,
+          orderCount: count(),
+          totalSpent: sql<string>`sum(${order.grandTotal})`,
+          /*
+           * Read as text and parsed here. An aggregate expression carries no column type, so the
+           * driver hands back whatever `max()` produced rather than the `Date` a declared
+           * `timestamptz` column would have been parsed into — and a caller that trusted the
+           * annotation got a string with no `toISOString`. Converting at the boundary keeps the
+           * method's contract a `Date`, which is what every other instant in this repository is.
+           */
+          lastOrderAt: sql<string>`max(${order.placedAt})`,
+        })
+        .from(order)
+        .where(
+          and(
+            eq(order.storeId, params.storeId),
+            inArray(order.userId, [...params.userIds]),
+            ne(order.status, CANCELLED_ORDER_STATUS),
+          ),
+        )
+        .groupBy(order.userId);
+
+      return rows.map((row) => ({
+        userId: row.userId,
+        orderCount: row.orderCount,
+        totalSpent: row.totalSpent,
+        lastOrderAt: new Date(row.lastOrderAt),
+      }));
     },
 
     async storeCustomerExists(params: { storeId: string; customerId: string }): Promise<boolean> {

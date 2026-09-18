@@ -21,6 +21,7 @@ export {
   createInventoryRepository,
   STOCK_REASONS,
   type InventoryRepository,
+  type LowStockRecord,
   type StockLedgerRecord,
   type StockRecord,
   type StockReason,

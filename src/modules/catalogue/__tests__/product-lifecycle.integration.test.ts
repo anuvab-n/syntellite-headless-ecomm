@@ -15,7 +15,7 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { giveSku, testMediaStorage } from '../../../../tests/helpers/catalogue.ts';
 import { newId } from '../../../shared/id.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
@@ -76,6 +76,7 @@ describe('product lifecycle (integration)', () => {
     });
 
     const catalogue = createCatalogueService({
+      storage: testMediaStorage(),
       repository,
       db: db(),
       ...testRecorders(db()),

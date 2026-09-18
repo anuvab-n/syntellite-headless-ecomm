@@ -355,8 +355,9 @@ describe('composition root (integration)', () => {
        */
       const allowed = await listProducts(await login());
       expect(allowed.status).toBe(200);
-      // And the real route returns the real contract, not just a 200.
-      expect(Object.keys(allowed.body).sort()).toEqual(['pagination', 'products']);
+      // And the real route returns the real contract, not just a 200. `counts` joined it in
+      // increment 58 — the list screen's tab badges, which are store-wide rather than page-wide.
+      expect(Object.keys(allowed.body).sort()).toEqual(['counts', 'pagination', 'products']);
     });
 
     it('protects the catalogue write route with the STAFF scope specifically', async () => {

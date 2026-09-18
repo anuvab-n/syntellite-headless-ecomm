@@ -17,6 +17,7 @@ import {
   ListOrdersQuerySchema,
   OrderNumberParamsSchema,
   toAdminOrderDetailResponse,
+  toOrderTimelineResponse,
   toAdminOrderListResponse,
   toAdminOrderStatusSummaryResponse,
   toOrderListResponse,
@@ -518,6 +519,78 @@ export function createOrdersRoutes(deps: {
         orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
       });
 
+      res.status(200).json({ order: toAdminOrderDetailResponse(view) });
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/{orderNumber}/timeline` — the order's append-only status history.
+   * Increment 62.
+   *
+   * A READ over `order_status_history`, which checkout and cancellation have written since
+   * Increment 30 and nothing has read until now. No second history table, no backfill, and
+   * nothing here can write.
+   *
+   * `actorType` is published; the actor's user id is not. Which KIND of actor moved an order is
+   * operational; naming the colleague is an `audit_log` question, answered where the access
+   * controls for it already live.
+   */
+  router.get(
+    '/admin/orders/:orderNumber/timeline',
+    auth,
+    requireStaff,
+    onlyOrderNumber,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const events = await orders.timelineForStoreOrder({
+        storeId: requireUser(req).storeId,
+        orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+      });
+
+      res.status(200).json({ timeline: events.map(toOrderTimelineResponse) });
+    }),
+  );
+
+  /**
+   * `POST /admin/orders/{orderNumber}/cancel` — staff cancellation. Increment 62.
+   *
+   * The SAME service call the customer route makes, without a `userId`: staff act for the
+   * tenant rather than for a person, so the lookup is store-scoped. Every guard is shared —
+   * a shipped order is refused, a paid order is refused, a payment in flight is refused, the
+   * status move is a compare-and-swap under the order lock, and the stock release happens after
+   * the CAS proves this request is the one that cancelled.
+   *
+   * **Payment status is not written here.** A cancellation that needed a refund would be
+   * refused by the `paid` guard above, so there is nothing for this path to reverse; the refund
+   * aggregate remains the only thing that moves money.
+   *
+   * No `Idempotency-Key`, matching the customer route and for the same stated reason: a second
+   * cancellation is a `409` rather than a no-op, because a client that receives success twice
+   * cannot tell whether it cancelled something or nothing.
+   */
+  router.post(
+    '/admin/orders/:orderNumber/cancel',
+    auth,
+    requireStaff,
+    onlyOrderNumber,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const user = requireUser(req);
+      const orderNumber = validatedParams<OrderNumberParams>(req).orderNumber;
+
+      await orders.cancelOrder({
+        storeId: user.storeId,
+        orderNumber,
+        actor: { type: 'staff', userId: user.id },
+      });
+
+      /*
+       * Re-read through the ADMIN projection, so a staff cancellation answers with the same
+       * shape the detail endpoint serves rather than the customer-facing view the service
+       * returns. One extra read on a rare, deliberate mutation, in exchange for one response
+       * contract instead of two.
+       */
+      const view = await orders.getStoreOrder({ storeId: user.storeId, orderNumber });
       res.status(200).json({ order: toAdminOrderDetailResponse(view) });
     }),
   );

@@ -15,7 +15,7 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { giveSku, testMediaStorage } from '../../../../tests/helpers/catalogue.ts';
 import { newId } from '../../../shared/id.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
@@ -103,6 +103,7 @@ describe('DELETE /api/v1/admin/products/:slug (integration)', () => {
           repository,
           db: db(),
           ...testRecorders(db()),
+          storage: testMediaStorage(),
           logger: silentLogger,
         }),
         verifyAccessToken: async (token) => tokens.verifyAccessToken(token),

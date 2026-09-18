@@ -155,7 +155,11 @@ describe('admin customers (integration)', () => {
     });
 
     it('rejects unknown parameters and out-of-range paging', async () => {
-      expect(await status('q=jane')).toBe(400);
+      /*
+       * `q` became a REAL parameter in Increment 56 and is asserted in its own block below.
+       * `email` stays unknown deliberately: searching is `q`'s job, and a second spelling of the
+       * same intent is a second thing to keep consistent.
+       */
       expect(await status('email=jane@example.com')).toBe(400);
       expect(await status('isStaff=true')).toBe(400);
       expect(await status('limit=101')).toBe(400);
@@ -209,6 +213,10 @@ describe('admin customers (integration)', () => {
         'id',
         'isActive',
         'lastName',
+        'lastOrderAt',
+        'orderCount',
+        'phone',
+        'totalSpent',
         'updatedAt',
       ]);
     });
@@ -665,6 +673,10 @@ describe('admin customers (integration)', () => {
         'id',
         'isActive',
         'lastName',
+        'lastOrderAt',
+        'orderCount',
+        'phone',
+        'totalSpent',
         'updatedAt',
       ]);
       expect(res.body.customer.id).toBe(target.id);
@@ -840,6 +852,573 @@ describe('admin customers (integration)', () => {
         .post('/api/v1/auth/login')
         .send({ email: target.email, password: PASSWORD });
       expect(res.status).toBe(200);
+    });
+  });
+
+  /* ── 8. Phone, order aggregates and search. Increment 56. ─────────────── */
+
+  /**
+   * The Customers screen's four missing columns: Mobile, Orders, Total Spent, Last Order Date.
+   *
+   * The three aggregates come from the ORDERS module through a port, so what is under test here
+   * is not just a SQL sum — it is that identity asked the right question about the right
+   * customers and put each answer on the right row.
+   *
+   * Orders are inserted directly rather than placed through checkout: this suite has no
+   * catalogue, no stock and no cart, and building all three to assert an aggregate would test
+   * checkout instead. The rows are real `order` rows satisfying every constraint, which is what
+   * the aggregate reads.
+   */
+  describe('phone, order aggregates and search', () => {
+    /** Customers created for this block alone, so the rest of the suite is unaffected. */
+    let noOrders = { id: '', email: '' };
+    let oneOrder = { id: '', email: '' };
+    let manyOrders = { id: '', email: '' };
+    let allCancelled = { id: '', email: '' };
+
+    /**
+     * The three counted orders total 5100.0000, INCLUDING 200.0000 of GST on the middle one.
+     *
+     * The tax is load-bearing: `grandTotal` is tax-inclusive and `total` is not, so an aggregate
+     * that summed the wrong column would be short by exactly that 200 — and in an untaxed
+     * fixture the two columns are equal and the mistake is invisible.
+     */
+    const MANY_EXPECTED_TOTAL = '5100.0000';
+    let manyNewestPlacedAt = '';
+
+    beforeAll(async () => {
+      noOrders = await register('agg.none.admincust', { staff: false });
+      oneOrder = await register('agg.one.admincust', { staff: false });
+      manyOrders = await register('agg.many.admincust', { staff: false });
+      allCancelled = await register('agg.cancelled.admincust', { staff: false });
+
+      await pool().query('update app_user set phone = $2 where id = $1', [
+        manyOrders.id,
+        '+919876500011',
+      ]);
+      await pool().query('update app_user set first_name = $2, last_name = $3 where id = $1', [
+        manyOrders.id,
+        'Meera',
+        'Rajagopalan',
+      ]);
+
+      await placeOrder({ userId: oneOrder.id, total: '500.0000', taxTotal: '0.0000', daysAgo: 9 });
+
+      /* Newest last, so the assertion below is about `max` rather than about insertion order. */
+      await placeOrder({
+        userId: manyOrders.id,
+        total: '1200.5000',
+        taxTotal: '0.0000',
+        daysAgo: 30,
+      });
+      await placeOrder({
+        userId: manyOrders.id,
+        total: '699.5000',
+        taxTotal: '200.0000',
+        daysAgo: 20,
+      });
+      manyNewestPlacedAt = await placeOrder({
+        userId: manyOrders.id,
+        total: '3000.0000',
+        taxTotal: '0.0000',
+        daysAgo: 10,
+      });
+
+      /* A cancelled order for the SAME customer, newer and larger than every counted one. */
+      await placeOrder({
+        userId: manyOrders.id,
+        total: '99999.0000',
+        taxTotal: '0.0000',
+        daysAgo: 1,
+        cancelled: true,
+      });
+
+      await placeOrder({
+        userId: allCancelled.id,
+        total: '777.0000',
+        taxTotal: '0.0000',
+        daysAgo: 5,
+        cancelled: true,
+      });
+      await placeOrder({
+        userId: allCancelled.id,
+        total: '888.0000',
+        taxTotal: '0.0000',
+        daysAgo: 4,
+        cancelled: true,
+      });
+    }, 180_000);
+
+    /**
+     * One real `order` row, with a cart to satisfy `fk_order_cart_store`.
+     *
+     * `address_id` is null, which the schema models: the delivery address is snapshotted onto
+     * the order at checkout, so the `ship_*` columns below are the record and the address row is
+     * not required to survive.
+     */
+    async function placeOrder(params: {
+      userId: string;
+      /** Goods total, before tax. `subtotal` and `total` both take this value. */
+      total: string;
+      /** GST on top. `grandTotal` is `total + taxTotal`, which the schema enforces. */
+      taxTotal: string;
+      daysAgo: number;
+      cancelled?: boolean;
+    }): Promise<string> {
+      const cartId = newId();
+      await pool().query(
+        `insert into cart (id, user_id, store_id, status) values ($1, $2, $3, 'checked_out')`,
+        [cartId, params.userId, storeId],
+      );
+
+      const orderId = newId();
+      const suffix = orderSeq().toString().padStart(6, '0').replace(/0/gu, 'A');
+      const { rows } = await pool().query<{ placed_at: Date }>(
+        `insert into "order" (
+           id, store_id, user_id, cart_id, order_number, status, currency,
+           subtotal, discount_total, total, tax_total, grand_total,
+           ship_recipient_name, ship_phone, ship_line1, ship_city, ship_state,
+           ship_postal_code, ship_country_code, placed_at,
+           tax_at, supply_type, place_of_supply_state, place_of_supply_basis,
+           seller_gstin, seller_legal_name, origin_line1, origin_city, origin_state,
+           origin_postal_code, origin_country_code, customer_tax_category
+         ) values (
+           $1, $2, $3, $4, $5, $6, 'INR',
+           $7, 0, $7, $8, ($7::numeric + $8::numeric),
+           'Test Recipient', '+919876543210', '1 Test Street', 'Bengaluru', 'Karnataka',
+           '560001', 'IN', now() - ($9 || ' days')::interval,
+           /*
+            * The GST determination snapshot: all-or-nothing per ck_order_tax_snapshot, and
+            * required at all only when tax_total is non-zero per
+            * ck_order_tax_needs_determination. Supplied for every row here so a taxed and an
+            * untaxed fixture order differ in exactly one thing: the tax.
+            */
+           now(), 'intra_state', 'Karnataka', 'delivery_destination',
+           '29AAAAA0000A1Z5', 'Test Seller', '1 Origin Road', 'Bengaluru', 'Karnataka',
+           '560001', 'IN', 'b2c'
+         ) returning placed_at`,
+        [
+          orderId,
+          storeId,
+          params.userId,
+          cartId,
+          `ORD-20260101-${suffix}`,
+          params.cancelled === true ? 'cancelled' : 'placed',
+          params.total,
+          params.taxTotal,
+          String(params.daysAgo),
+        ],
+      );
+      return (rows[0]?.placed_at ?? new Date()).toISOString();
+    }
+
+    let seq = 0;
+    function orderSeq(): number {
+      seq += 1;
+      return seq;
+    }
+
+    const rowFor = async (id: string): Promise<Record<string, unknown>> => {
+      const res = await api().get('/api/v1/admin/customers?limit=100').set(asStaff());
+      expect(res.status).toBe(200);
+      const found = (res.body.customers as Record<string, unknown>[]).find((c) => c['id'] === id);
+      expect(found, `customer ${id} not on the page`).toBeDefined();
+      return found ?? {};
+    };
+
+    /* ── phone ──────────────────────────────────────────────────────────── */
+
+    it('publishes the customer’s phone, and null when there is none', async () => {
+      expect((await rowFor(manyOrders.id))['phone']).toBe('+919876500011');
+      expect((await rowFor(noOrders.id))['phone']).toBeNull();
+    });
+
+    /* ── aggregates ─────────────────────────────────────────────────────── */
+
+    it('reports zero and null for a customer who has never ordered', async () => {
+      expect(await rowFor(noOrders.id)).toMatchObject({
+        orderCount: 0,
+        totalSpent: '0.0000',
+        lastOrderAt: null,
+      });
+    });
+
+    /** Zero rather than absent: "never ordered" is a fact, not a missing field. */
+    it('publishes the zero keys rather than omitting them', async () => {
+      const row = await rowFor(noOrders.id);
+      expect(Object.keys(row)).toContain('totalSpent');
+      expect(Object.keys(row)).toContain('lastOrderAt');
+      expect(Object.keys(row)).toContain('orderCount');
+    });
+
+    it('reports one order exactly', async () => {
+      const row = await rowFor(oneOrder.id);
+      expect(row).toMatchObject({ orderCount: 1, totalSpent: '500.0000' });
+      expect(typeof row['lastOrderAt']).toBe('string');
+    });
+
+    /**
+     * The arithmetic, and the exclusion, in one row.
+     *
+     * The cancelled order is the NEWEST and by far the LARGEST, so a bug that forgot to exclude
+     * it would be visible in all three fields at once rather than in only the sum.
+     */
+    it('sums, counts and dates only the non-cancelled orders', async () => {
+      const row = await rowFor(manyOrders.id);
+      expect(row['orderCount']).toBe(3);
+      expect(row['totalSpent']).toBe(MANY_EXPECTED_TOTAL);
+      expect(row['lastOrderAt']).toBe(manyNewestPlacedAt);
+    });
+
+    /** Money stays a decimal string at NUMERIC(19,4) scale — never a JSON number. */
+    it('publishes the total as a decimal string, not a number', async () => {
+      const row = await rowFor(manyOrders.id);
+      expect(typeof row['totalSpent']).toBe('string');
+      expect(row['totalSpent']).toMatch(/^\d+\.\d{4}$/u);
+    });
+
+    /**
+     * Independently derived, not compared against another call into the same repository.
+     * Two readings of one SQL expression agreeing proves nothing about either.
+     */
+    it('agrees with a direct SUM over the order table', async () => {
+      const { rows } = await pool().query<{ c: string; s: string | null; m: Date | null }>(
+        `select count(*)::text c, sum(grand_total)::text s, max(placed_at) m
+           from "order" where store_id = $1 and user_id = $2 and status <> 'cancelled'`,
+        [storeId, manyOrders.id],
+      );
+      const row = await rowFor(manyOrders.id);
+      expect(row['orderCount']).toBe(Number(rows[0]?.c ?? '0'));
+      expect(row['totalSpent']).toBe(rows[0]?.s);
+      expect(row['lastOrderAt']).toBe(rows[0]?.m?.toISOString());
+    });
+
+    it('treats a customer whose every order was cancelled as having none', async () => {
+      expect(await rowFor(allCancelled.id)).toMatchObject({
+        orderCount: 0,
+        totalSpent: '0.0000',
+        lastOrderAt: null,
+      });
+    });
+
+    /** Several customers on one page, each with their own answer and nobody else's. */
+    it('keys the aggregates to the right customer across a page', async () => {
+      const res = await api().get('/api/v1/admin/customers?limit=100').set(asStaff());
+      const byId = new Map(
+        (res.body.customers as Record<string, unknown>[]).map((c) => [c['id'], c]),
+      );
+      expect(byId.get(noOrders.id)).toMatchObject({ orderCount: 0 });
+      expect(byId.get(oneOrder.id)).toMatchObject({ orderCount: 1, totalSpent: '500.0000' });
+      expect(byId.get(manyOrders.id)).toMatchObject({
+        orderCount: 3,
+        totalSpent: MANY_EXPECTED_TOTAL,
+      });
+      expect(byId.get(allCancelled.id)).toMatchObject({ orderCount: 0 });
+    });
+
+    /* ── the detail endpoint reports the same numbers ───────────────────── */
+
+    it('publishes identical aggregates on the detail endpoint', async () => {
+      const listRow = await rowFor(manyOrders.id);
+      const res = await api().get(`/api/v1/admin/customers/${manyOrders.id}`).set(asStaff());
+      expect(res.status).toBe(200);
+      expect(res.body.customer).toEqual(listRow);
+    });
+
+    /* ── search ─────────────────────────────────────────────────────────── */
+
+    const search = (q: string) =>
+      api()
+        .get(`/api/v1/admin/customers?limit=100&q=${encodeURIComponent(q)}`)
+        .set(asStaff());
+
+    const idsFrom = (body: unknown): string[] =>
+      (body as { customers: { id: string }[] }).customers.map((c) => c.id);
+
+    it('finds a customer by a fragment of their first name', async () => {
+      expect(idsFrom((await search('eera')).body)).toContain(manyOrders.id);
+    });
+
+    it('finds a customer by a fragment of their last name', async () => {
+      expect(idsFrom((await search('rajagop')).body)).toContain(manyOrders.id);
+    });
+
+    it('finds a customer by a fragment of their email', async () => {
+      const local = oneOrder.email.split('@')[0] ?? '';
+      expect(idsFrom((await search(local)).body)).toEqual([oneOrder.id]);
+    });
+
+    it('finds a customer by a fragment of their phone', async () => {
+      expect(idsFrom((await search('9876500011')).body)).toContain(manyOrders.id);
+    });
+
+    /** Separators are stripped for the phone arm, so a typed number matches a stored one. */
+    it('finds a customer by a phone fragment typed with separators', async () => {
+      expect(idsFrom((await search('+91 98765 00011')).body)).toContain(manyOrders.id);
+    });
+
+    it('is case-insensitive', async () => {
+      expect(idsFrom((await search('MEERA')).body)).toContain(manyOrders.id);
+    });
+
+    it('answers an unmatched term with an empty page and a zero total', async () => {
+      const res = await search('zzz-nobody-matches-this');
+      expect(res.status).toBe(200);
+      expect(res.body.customers).toEqual([]);
+      expect(res.body.pagination.total).toBe(0);
+    });
+
+    /**
+     * An unescaped `%` would match every row, which reads to an operator as "the filter is
+     * broken" rather than "nothing matched".
+     */
+    it('treats a percent sign as a literal, not a wildcard', async () => {
+      const res = await search('%');
+      expect(res.status).toBe(200);
+      expect(res.body.customers).toEqual([]);
+    });
+
+    it('treats an underscore as a literal, not a single-character wildcard', async () => {
+      const res = await search('_');
+      expect(res.status).toBe(200);
+      expect(res.body.customers).toEqual([]);
+    });
+
+    it('narrows rather than replaces the other filters', async () => {
+      await pool().query('update app_user set is_active = false where id = $1', [oneOrder.id]);
+      const local = oneOrder.email.split('@')[0] ?? '';
+
+      const active = await api()
+        .get(`/api/v1/admin/customers?q=${encodeURIComponent(local)}&isActive=true`)
+        .set(asStaff());
+      expect(idsFrom(active.body)).toEqual([]);
+
+      const inactive = await api()
+        .get(`/api/v1/admin/customers?q=${encodeURIComponent(local)}&isActive=false`)
+        .set(asStaff());
+      expect(idsFrom(inactive.body)).toEqual([oneOrder.id]);
+
+      await pool().query('update app_user set is_active = true where id = $1', [oneOrder.id]);
+    });
+
+    it('rejects an empty or over-long search term', async () => {
+      expect((await api().get('/api/v1/admin/customers?q=').set(asStaff())).status).toBe(400);
+      expect(
+        (
+          await api()
+            .get(`/api/v1/admin/customers?q=${'x'.repeat(321)}`)
+            .set(asStaff())
+        ).status,
+      ).toBe(400);
+    });
+
+    it('never matches a soft-deleted customer', async () => {
+      const target = await register('erased.search.admincust', { staff: false });
+      await pool().query('update app_user set first_name = $2 where id = $1', [
+        target.id,
+        'Zephyrine',
+      ]);
+      expect(idsFrom((await search('Zephyrine')).body)).toEqual([target.id]);
+
+      await pool().query('update app_user set deleted_at = now() where id = $1', [target.id]);
+      const after = await search('Zephyrine');
+      expect(idsFrom(after.body)).toEqual([]);
+      expect(after.body.pagination.total).toBe(0);
+    });
+
+    /* ── status counts ──────────────────────────────────────────────────── */
+
+    it('publishes counts that agree with a direct count of the store', async () => {
+      const res = await api().get('/api/v1/admin/customers?limit=1').set(asStaff());
+      expect(res.status).toBe(200);
+
+      const { rows } = await pool().query<{ active: string; inactive: string }>(
+        `select
+           count(*) filter (where is_active)::text as active,
+           count(*) filter (where not is_active)::text as inactive
+           from app_user where store_id = $1 and deleted_at is null`,
+        [storeId],
+      );
+
+      expect(res.body.counts.active).toBe(Number(rows[0]?.active ?? '0'));
+      expect(res.body.counts.inactive).toBe(Number(rows[0]?.inactive ?? '0'));
+      expect(res.body.counts.total).toBe(res.body.counts.active + res.body.counts.inactive);
+    });
+
+    /**
+     * The tabs must not move as the operator types, or the count could never say how many rows
+     * switching to that tab would show. So `counts` is the store and `pagination.total` is the
+     * query, and the two differing under a filter is correct.
+     */
+    it('does not narrow the counts with the request’s own filters', async () => {
+      const unfiltered = await api().get('/api/v1/admin/customers?limit=1').set(asStaff());
+      const filtered = await search('zzz-nobody-matches-this');
+
+      expect(filtered.body.counts).toEqual(unfiltered.body.counts);
+      expect(filtered.body.pagination.total).toBe(0);
+      expect(unfiltered.body.counts.total).toBeGreaterThan(0);
+    });
+
+    it('excludes soft-deleted accounts from the counts', async () => {
+      const before = (await api().get('/api/v1/admin/customers?limit=1').set(asStaff())).body
+        .counts;
+
+      const target = await register('erased.counts.admincust', { staff: false });
+      const during = (await api().get('/api/v1/admin/customers?limit=1').set(asStaff())).body
+        .counts;
+      expect(during.total).toBe(before.total + 1);
+
+      await pool().query('update app_user set deleted_at = now() where id = $1', [target.id]);
+      const after = (await api().get('/api/v1/admin/customers?limit=1').set(asStaff())).body.counts;
+      expect(after.total).toBe(before.total);
+    });
+  });
+
+  /* ── 9. Tenancy of the aggregates and the search. ─────────────────────── */
+
+  /**
+   * A foreign store with its own customer AND its own orders.
+   *
+   * The aggregate is the new tenancy risk: it is keyed by `user_id`, so a query that forgot its
+   * store predicate would still return the right SHAPE — one row per customer — while silently
+   * totalling another merchant's orders. Asserting against an absence could not catch that; this
+   * builds a foreign customer whose id is passed to the port alongside ours.
+   */
+  describe('tenant isolation of aggregates and search', () => {
+    let foreignStoreId = '';
+    let foreignUserId = '';
+    let localTwinId = '';
+
+    beforeAll(async () => {
+      foreignStoreId = newId();
+      foreignUserId = newId();
+
+      await pool().query(
+        `insert into store (id, slug, name, currency, timezone, is_active)
+         values ($1, $2, 'Aggregate Other Store', 'INR', 'Asia/Kolkata', true)`,
+        [foreignStoreId, `agg-other-${foreignStoreId.slice(0, 8)}`],
+      );
+      await pool().query(
+        `insert into app_user (id, store_id, email, password_hash, first_name, last_name, phone)
+         values ($1, $2, $3, 'argon2-placeholder', 'Zarina', 'Foreignsson', '+915550001111')`,
+        [foreignUserId, foreignStoreId, `foreign.agg.${foreignUserId}@example.com`],
+      );
+
+      const cartId = newId();
+      await pool().query(
+        `insert into cart (id, user_id, store_id, status) values ($1, $2, $3, 'checked_out')`,
+        [cartId, foreignUserId, foreignStoreId],
+      );
+      await pool().query(
+        `insert into "order" (
+           id, store_id, user_id, cart_id, order_number, status, currency,
+           subtotal, discount_total, total, tax_total, grand_total,
+           ship_recipient_name, ship_phone, ship_line1, ship_city, ship_state,
+           ship_postal_code, ship_country_code, placed_at
+         ) values (
+           $1, $2, $3, $4, 'ORD-20260101-ZZZZZZ', 'placed', 'INR',
+           50000, 0, 50000, 0, 50000,
+           'Foreign Recipient', '+915550001111', '9 Other Street', 'Chennai', 'Tamil Nadu',
+           '600001', 'IN', now()
+         )`,
+        [newId(), foreignStoreId, foreignUserId, cartId],
+      );
+
+      const twin = await register('twin.agg.admincust', { staff: false });
+      localTwinId = twin.id;
+    }, 180_000);
+
+    it('has actually created a foreign customer with an order — otherwise this proves nothing', async () => {
+      const { rows } = await pool().query<{ c: string }>(
+        `select count(*)::text c from "order" o
+           join app_user u on u.id = o.user_id
+          where o.store_id <> $1 and u.store_id <> $1`,
+        [storeId],
+      );
+      expect(Number(rows[0]?.c ?? '0')).toBe(1);
+    });
+
+    it('never returns the foreign customer, by list or by search', async () => {
+      const page = await api().get('/api/v1/admin/customers?limit=100').set(asStaff());
+      expect((page.body.customers as { id: string }[]).map((c) => c.id)).not.toContain(
+        foreignUserId,
+      );
+
+      const byName = await api().get('/api/v1/admin/customers?q=Zarina').set(asStaff());
+      expect(byName.body.customers).toEqual([]);
+
+      const byPhone = await api().get('/api/v1/admin/customers?q=5550001111').set(asStaff());
+      expect(byPhone.body.customers).toEqual([]);
+    });
+
+    it('does not count the foreign store’s customers in the status counts', async () => {
+      const res = await api().get('/api/v1/admin/customers?limit=1').set(asStaff());
+      const { rows } = await pool().query<{ c: string }>(
+        'select count(*)::text c from app_user where store_id = $1 and deleted_at is null',
+        [storeId],
+      );
+      expect(res.body.counts.total).toBe(Number(rows[0]?.c ?? '0'));
+    });
+
+    /**
+     * The aggregate's own tenancy, asserted where it lives.
+     *
+     * Through the list the port is only ever handed ids the customer query already filtered, so
+     * a missing store predicate there would change no visible answer — which is exactly what
+     * makes it easy to lose. This calls the port's implementation directly with a foreign id.
+     */
+    it('reports nothing for a foreign customer id handed to the aggregate directly', async () => {
+      const foreign = await container.orders.orderStatsForCustomers({
+        storeId,
+        customerIds: [foreignUserId],
+      });
+      expect(foreign).toEqual([]);
+
+      const mixed = await container.orders.orderStatsForCustomers({
+        storeId,
+        customerIds: [foreignUserId, localTwinId],
+      });
+      expect(mixed.map((row) => row.userId)).not.toContain(foreignUserId);
+    });
+  });
+
+  /* ── 10. No N+1. ──────────────────────────────────────────────────────── */
+
+  /**
+   * The aggregate must cost ONE statement for the whole page, not one per customer.
+   *
+   * Counted from the driver rather than inferred from a plan: `pg_stat_statements` is not in the
+   * stock `postgres:16` image, but the pool emits every query it issues, so wrapping it for the
+   * duration of one request counts exactly what the request ran.
+   */
+  describe('no N+1', () => {
+    it('issues one aggregate statement for a page of many customers', async () => {
+      const seen: string[] = [];
+      const realQuery = container.db.pool.query.bind(container.db.pool);
+
+      (container.db.pool as { query: unknown }).query = (...args: unknown[]) => {
+        const text =
+          typeof args[0] === 'string'
+            ? args[0]
+            : String((args[0] as { text?: string })?.text ?? '');
+        seen.push(text);
+        return (realQuery as (...a: unknown[]) => unknown)(...args);
+      };
+
+      try {
+        const res = await api().get('/api/v1/admin/customers?limit=100').set(asStaff());
+        expect(res.status).toBe(200);
+        expect((res.body.customers as unknown[]).length).toBeGreaterThan(5);
+      } finally {
+        (container.db.pool as { query: unknown }).query = realQuery;
+      }
+
+      const aggregates = seen.filter((text) => /group by/iu.test(text) && /"order"/u.test(text));
+      expect(aggregates).toHaveLength(1);
+
+      /* And no per-customer order read of any kind. */
+      const orderReads = seen.filter((text) => /from "order"/iu.test(text));
+      expect(orderReads).toHaveLength(1);
     });
   });
 });

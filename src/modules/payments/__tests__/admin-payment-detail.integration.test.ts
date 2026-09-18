@@ -568,6 +568,13 @@ describe('admin payment detail and the provider transaction id (integration)', (
   /* ── 4. The detail's contract ─────────────────────────────────────────── */
 
   describe('the admin detail contract', () => {
+    /**
+     * Thirteen since Increment 59: `refunds` and `refundBalance` joined the detail.
+     *
+     * The list is still EXACT rather than a subset check — that is the whole value of this
+     * test. It caught the two additions, which is what it is for; widening it deliberately is
+     * the correct response, and silently relaxing it to `toContain` would not be.
+     */
     const DETAIL_KEYS = [
       'amount',
       'createdAt',
@@ -578,6 +585,8 @@ describe('admin payment detail and the provider transaction id (integration)', (
       'provider',
       'providerRef',
       'providerTransactionId',
+      'refundBalance',
+      'refunds',
       'status',
       'updatedAt',
     ];
@@ -591,7 +600,7 @@ describe('admin payment detail and the provider transaction id (integration)', (
       );
     }, 120_000);
 
-    it('publishes exactly eleven keys, and no more', async () => {
+    it('publishes exactly thirteen keys, and no more', async () => {
       const res = await api().get(detailPath(subject.orderNumber)).set(asStaff());
       expect(res.status).toBe(200);
       expect(Object.keys(res.body)).toEqual(['payment']);

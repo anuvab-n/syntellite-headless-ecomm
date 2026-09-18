@@ -1,3 +1,4 @@
+import { testMediaStorage } from '../../../../tests/helpers/catalogue.ts';
 import { Router } from 'express';
 import { and, eq } from 'drizzle-orm';
 import request from 'supertest';
@@ -76,6 +77,7 @@ describe('POST /api/v1/admin/products (integration)', () => {
     });
 
     const catalogue = createCatalogueService({
+      storage: testMediaStorage(),
       repository: createCatalogueRepository({ db: db() }),
       db: db(),
       ...testRecorders(db()),

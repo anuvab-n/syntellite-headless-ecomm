@@ -35,6 +35,7 @@ import {
   type OrderLineRecord,
   type OrderRecord,
   type OrdersRepository,
+  type OrderTimelineRecord,
 } from './orders.repository.js';
 
 /**
@@ -1136,18 +1137,56 @@ export function createOrdersService(deps: {
      * covered on the other side: payment initiation refuses an order whose status is not
      * `placed`, and it reads that status inside its own transaction.
      */
+    /**
+     * One order's append-only status history, for the admin detail page. Increment 62.
+     *
+     * Store-scoped through the header lookup: an order that is not this tenant's is `404`,
+     * identical to an unknown number, so the response cannot be used to probe.
+     */
+    async timelineForStoreOrder(params: {
+      storeId: string;
+      orderNumber: string;
+    }): Promise<readonly OrderTimelineRecord[]> {
+      const header = await repository.findStoreOrderByNumber(params);
+      if (!header) throw new NotFound('order');
+
+      return repository.listOrderStatusHistory({
+        orderId: header.id,
+        storeId: params.storeId,
+      });
+    },
+
+    /**
+     * Cancel an order.
+     *
+     * **One implementation, two callers.** `userId` present means the customer cancelling their
+     * own order; absent means staff cancelling on the store's behalf. Only the LOOKUP differs —
+     * an owner-scoped lock versus a store-scoped one — and every guard below is shared
+     * deliberately: the shipped check, the payment checks, the status CAS and the reservation
+     * release are the rules that keep stock and money consistent, and a second copy of them
+     * for the admin path is how the two drift until one of them is wrong.
+     *
+     * Increment 62 added the staff caller. Nothing about the customer path changed.
+     */
     async cancelOrder(params: {
-      userId: string;
+      /** The owner, when a customer is cancelling. Absent for a staff cancellation. */
+      userId?: string;
       storeId: string;
       orderNumber: string;
       actor: AuditActor;
     }): Promise<OrderView> {
       return withTransaction(db, logger, async () => {
-        const header = await repository.lockOwnedOrderByNumber({
-          orderNumber: params.orderNumber,
-          userId: params.userId,
-          storeId: params.storeId,
-        });
+        const header =
+          params.userId === undefined
+            ? await repository.lockStoreOrderByNumber({
+                orderNumber: params.orderNumber,
+                storeId: params.storeId,
+              })
+            : await repository.lockOwnedOrderByNumber({
+                orderNumber: params.orderNumber,
+                userId: params.userId,
+                storeId: params.storeId,
+              });
         if (!header) throw new NotFound('order');
 
         if (!CANCELLABLE_ORDER_STATUSES.includes(header.status as 'placed')) {
@@ -1584,6 +1623,93 @@ export function createOrdersService(deps: {
         paymentStatus: tally(PAYMENT_STATUSES, counts.paymentStatus),
         shipmentStatus: tally(SHIPMENT_STATUSES, counts.shipmentStatus),
       };
+    },
+
+    /**
+     * **The dashboard's order-side figures.** Increment 57. Read-only.
+     *
+     * Exported on the service because the DASHBOARD module needs them and must not reach for the
+     * order table itself. The composition root adapts these onto the port it declares.
+     *
+     * Three separate reads rather than one, because they answer three different questions over
+     * three different groupings — and the dashboard runs them concurrently, so the round trips
+     * overlap. Every one of them is a bounded SQL aggregate: no order or order line is ever
+     * loaded into application memory.
+     *
+     * The window semantics are the caller's: this service takes an already-resolved half-open
+     * `[from, toExclusive)` and does not decide what "inclusive" means. That decision lives once,
+     * in the dashboard's request handling, next to `exclusiveEndOfMillisecond`.
+     */
+    async dashboardRevenue(params: {
+      storeId: string;
+      from: Date;
+      toExclusive: Date;
+      previousFrom: Date;
+      previousToExclusive: Date;
+    }): Promise<{
+      revenue: string;
+      orders: number;
+      previousRevenue: string;
+      previousOrders: number;
+    }> {
+      return repository.revenueAndOrderCounts(params);
+    },
+
+    async dashboardSeries(params: {
+      storeId: string;
+      from: Date;
+      toExclusive: Date;
+      unit: 'day' | 'week' | 'month';
+      timezone: string;
+    }): Promise<readonly { bucket: string; revenue: string; orders: number }[]> {
+      return repository.revenueSeries(params);
+    },
+
+    async dashboardTopSkus(params: {
+      storeId: string;
+      from: Date;
+      toExclusive: Date;
+      limit: number;
+    }): Promise<
+      readonly {
+        skuCode: string;
+        productName: string;
+        skuName: string;
+        quantity: number;
+        revenue: string;
+      }[]
+    > {
+      return repository.topSellingSkus(params);
+    },
+
+    /**
+     * **Order aggregates for a set of this store's customers.** Increment 56. Read-only.
+     *
+     * Exported on the service because IDENTITY needs it: the staff customer list publishes an
+     * order count, a total and a last-order instant per row, and identity must not reach for the
+     * order table itself. The composition root adapts this onto the port identity declares.
+     *
+     * Takes the whole page's ids at once, so a page of 25 costs one statement rather than 25 —
+     * the N+1 the list exists to avoid.
+     *
+     * **Cancelled orders are excluded from all three answers.** That is the approved definition
+     * of `totalSpent`, and it is applied once, in the repository's predicate, so the count, the
+     * sum and the instant are always describing the same set of orders.
+     *
+     * A customer with no qualifying orders is ABSENT from the result rather than present at
+     * zero. The caller decides what "no orders" looks like on the wire; this reports what the
+     * table holds.
+     */
+    async orderStatsForCustomers(params: {
+      storeId: string;
+      customerIds: readonly string[];
+    }): Promise<
+      readonly { userId: string; orderCount: number; totalSpent: string; lastOrderAt: Date }[]
+    > {
+      return repository.orderStatsForUsers({
+        storeId: params.storeId,
+        userIds: params.customerIds,
+      });
     },
 
     async listStoreOrdersForCustomer(params: {

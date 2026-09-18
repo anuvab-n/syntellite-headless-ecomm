@@ -405,6 +405,22 @@ export const AdminListCustomersQuerySchema = z.strictObject({
     .transform((value) => value === 'true')
     .optional(),
 
+  /**
+   * The operator's search box. Increment 56.
+   *
+   * One term matched case-insensitively as a SUBSTRING across `email`, `firstName`, `lastName`
+   * and `phone` — the four identity fields the Customers screen shows. Bounded at the email
+   * column's width, which is the widest of the four.
+   *
+   * Wider than the order list's `q`, which is an order number or an email. That one narrows a
+   * list an operator is already looking at; this one is the customer directory, whose whole
+   * purpose is finding a person from a partial name or a partial number.
+   *
+   * The phone arm compares digits only, so `98765`, `+91 98765` and `+919876543210` all find
+   * the same customer. The other three arms take the term verbatim.
+   */
+  q: z.string().trim().min(1).max(320).optional(),
+
   createdFrom: adminInstantField.optional(),
   createdTo: adminInstantField.optional(),
 });
@@ -445,27 +461,80 @@ export type CustomerIdParams = z.infer<typeof CustomerIdParamsSchema>;
 export type AdminCustomerResponse = {
   id: string;
   email: string;
+  /** Nullable, permanently: `phone` has never been required at registration. */
+  phone: string | null;
   firstName: string;
   lastName: string;
   /** `false` once an account is deactivated; its tokens then fail on the next request. */
   isActive: boolean;
   createdAt: string;
   updatedAt: string;
+
+  /**
+   * Orders this customer has placed that were not cancelled. Increment 56.
+   *
+   * `0` for a customer who has never ordered AND for one whose every order was cancelled. The
+   * two are deliberately the same number: neither is a sale.
+   */
+  orderCount: number;
+
+  /**
+   * **What this customer has been billed: the sum of `grandTotal` over their non-cancelled
+   * orders.** A decimal string at `NUMERIC(19,4)` scale, never a number.
+   *
+   * Tax-inclusive, because `grandTotal` is. Cancelled orders are excluded. Returns are NOT
+   * deducted — this system has no refund execution, so no money has ever moved back, and
+   * subtracting a requested refund would report a reversal that never happened.
+   *
+   * It is billed value, not cash received. A COD payment never reaches `succeeded` in this
+   * system, so a definition based on captured money would report zero for every
+   * cash-on-delivery sale; this one does not have that defect, and pays for it by counting an
+   * order whose online payment later failed.
+   */
+  totalSpent: string;
+
+  /** The most recent non-cancelled order's `placedAt`, or `null` if there is none. */
+  lastOrderAt: string | null;
 };
 
 /** The row fields the mapper needs. Structural, so the repository picks the columns. */
 export type MappableAdminCustomer = {
   id: string;
   email: string;
+  phone: string | null;
   firstName: string;
   lastName: string;
   isActive: boolean;
   createdAt: Date;
   updatedAt: Date;
+  orderCount: number;
+  totalSpent: string;
+  lastOrderAt: Date | null;
+};
+
+/**
+ * The store's customers by account status. Increment 56.
+ *
+ * The screen's tabs. Scoped to the tenant and to live accounts and to NOTHING ELSE — not to the
+ * list's filters, and not to the search term. A tab count that moved as you typed could never
+ * tell you how many rows switching to that tab would show, which is the only question a tab
+ * count answers.
+ *
+ * So `counts.total` and `pagination.total` differ whenever a filter is applied, and that is
+ * correct: one counts the store, the other counts the query.
+ *
+ * `active + inactive === total` always. Both keys are present at zero, so the shape does not
+ * change with the data.
+ */
+export type AdminCustomerCountsResponse = {
+  total: number;
+  active: number;
+  inactive: number;
 };
 
 export type AdminCustomerListResponse = {
   customers: AdminCustomerResponse[];
+  counts: AdminCustomerCountsResponse;
   pagination: PaginationResponse;
 };
 
@@ -473,11 +542,15 @@ export function toAdminCustomerResponse(row: MappableAdminCustomer): AdminCustom
   return {
     id: row.id,
     email: row.email,
+    phone: row.phone,
     firstName: row.firstName,
     lastName: row.lastName,
     isActive: row.isActive,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
+    orderCount: row.orderCount,
+    totalSpent: row.totalSpent,
+    lastOrderAt: row.lastOrderAt?.toISOString() ?? null,
   };
 }
 
@@ -486,9 +559,188 @@ export function toAdminCustomerListResponse(page: {
   total: number;
   limit: number;
   offset: number;
+  counts: AdminCustomerCountsResponse;
 }): AdminCustomerListResponse {
   return {
     customers: page.items.map(toAdminCustomerResponse),
+    counts: page.counts,
     pagination: { limit: page.limit, offset: page.offset, total: page.total },
+  };
+}
+
+/* ── Customer activation. Increment 62. ──────────────────────────────────── */
+
+/**
+ * The activation body: one boolean and nothing else.
+ *
+ * `strictObject`, so a request that also tried to send `isStaff`, `isSuperuser`, `email` or
+ * `storeId` is a `400` naming the field rather than a silently ignored privilege attempt. The
+ * repository could not write any of them regardless — two independent defences, because the
+ * consequence of losing this one is an account taking a privilege nobody granted.
+ */
+export const SetCustomerActiveRequestSchema = z.strictObject({
+  isActive: z.boolean(),
+});
+
+export type SetCustomerActiveRequest = z.infer<typeof SetCustomerActiveRequestSchema>;
+
+/* ── The audit log. Increment 62. ────────────────────────────────────────── */
+
+const AUDIT_LOG_MAX_LIMIT = 100;
+const AUDIT_LOG_DEFAULT_LIMIT = 20;
+
+/**
+ * The audit log query.
+ *
+ * Every filter is an EXACT match, not a substring: these are closed vocabularies an operator
+ * picks from a list, and a substring search over `action` would let `payment` quietly match
+ * `payment.captured`, `payment.failed` and anything a future module adds — a filter whose
+ * meaning changes as the codebase grows.
+ *
+ * `storeId` is absent and always will be. Tenancy comes from the verified staff token.
+ */
+export const AdminAuditLogQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: AUDIT_LOG_MAX_LIMIT,
+    default: AUDIT_LOG_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+
+  action: z.string().trim().min(1).max(128).optional(),
+  actorType: z.enum(['staff', 'customer', 'system', 'job']).optional(),
+  actorUserId: z.uuid().optional(),
+  resourceType: z.string().trim().min(1).max(64).optional(),
+  resourceId: z.string().trim().min(1).max(64).optional(),
+
+  /**
+   * Both bounds inclusive; the upper one names a MILLISECOND and admits all of it. ISO-8601
+   * with an offset, so the client owns the timezone — the same contract the orders, payments,
+   * customers and returns lists use.
+   */
+  from: z.iso.datetime({ offset: true }).optional(),
+  to: z.iso.datetime({ offset: true }).optional(),
+});
+
+export type AdminAuditLogQuery = z.infer<typeof AdminAuditLogQuerySchema>;
+
+/**
+ * One audit entry on the wire.
+ *
+ * `metadata` is deliberately absent. Each module writes its own per-action context, reviewed at
+ * its own call site; publishing the union of all of them through one endpoint would make every
+ * future `audit.record` call a disclosure decision on this route. What is published is who did
+ * what to which resource, and when.
+ *
+ * `actorUserId` IS published here, unlike on the order and return timelines. This endpoint is
+ * the accountability surface — "which colleague did this" is the question it exists to answer —
+ * and it is a distinct read that an operator reaches deliberately.
+ */
+export type AuditLogEntryResponse = {
+  action: string;
+  actorType: string;
+  actorUserId: string | null;
+  resourceType: string | null;
+  resourceId: string | null;
+  at: string;
+};
+
+export function toAuditLogEntryResponse(entry: {
+  readonly action: string;
+  readonly actorType: string;
+  readonly actorUserId: string | null;
+  readonly resourceType: string | null;
+  readonly resourceId: string | null;
+  readonly createdAt: Date;
+}): AuditLogEntryResponse {
+  return {
+    action: entry.action,
+    actorType: entry.actorType,
+    actorUserId: entry.actorUserId,
+    resourceType: entry.resourceType,
+    resourceId: entry.resourceId,
+    at: entry.createdAt.toISOString(),
+  };
+}
+
+/* ── Admin sessions. Increment 63. ───────────────────────────────────────── */
+
+const SESSION_LIST_MAX_LIMIT = 100;
+const SESSION_LIST_DEFAULT_LIMIT = 20;
+
+export const AdminSessionsQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: SESSION_LIST_MAX_LIMIT,
+    default: SESSION_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+});
+
+export type AdminSessionsQuery = z.infer<typeof AdminSessionsQuerySchema>;
+
+export const AdminSessionParamsSchema = z.object({
+  customerId: z.uuid(),
+  sessionId: z.uuid(),
+});
+
+export type AdminSessionParams = z.infer<typeof AdminSessionParamsSchema>;
+
+/**
+ * One refresh session on the wire.
+ *
+ * **No token material of any kind.** `token_hash` is not merely omitted here — it is never
+ * selected by the repository, so there is no value in scope for this mapper to publish even by
+ * accident. `userId` is absent too: the caller named the customer in the path.
+ *
+ * `isCurrent` is deliberately NOT published. Answering "is this the session you are using right
+ * now" would require comparing against the caller's own refresh token, and the caller is a
+ * STAFF member looking at somebody else's account — the question is meaningless here, and
+ * answering it for the customer's own view would need a token this endpoint must never see.
+ *
+ * `active` is derived rather than stored: a session is usable when it has not been revoked and
+ * has not expired. Computed in one place so the screen cannot disagree with what refresh does.
+ */
+export type AdminSessionResponse = {
+  id: string;
+  familyId: string;
+  active: boolean;
+  expiresAt: string;
+  consumedAt: string | null;
+  revokedAt: string | null;
+  revokedReason: string | null;
+  userAgent: string | null;
+  ipAddress: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export function toAdminSessionResponse(
+  record: {
+    readonly id: string;
+    readonly familyId: string;
+    readonly expiresAt: Date;
+    readonly consumedAt: Date | null;
+    readonly revokedAt: Date | null;
+    readonly revokedReason: string | null;
+    readonly userAgent: string | null;
+    readonly ipAddress: string | null;
+    readonly createdAt: Date;
+    readonly updatedAt: Date;
+  },
+  now: Date,
+): AdminSessionResponse {
+  return {
+    id: record.id,
+    familyId: record.familyId,
+    active: record.revokedAt === null && record.expiresAt.getTime() > now.getTime(),
+    expiresAt: record.expiresAt.toISOString(),
+    consumedAt: record.consumedAt === null ? null : record.consumedAt.toISOString(),
+    revokedAt: record.revokedAt === null ? null : record.revokedAt.toISOString(),
+    revokedReason: record.revokedReason,
+    userAgent: record.userAgent,
+    ipAddress: record.ipAddress,
+    createdAt: record.createdAt.toISOString(),
+    updatedAt: record.updatedAt.toISOString(),
   };
 }

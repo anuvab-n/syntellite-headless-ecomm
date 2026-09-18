@@ -16,7 +16,7 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { giveSku, testMediaStorage } from '../../../../tests/helpers/catalogue.ts';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 import { newId } from '../../../shared/id.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
@@ -87,6 +87,7 @@ describe('SKUs (integration)', () => {
     });
 
     const catalogue = createCatalogueService({
+      storage: testMediaStorage(),
       repository,
       db: db(),
       ...testRecorders(db()),
@@ -291,6 +292,9 @@ describe('SKUs (integration)', () => {
         'createdAt',
         'id',
         'isActive',
+        // Increment 57's reorder point. Published as `null` here — a create that named no
+        // threshold configured none, which is not the same as configuring zero.
+        'lowStockThreshold',
         'name',
         // Increment 25. Still an EXACT key set, not a superset check: the point of this
         // assertion is that a column added later cannot reach the wire unnoticed.
@@ -704,6 +708,129 @@ describe('SKUs (integration)', () => {
 
       // The other store's SKU is untouched.
       expect((await rowOf('FOREIGN-1', otherStoreId))?.price).toBe('10.0000');
+    });
+  });
+
+  /* ── Low-stock threshold ───────────────────────────────────────────────── */
+
+  /**
+   * Increment 57 added `sku.low_stock_threshold` and a dashboard that reads it, but nothing
+   * that writes it — so every threshold was NULL and the low-stock list was empty by
+   * construction. These cases pin the write path, and above all the distinction the column's
+   * own note insists on: **NULL is not zero.**
+   */
+  describe('low-stock threshold', () => {
+    it('stores NULL, not zero, when a create names no threshold', async () => {
+      await givenProduct();
+      const { app, token } = await staffApp();
+
+      const response = await createSku(app, VALID, token);
+
+      expect(response.status).toBe(201);
+      // Published rather than hidden: the merchant screen has to render an empty field as empty.
+      expect(response.body.sku.lowStockThreshold).toBeNull();
+      expect((await rowOf(VALID.code))?.lowStockThreshold).toBeNull();
+    });
+
+    it('persists a threshold given at create', async () => {
+      await givenProduct();
+      const { app, token } = await staffApp();
+
+      const response = await createSku(app, { ...VALID, lowStockThreshold: 5 }, token);
+
+      expect(response.status).toBe(201);
+      expect(response.body.sku.lowStockThreshold).toBe(5);
+      expect((await rowOf(VALID.code))?.lowStockThreshold).toBe(5);
+    });
+
+    it('keeps an explicit zero as zero', async () => {
+      await givenProduct();
+      const { app, token } = await staffApp();
+
+      const response = await createSku(app, { ...VALID, lowStockThreshold: 0 }, token);
+
+      expect(response.status).toBe(201);
+      /*
+       * The case a `??` or a truthiness test would silently turn into NULL. Zero is a
+       * configured threshold meaning "warn me only when this is gone" — the `available > 0`
+       * half of the low-stock rule then makes it unreachable, which is the point. A SKU with
+       * NULL is never low for a different reason: nobody has said what low means for it.
+       */
+      expect(response.body.sku.lowStockThreshold).toBe(0);
+      expect((await rowOf(VALID.code))?.lowStockThreshold).toBe(0);
+    });
+
+    it('sets a threshold on an existing SKU', async () => {
+      const created = await givenProduct();
+      await giveSku(db(), created, { code: VALID.code });
+      const { app, token } = await staffApp();
+
+      const response = await patchSku(app, VALID.code, { lowStockThreshold: 12 }, token);
+
+      expect(response.status).toBe(200);
+      expect(response.body.sku.lowStockThreshold).toBe(12);
+      expect((await rowOf(VALID.code))?.lowStockThreshold).toBe(12);
+    });
+
+    it('clears a threshold when the patch sends an explicit null', async () => {
+      const created = await givenProduct();
+      await giveSku(db(), created, { code: VALID.code });
+      const { app, token } = await staffApp();
+
+      await patchSku(app, VALID.code, { lowStockThreshold: 7 }, token);
+      const response = await patchSku(app, VALID.code, { lowStockThreshold: null }, token);
+
+      expect(response.status).toBe(200);
+      expect(response.body.sku.lowStockThreshold).toBeNull();
+      expect((await rowOf(VALID.code))?.lowStockThreshold).toBeNull();
+    });
+
+    it('leaves a configured threshold alone when the patch omits the key', async () => {
+      const created = await givenProduct();
+      await giveSku(db(), created, { code: VALID.code });
+      const { app, token } = await staffApp();
+
+      await patchSku(app, VALID.code, { lowStockThreshold: 3 }, token);
+      // Omission and null are different answers: this one edits a neighbouring field only.
+      const response = await patchSku(app, VALID.code, { price: '20.00' }, token);
+
+      expect(response.status).toBe(200);
+      expect(response.body.sku.lowStockThreshold).toBe(3);
+      expect((await rowOf(VALID.code))?.lowStockThreshold).toBe(3);
+    });
+
+    it('accepts a threshold as the only property of a patch', async () => {
+      const created = await givenProduct();
+      await giveSku(db(), created, { code: VALID.code });
+      const { app, token } = await staffApp();
+
+      // The at-least-one-property rule counts it, so it is editable on its own.
+      const response = await patchSku(app, VALID.code, { lowStockThreshold: 2 }, token);
+
+      expect(response.status).toBe(200);
+    });
+
+    it('rejects a negative, fractional or oversized threshold with 400', async () => {
+      const created = await givenProduct();
+      await giveSku(db(), created, { code: 'PATCH-ME' });
+      await givenProduct({ slug: 'other-shirt' });
+      const { app, token } = await staffApp();
+
+      for (const bad of [-1, 1.5, 1_000_001]) {
+        const onCreate = await createSku(
+          app,
+          { ...VALID, code: `BAD-${String(bad)}`, lowStockThreshold: bad },
+          token,
+          'other-shirt',
+        );
+        expect(onCreate.status, `create ${String(bad)}`).toBe(400);
+
+        const onPatch = await patchSku(app, 'PATCH-ME', { lowStockThreshold: bad }, token);
+        expect(onPatch.status, `patch ${String(bad)}`).toBe(400);
+      }
+
+      // `ck_sku_low_stock_threshold_non_negative` is the guarantee; Zod is only the message.
+      expect((await rowOf('PATCH-ME'))?.lowStockThreshold).toBeNull();
     });
   });
 

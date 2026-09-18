@@ -1,9 +1,12 @@
+import { randomInt } from 'node:crypto';
+
 import type { Database } from '../../db/client.js';
 import { uniqueViolationConstraint } from '../../db/errors.js';
 import { withTransaction } from '../../db/transaction.js';
 import type { AuditActor, AuditTrail } from '../../shared/audit.js';
 import {
   Conflict,
+  DomainError,
   InvalidStateTransition,
   NotFound,
   ValidationError,
@@ -16,13 +19,17 @@ import {
   OPTION_NAME_UNIQUE_CONSTRAINT,
   OPTION_VALUE_UNIQUE_CONSTRAINT,
   PRODUCT_SLUG_UNIQUE_CONSTRAINT,
+  MEDIA_KEY_UNIQUE_CONSTRAINT,
   SKU_CODE_UNIQUE_CONSTRAINT,
   SKU_COMBINATION_UNIQUE_CONSTRAINT,
+  type AdminProductFilters,
   type CatalogueRepository,
   type EditableOptionFields,
   type EditableOptionValueFields,
+  type EditableMediaFields,
   type EditableProductFields,
   type EditableSkuFields,
+  type MediaRecord,
   type OptionRecord,
   type OptionValueRecord,
   type ProductRecord,
@@ -30,6 +37,8 @@ import {
   type SkuRecord,
 } from './catalogue.repository.js';
 import {
+  MEDIA_AUDIT,
+  MEDIA_RESOURCE,
   OPTION_AGGREGATE,
   OPTION_AUDIT,
   OPTION_EVENTS,
@@ -56,11 +65,14 @@ import {
 import {
   MAX_OPTIONS_PER_PRODUCT,
   MAX_VALUES_PER_OPTION,
+  type CreateMediaRequest,
   type CreateOptionRequest,
+  type CreateUploadTargetRequest,
   type CreateOptionValueRequest,
   type CreateProductRequest,
   type CreateSkuRequest,
   type ReplaceSkuOptionsRequest,
+  type UpdateMediaRequest,
   type UpdateOptionRequest,
   type UpdateOptionValueRequest,
   type UpdateProductRequest,
@@ -172,6 +184,113 @@ export class OptionInUse extends Conflict {
   }
 }
 
+/* ── The media storage port. Increment 58. ───────────────────────────────── */
+
+/**
+ * Where a client should send an image's bytes, and under what key they will land.
+ *
+ * `uploadUrl` is a pre-signed target the browser `PUT`s to directly, so a multi-megabyte image
+ * never travels through this API. `storageKey` comes back with it because the client hands that
+ * same key to `POST /admin/products/{slug}/media` once the upload finishes — the key is the only
+ * durable link between the object and the row that will describe it.
+ *
+ * `expiresAt` is published so a client can tell a stale target from a rejected one instead of
+ * guessing at a 403 from the bucket.
+ */
+export type MediaUploadTarget = {
+  readonly uploadUrl: string;
+  readonly storageKey: string;
+  readonly expiresAt: Date;
+  /** Headers the client MUST send with the `PUT`, if the adapter requires any. */
+  readonly requiredHeaders: Readonly<Record<string, string>>;
+};
+
+/**
+ * **Object storage, as this module needs it.** A consumer-declared port.
+ *
+ * Declared here and implemented outside, so the catalogue never learns which vendor holds the
+ * bytes. That is not ceremony: the alternative is an S3 SDK imported into a domain module, and
+ * from there into every test that touches a product.
+ *
+ * Deliberately TWO methods and no more. This module registers pointers and asks where to put
+ * bytes; it does not list buckets, set policies, or serve objects. A wider port would be a media
+ * platform arriving through the back door.
+ */
+export type MediaStorage = {
+  /** Where to send one object's bytes. Throws `DependencyUnavailable` when unconfigured. */
+  createUploadTarget(params: {
+    storeId: string;
+    productId: string;
+    contentType: string;
+    byteSize: number;
+  }): Promise<MediaUploadTarget>;
+
+  /**
+   * The URL a browser can render this object from, or `null` when the deployment has no
+   * public delivery host configured.
+   *
+   * Synchronous and total: composing a URL from a key and configuration must not be a network
+   * call, and a missing host is an ordinary configuration state rather than an error — the row
+   * is still a valid image reference, it simply cannot be displayed from here yet.
+   */
+  publicUrl(storageKey: string): string | null;
+};
+
+/**
+ * The same object is already registered against a product. Increment 58.
+ *
+ * `409` rather than a silent second row: two rows pointing at one object would double it in
+ * every gallery and make deletion ambiguous. A repeated registration is a client retry, and
+ * saying so is more useful than accepting it.
+ */
+export class MediaAlreadyRegistered extends Conflict {
+  override readonly code = 'MEDIA_ALREADY_REGISTERED';
+
+  constructor() {
+    super('This storage object is already registered against a product.');
+  }
+}
+
+/**
+ * A bulk action named products this store does not have. Increment 58.
+ *
+ * `404`, matching the single-product routes, and it NAMES the offending slugs — a merchant who
+ * selected fifty products and mistyped one needs to know which one, and a bare "not found" would
+ * send them checking all fifty.
+ *
+ * Unknown, soft-deleted and another store's are reported identically, so the list cannot be used
+ * to discover which slugs exist in a neighbouring tenant. The caller is authenticated staff of
+ * this store and just asked about these exact slugs, so echoing them back discloses nothing.
+ */
+export class BulkProductsNotFound extends DomainError {
+  readonly code = 'NOT_FOUND';
+  readonly statusCode = 404;
+
+  constructor(slugs: readonly string[]) {
+    super('Some of the requested products do not exist.', {
+      details: { resource: 'product', slugs: [...slugs].sort() },
+    });
+  }
+}
+
+/**
+ * A bulk action asked for a transition some of the selected products cannot make. Increment 58.
+ *
+ * Refused for the WHOLE batch rather than quietly skipping the offenders: the merchant selected
+ * them on purpose, and a partial application would leave them guessing which half moved.
+ */
+export class BulkProductTransitionRejected extends Conflict {
+  override readonly code = 'INVALID_STATE_TRANSITION';
+
+  constructor(args: { action: string; slugs: readonly string[]; expected: readonly string[] }) {
+    super(`Some products cannot be ${args.action}ed from their current status.`, {
+      action: args.action,
+      slugs: [...args.slugs].sort(),
+      expected: [...args.expected],
+    });
+  }
+}
+
 /**
  * Build a SKU's option signature.
  *
@@ -214,6 +333,83 @@ export const PRODUCT_TRANSITIONS = {
 
 type ProductTransition = (typeof PRODUCT_TRANSITIONS)[keyof typeof PRODUCT_TRANSITIONS];
 
+/**
+ * Zero-fill the status tally from the published vocabulary. Increment 58.
+ *
+ * The repository reports only the statuses that occur; which statuses EXIST is domain knowledge,
+ * so the filling happens here. A tab that vanished when its count reached zero would make "none"
+ * indistinguishable from "this status is gone", and would change the response shape as the data
+ * changed.
+ *
+ * A status the database holds but this vocabulary does not know is counted into `total` and
+ * reported nowhere else — the honest outcome, and the one a migration that introduced a state
+ * the code has not learned would want to be visible in.
+ */
+function tallyProductStatuses(rows: readonly { status: string; count: number }[]): {
+  total: number;
+  draft: number;
+  active: number;
+  archived: number;
+} {
+  const byStatus = new Map(rows.map((row) => [row.status, row.count]));
+  const total = rows.reduce((sum, row) => sum + row.count, 0);
+
+  return {
+    total,
+    draft: byStatus.get('draft') ?? 0,
+    active: byStatus.get('active') ?? 0,
+    archived: byStatus.get('archived') ?? 0,
+  };
+}
+
+/**
+ * **Generate a SKU code for a product.** Increment 58.
+ *
+ * `PREFIX-XXXXXX`: up to sixteen characters derived from the product slug, a hyphen, then six
+ * drawn from a 32-symbol alphabet — `SHIRT-7QK4M2` for a product slugged `shirt`. Always inside
+ * the column's 64 characters and always matching `skuCodeField`, both pinned by test rather than
+ * assumed.
+ *
+ * The same construction `generateOrderNumber` uses, for the same reasons:
+ *
+ *  - **Random, not sequential.** A serial in a merchant-visible identifier leaks how many
+ *    variants a catalogue holds, and consecutive codes across two stores would leak more.
+ *  - **`I`, `O`, `0` and `1` are excluded**, so a code read off a packing slip or dictated over
+ *    a phone cannot be transcribed into a different one.
+ *  - **`randomInt` is a CSPRNG**, giving ~1.07 billion suffixes per prefix.
+ *
+ * The prefix is DERIVED rather than random so a human can see at a glance which product a code
+ * belongs to. It is uppercased and reduced to the character class the column accepts; a slug
+ * that reduces to nothing falls back to `SKU`, so a product slugged entirely in characters the
+ * SKU grammar forbids still gets a usable code.
+ *
+ * **Not derived from any database id.** A code is a merchant-facing identifier printed on
+ * paperwork; minting it from a primary key would publish an internal one.
+ */
+const SKU_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const SKU_CODE_SUFFIX_LENGTH = 6;
+const SKU_CODE_PREFIX_MAX = 16;
+const SKU_CODE_FALLBACK_PREFIX = 'SKU';
+
+export function generateSkuCode(productSlug: string): string {
+  const prefix =
+    productSlug
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/gu, '-')
+      .replace(/^-+|-+$/gu, '')
+      .slice(0, SKU_CODE_PREFIX_MAX) || SKU_CODE_FALLBACK_PREFIX;
+
+  let suffix = '';
+  for (let i = 0; i < SKU_CODE_SUFFIX_LENGTH; i += 1) {
+    suffix += SKU_CODE_ALPHABET[randomInt(SKU_CODE_ALPHABET.length)];
+  }
+
+  return `${prefix}-${suffix}`;
+}
+
+/** How many times a colliding generated code is re-drawn before failing loudly. */
+const SKU_CODE_ATTEMPTS = 5;
+
 export function createCatalogueService(deps: {
   repository: CatalogueRepository;
   /**
@@ -225,9 +421,18 @@ export function createCatalogueService(deps: {
   db: Database;
   events: EventBus;
   audit: AuditTrail;
+  /**
+   * Object storage, adapted by the composition root. Increment 58.
+   *
+   * Required rather than optional: a catalogue that could be built without it would let a
+   * deployment discover the missing wiring at the first upload attempt instead of at boot. The
+   * composition root supplies an adapter that refuses with 503 when no bucket is configured,
+   * which is a configured state rather than an absent dependency.
+   */
+  storage: MediaStorage;
   logger: Logger;
 }) {
-  const { repository, db, events, audit, logger } = deps;
+  const { repository, db, events, audit, storage, logger } = deps;
 
   /**
    * The store's currency, or a loud failure.
@@ -696,16 +901,51 @@ export function createCatalogueService(deps: {
      * Visibility — this store, not soft-deleted, any status — belongs to the repository query
      * and is not duplicated here.
      */
+    /**
+     * **How many products this store can currently sell.** Increment 57. Read-only.
+     *
+     * Exported on the service because the DASHBOARD module needs it and must not reach for the
+     * product table itself. The composition root adapts this onto the port it declares.
+     *
+     * `active` and not soft-deleted — the approved definition of the "Total Products" tile, and
+     * deliberately NOT "every row in the table": a draft is unfinished and an archived listing is
+     * withdrawn, so counting either would make the tile disagree with what a shopper can buy.
+     */
+    async countActiveProducts(params: { storeId: string }): Promise<number> {
+      return repository.countActiveForStore(params);
+    },
+
     async getProductsForStaff(params: {
       storeId: string;
       limit: number;
       offset: number;
-    }): Promise<{ items: ProductRecord[]; total: number; limit: number; offset: number }> {
-      const { items, total } = await repository.listForStore(params);
+      filters?: AdminProductFilters;
+    }): Promise<{
+      items: ProductRecord[];
+      total: number;
+      limit: number;
+      offset: number;
+      counts: { total: number; draft: number; active: number; archived: number };
+    }> {
+      /*
+       * Two statements, run together: the filtered page and the UNFILTERED status tally. The
+       * tally is not narrowed by this request's own filters — it answers "how many rows would
+       * switching to that tab show", which a filtered count cannot.
+       */
+      const [{ items, total }, statusCounts] = await Promise.all([
+        repository.listForStore(params),
+        repository.countByStatusForStore({ storeId: params.storeId }),
+      ]);
 
       logger.info({ storeId: params.storeId, returned: items.length, total }, 'product_list_read');
 
-      return { items, total, limit: params.limit, offset: params.offset };
+      return {
+        items,
+        total,
+        limit: params.limit,
+        offset: params.offset,
+        counts: tallyProductStatuses(statusCounts),
+      };
     },
     /**
      * Update a product's editable data.
@@ -798,6 +1038,177 @@ export function createCatalogueService(deps: {
      * The row is never physically removed. Order lines and invoices will reference products,
      * and a hard delete would either break those or force a cascade that rewrites history.
      */
+    /**
+     * **Apply one lifecycle action to several products at once.** Increment 58.
+     *
+     * The list screen's select-all. Three actions, and they are the three the single-product
+     * routes already expose — `publish`, `archive`, `delete` — because a bulk action that could
+     * do something no individual action can would be a second, less-guarded lifecycle.
+     *
+     * ### All or nothing
+     *
+     * Every slug is resolved FIRST, in one query. If any is unknown, soft-deleted, or belongs to
+     * another store, nothing is applied and the caller is told exactly which ones failed. A
+     * partial success would leave the operator guessing which half of their selection moved, and
+     * a silent skip would be worse still.
+     *
+     * The same rule covers an illegal transition: archiving a draft is refused for the whole
+     * batch rather than quietly skipped, because the merchant selected it on purpose.
+     *
+     * ### One transaction, one statement per stage
+     *
+     * The resolve is a single `IN`; the write is a single `UPDATE ... IN`; the audit rows are a
+     * single insert. No per-item round trip, and no per-item transaction — a crash halfway
+     * through leaves the selection untouched rather than half-applied.
+     */
+    async bulkProductAction(params: {
+      storeId: string;
+      slugs: readonly string[];
+      action: 'publish' | 'archive' | 'delete';
+      actor: AuditActor;
+    }): Promise<{ action: string; affected: number; slugs: string[] }> {
+      const { storeId, slugs, action, actor } = params;
+
+      /* Deduplicated before anything else: a slug named twice is one product, not two. */
+      const requested = [...new Set(slugs)];
+
+      const found = await repository.findProductsBySlugs({ storeId, slugs: requested });
+      const bySlug = new Map(found.map((row) => [row.slug, row]));
+
+      const missing = requested.filter((slug) => !bySlug.has(slug));
+      if (missing.length > 0) {
+        /*
+         * Unknown, soft-deleted and another store's are ALL reported the same way, so the
+         * response cannot be used to discover which slugs exist in a neighbouring tenant.
+         */
+        logger.info({ storeId, action, missing: missing.length }, 'product_bulk_unknown_slugs');
+        throw new BulkProductsNotFound(missing);
+      }
+
+      if (action === 'delete') {
+        return withTransaction(db, logger, async () => {
+          const at = new Date();
+          const affected: string[] = [];
+
+          for (const row of found) {
+            const deleted = await repository.softDeleteProduct({ storeId, slug: row.slug, at });
+            /* istanbul ignore next -- resolved under the same transaction moments earlier. */
+            if (!deleted) continue;
+
+            /*
+             * The SAME cascade `deleteProduct` performs, imagery included. A product deleted
+             * through this route and one deleted individually must leave the database in the
+             * same state; a bulk path that cascaded less would leave sellable SKUs and live
+             * media rows under a product nothing can reach.
+             */
+            const cascadedCodes = await repository.softDeleteSkusForProduct({
+              storeId,
+              productId: row.id,
+              at,
+            });
+            const cascadedOptionNames = await repository.softDeleteOptionsForProduct({
+              storeId,
+              productId: row.id,
+              at,
+            });
+            await repository.softDeleteMediaForProduct({ storeId, productId: row.id, at });
+            const cascadedValueCount = await repository.softDeleteValuesForProduct({
+              storeId,
+              productId: row.id,
+              at,
+            });
+
+            await recordProductChange({
+              storeId,
+              actor,
+              product: deleted,
+              eventName: PRODUCT_EVENTS.deleted,
+              auditAction: PRODUCT_AUDIT.deleted,
+              payloadExtra: {
+                cascadedSkuCount: cascadedCodes.length,
+                cascadedOptionCount: cascadedOptionNames.length,
+              },
+              metadata: {
+                slug: deleted.slug,
+                name: deleted.name,
+                statusAtDeletion: deleted.status,
+                cascadedSkuCodes: cascadedCodes,
+                cascadedOptionNames,
+                cascadedOptionValueCount: cascadedValueCount,
+                bulk: true,
+              },
+            });
+            affected.push(deleted.slug);
+          }
+
+          return { action, affected: affected.length, slugs: affected.sort() };
+        });
+      }
+
+      const rule = action === 'publish' ? PRODUCT_TRANSITIONS.publish : PRODUCT_TRANSITIONS.archive;
+
+      /*
+       * Illegal transitions are found BEFORE the write, so the refusal names every offending
+       * slug at once rather than stopping at the first.
+       */
+      const illegal = found.filter((row) => !(rule.from as readonly string[]).includes(row.status));
+      if (illegal.length > 0) {
+        logger.info(
+          { storeId, action, illegal: illegal.length },
+          'product_bulk_illegal_transition',
+        );
+        throw new BulkProductTransitionRejected({
+          action,
+          slugs: illegal.map((row) => row.slug),
+          expected: rule.from,
+        });
+      }
+
+      return withTransaction(db, logger, async () => {
+        const updated = await repository.setStatusForProducts({
+          storeId,
+          productIds: found.map((row) => row.id),
+          from: [...rule.from],
+          to: rule.to,
+          at: new Date(),
+        });
+
+        /*
+         * `recordProductChange`, not a bare `audit.record` — so a product published here emits
+         * the same `product.published` a product published one at a time does. A subscriber
+         * that invalidates a storefront cache cannot know which route a merchant used, and an
+         * event that fired for one and not the other would leave the cache stale exactly when a
+         * merchant published in bulk.
+         *
+         * `bulk: true` stays in the audit metadata, where the distinction genuinely matters:
+         * an auditor asking how a change was made is a different question from a consumer
+         * asking what changed.
+         */
+        const names =
+          action === 'publish'
+            ? { event: PRODUCT_EVENTS.published, audit: PRODUCT_AUDIT.published }
+            : { event: PRODUCT_EVENTS.archived, audit: PRODUCT_AUDIT.archived };
+
+        for (const row of updated) {
+          await recordProductChange({
+            storeId,
+            actor,
+            product: row,
+            eventName: names.event,
+            auditAction: names.audit,
+            payloadExtra: { from: rule.from.join(','), to: rule.to },
+            metadata: { slug: row.slug, status: row.status, to: rule.to, bulk: true },
+          });
+        }
+
+        return {
+          action,
+          affected: updated.length,
+          slugs: updated.map((row) => row.slug).sort(),
+        };
+      });
+    },
+
     async deleteProduct(params: {
       storeId: string;
       slug: string;
@@ -849,6 +1260,16 @@ export function createCatalogueService(deps: {
          * are soft.
          */
         const cascadedOptionNames = await repository.softDeleteOptionsForProduct({
+          storeId: params.storeId,
+          productId: row.id,
+          at,
+        });
+
+        /*
+         * Imagery cascades with the product, inside the same transaction. Images that outlived
+         * their product would keep storage objects referenced by rows nothing can reach.
+         */
+        await repository.softDeleteMediaForProduct({
           storeId: params.storeId,
           productId: row.id,
           at,
@@ -1015,25 +1436,46 @@ export function createCatalogueService(deps: {
        * of the same code both reach this point and both see nothing, so the partial unique
        * index is what actually decides. The catch below covers the race.
        */
-      const existing = await repository.findSkuByCode({ storeId, code: input.code });
-      if (existing) {
-        logger.info({ storeId }, 'sku_create_rejected_code_taken');
-        throw new SkuCodeTaken();
+      /*
+       * A SUPPLIED code is pre-checked, so a merchant typing a duplicate gets a clear conflict
+       * naming their own input. A GENERATED one deliberately is not: a SELECT-then-INSERT is a
+       * race by construction, and the retry loop below leans on the unique index instead, which
+       * is the only arbiter two concurrent requests cannot both pass.
+       */
+      if (input.code !== undefined) {
+        const existing = await repository.findSkuByCode({ storeId, code: input.code });
+        if (existing) {
+          logger.info({ storeId }, 'sku_create_rejected_code_taken');
+          throw new SkuCodeTaken();
+        }
       }
 
-      try {
-        return await withTransaction(db, logger, async () => {
+      /**
+       * Insert, and on a generated-code collision draw another. Increment 58.
+       *
+       * **The constraint is the arbiter.** Two concurrent creates that happened to generate the
+       * same code are resolved by `uq_sku_code_active`: one commits, the other sees a unique
+       * violation and tries again with a fresh draw. Nothing here reads-then-writes.
+       *
+       * A caller who SUPPLIED the code gets the conflict instead of a retry — silently giving
+       * them a different code than the one they asked for would be worse than refusing.
+       */
+      const insertOnce = async (code: string): Promise<SkuRecord> =>
+        withTransaction(db, logger, async () => {
           const row = await repository.insertSku({
             id: newId(),
             // From the PRODUCT row, not the caller's argument.
             storeId: parent.storeId,
             productId: parent.id,
-            code: input.code,
+            code,
             name: input.name ?? '',
             price,
             // The column default is `true`; naming it here keeps the decision visible at the
             // one place a SKU's initial sellability is chosen.
             isActive: input.isActive ?? true,
+            // Absent means NULL — "no threshold configured" — never zero. See the field's note
+            // on `CreateSkuRequestSchema` and the column's own in `db/schema/catalogue.ts`.
+            lowStockThreshold: input.lowStockThreshold ?? null,
           });
 
           await recordSkuChange({
@@ -1047,18 +1489,311 @@ export function createCatalogueService(deps: {
 
           return row;
         });
-      } catch (err) {
-        /**
-         * The race the pre-check cannot cover. Translated to the same 409 so a client cannot
-         * tell which path produced it. Any OTHER unique violation is rethrown untouched —
-         * reporting an unrelated constraint failure as a code conflict would hide a real bug.
+
+      for (let attempt = 0; attempt < SKU_CODE_ATTEMPTS; attempt += 1) {
+        const code = input.code ?? generateSkuCode(productSlug);
+
+        try {
+          return await insertOnce(code);
+        } catch (err) {
+          /*
+           * Any OTHER unique violation is rethrown untouched — reporting an unrelated constraint
+           * failure as a code conflict would hide a real bug.
+           */
+          if (uniqueViolationConstraint(err) !== SKU_CODE_UNIQUE_CONSTRAINT) throw err;
+
+          /* The race the pre-check cannot cover, for a code the caller chose. */
+          if (input.code !== undefined) {
+            logger.warn({ storeId }, 'sku_create_code_race');
+            throw new SkuCodeTaken();
+          }
+
+          logger.info({ storeId, attempt }, 'sku_code_generation_collision');
+        }
+      }
+
+      /*
+       * Five collisions against ~1.07 billion suffixes means the entropy source is broken, not
+       * that we were unlucky. Failing loudly is correct; looping forever is not — the same
+       * judgement `ORDER_NUMBER_ATTEMPTS` makes.
+       */
+      logger.error({ storeId, attempts: SKU_CODE_ATTEMPTS }, 'sku_code_generation_exhausted');
+      throw new SkuCodeTaken();
+    },
+
+    /* ── Media. Increment 58. ──────────────────────────────────────────────── */
+
+    /**
+     * **Register an uploaded object against a product.**
+     *
+     * The bytes are already in the bucket by the time this runs — this records the pointer and
+     * everything needed to render the image. Splitting the upload from the registration is what
+     * keeps a large binary off this API's request path entirely.
+     *
+     * The SKU link, when given, is resolved from a CODE and checked to belong to this product.
+     * A merchant cannot attach an image to a variant of a different product, and cannot reach
+     * another tenant's SKU at all, because the lookup is store-scoped before the parentage
+     * comparison is even made.
+     *
+     * `position` defaults to the end of the gallery rather than to zero: a new image appended to
+     * a reordered gallery must not silently become the first one.
+     *
+     * The FIRST image of a product becomes its primary automatically. A product whose gallery
+     * has images but no primary would render a blank tile in the list, and making the merchant
+     * perform a second call to avoid that is a trap rather than a choice.
+     */
+    async addProductMedia(params: {
+      storeId: string;
+      productSlug: string;
+      actor: AuditActor;
+      input: CreateMediaRequest;
+    }): Promise<MediaRecord> {
+      const { storeId, productSlug, actor, input } = params;
+
+      const parent = await repository.findProductRefBySlug({ storeId, slug: productSlug });
+      if (!parent) {
+        logger.info({ storeId, slug: productSlug }, 'media_create_product_not_found');
+        throw new NotFound('product');
+      }
+
+      let skuId: string | null = null;
+      if (input.skuCode !== undefined) {
+        const variant = await repository.findSkuByCode({ storeId, code: input.skuCode });
+
+        /*
+         * Unknown, another store's, and a SKU of a DIFFERENT product are all the same answer.
+         * Distinguishing them would let a caller probe which codes exist elsewhere in the store
+         * — and the merchant's mistake is the same in every case: that code is not this
+         * product's variant.
          */
-        if (uniqueViolationConstraint(err) === SKU_CODE_UNIQUE_CONSTRAINT) {
-          logger.warn({ storeId }, 'sku_create_code_race');
-          throw new SkuCodeTaken();
+        if (!variant || variant.productId !== parent.id) {
+          logger.info({ storeId, slug: productSlug }, 'media_create_sku_not_found');
+          throw new NotFound('sku');
+        }
+        skuId = variant.id;
+      }
+
+      const existing = await repository.listMediaForProduct({ storeId, productId: parent.id });
+
+      try {
+        return await withTransaction(db, logger, async () => {
+          const row = await repository.insertMedia({
+            id: newId(),
+            /* From the PRODUCT row, not the caller's argument. */
+            storeId: parent.storeId,
+            productId: parent.id,
+            skuId,
+            storageKey: input.storageKey,
+            contentType: input.contentType,
+            altText: input.altText ?? '',
+            width: input.width ?? null,
+            height: input.height ?? null,
+            byteSize: input.byteSize ?? null,
+            position: input.position ?? existing.length,
+            /* The first image of a product is its primary; see the note above. */
+            isPrimary: existing.length === 0,
+          });
+
+          await audit.record({
+            storeId,
+            actor,
+            action: MEDIA_AUDIT.created,
+            resourceType: MEDIA_RESOURCE,
+            resourceId: row.id,
+            metadata: { productSlug, isPrimary: row.isPrimary, contentType: row.contentType },
+          });
+
+          return row;
+        });
+      } catch (err) {
+        /*
+         * One object belongs to one row. A repeated registration of the same key is a client
+         * retry or a double-click, and reporting it as a conflict is more useful than silently
+         * creating a second row pointing at the same bytes.
+         */
+        if (uniqueViolationConstraint(err) === MEDIA_KEY_UNIQUE_CONSTRAINT) {
+          logger.info({ storeId }, 'media_create_key_taken');
+          throw new MediaAlreadyRegistered();
         }
         throw err;
       }
+    },
+
+    /**
+     * Merchant codes for a set of SKU ids. Increment 58.
+     *
+     * Exposed for the media mapper, which publishes a variant's CODE rather than its id. One
+     * statement for a whole gallery, so the mapper cannot become an N+1.
+     */
+    async getSkuCodesByIds(params: {
+      storeId: string;
+      skuIds: readonly string[];
+    }): Promise<Map<string, string>> {
+      const rows = await repository.findSkuCodesByIds(params);
+      return new Map(rows.map((row) => [row.id, row.code]));
+    },
+
+    /**
+     * Compose an object's delivery URL, or `null` when this deployment configures no host.
+     *
+     * Exposed rather than the storage port itself, so the HTTP layer never holds a capability it
+     * could upload with — it needs to render a URL, not to sign one.
+     */
+    mediaPublicUrl(storageKey: string): string | null {
+      return storage.publicUrl(storageKey);
+    },
+
+    /** One product's gallery, in the merchant's order. 404 for an unknown product. */
+    async getProductMedia(params: {
+      storeId: string;
+      productSlug: string;
+    }): Promise<MediaRecord[]> {
+      const parent = await repository.findProductRefBySlug({
+        storeId: params.storeId,
+        slug: params.productSlug,
+      });
+
+      if (!parent) {
+        logger.info({ storeId: params.storeId, slug: params.productSlug }, 'product_not_found');
+        throw new NotFound('product');
+      }
+
+      return repository.listMediaForProduct({ storeId: params.storeId, productId: parent.id });
+    },
+
+    /**
+     * **Edit an image's alt text, its place in the gallery, or its primary flag.**
+     *
+     * Promoting a new primary demotes the old one FIRST, inside the same transaction, because
+     * `uq_product_media_primary` would otherwise refuse the second primary. Doing it in one
+     * transaction is what stops a failure halfway through leaving a product with none.
+     *
+     * Demoting the current primary to `false` is permitted and leaves the product with no
+     * primary. That is a state the merchant can reach deliberately and the list screen handles;
+     * refusing it would make the flag impossible to clear without deleting the image.
+     */
+    async updateProductMedia(params: {
+      storeId: string;
+      mediaId: string;
+      actor: AuditActor;
+      input: UpdateMediaRequest;
+    }): Promise<MediaRecord> {
+      const { storeId, mediaId, actor, input } = params;
+
+      const current = await repository.findMediaById({ storeId, mediaId });
+      if (!current) {
+        logger.info({ storeId }, 'media_not_found');
+        throw new NotFound('media');
+      }
+
+      const fields: EditableMediaFields = {};
+      if (input.altText !== undefined) fields.altText = input.altText;
+      if (input.position !== undefined) fields.position = input.position;
+      if (input.isPrimary !== undefined) fields.isPrimary = input.isPrimary;
+
+      return withTransaction(db, logger, async () => {
+        const at = new Date();
+
+        if (input.isPrimary === true) {
+          await repository.clearPrimaryMedia({
+            storeId,
+            productId: current.productId,
+            exceptMediaId: mediaId,
+            at,
+          });
+        }
+
+        const row = await repository.updateMedia({ storeId, mediaId, fields, at });
+
+        /* istanbul ignore next -- resolved under the same transaction moments earlier. */
+        if (!row) throw new NotFound('media');
+
+        await audit.record({
+          storeId,
+          actor,
+          action: MEDIA_AUDIT.updated,
+          resourceType: MEDIA_RESOURCE,
+          resourceId: row.id,
+          metadata: { fields: Object.keys(fields).sort() },
+        });
+
+        return row;
+      });
+    },
+
+    /**
+     * **Remove an image from a product.**
+     *
+     * Soft-deleted, so the storage object keeps a row saying it should be reclaimed. The primary
+     * flag is cleared on the way out, which frees `uq_product_media_primary` for a replacement —
+     * without it, deleting a primary would block the next promotion.
+     *
+     * No automatic promotion of a successor. Which image becomes primary is a merchandising
+     * decision, and picking one for the merchant would be inventing a rule the screen does not
+     * express.
+     */
+    async deleteProductMedia(params: {
+      storeId: string;
+      mediaId: string;
+      actor: AuditActor;
+    }): Promise<void> {
+      const { storeId, mediaId, actor } = params;
+
+      const removed = await withTransaction(db, logger, async () => {
+        const row = await repository.softDeleteMedia({ storeId, mediaId, at: new Date() });
+        if (!row) return undefined;
+
+        await audit.record({
+          storeId,
+          actor,
+          action: MEDIA_AUDIT.deleted,
+          resourceType: MEDIA_RESOURCE,
+          resourceId: row.id,
+          metadata: { storageKey: row.storageKey },
+        });
+
+        return row;
+      });
+
+      if (!removed) {
+        logger.info({ storeId }, 'media_delete_not_found');
+        throw new NotFound('media');
+      }
+    },
+
+    /**
+     * **Ask the storage adapter where to put the bytes.**
+     *
+     * Returns whatever the adapter needs a client to know — typically a pre-signed URL and the
+     * key the object will land at. The key comes back so the client can hand it straight to
+     * `addProductMedia` once the upload finishes.
+     *
+     * The adapter is a PORT. This module knows nothing about S3, and when no adapter is
+     * configured the composition root supplies one that refuses with `503` — the same posture
+     * the payment gateway takes when Razorpay credentials are absent. A store with no bucket
+     * configured gets an honest "not available here" rather than a fabricated URL.
+     */
+    async createMediaUploadTarget(params: {
+      storeId: string;
+      productSlug: string;
+      input: CreateUploadTargetRequest;
+    }): Promise<MediaUploadTarget> {
+      const parent = await repository.findProductRefBySlug({
+        storeId: params.storeId,
+        slug: params.productSlug,
+      });
+
+      if (!parent) {
+        logger.info({ storeId: params.storeId, slug: params.productSlug }, 'product_not_found');
+        throw new NotFound('product');
+      }
+
+      return storage.createUploadTarget({
+        storeId: params.storeId,
+        productId: parent.id,
+        contentType: params.input.contentType,
+        byteSize: params.input.byteSize,
+      });
     },
 
     /**
@@ -1104,6 +1839,15 @@ export function createCatalogueService(deps: {
       const fields: EditableSkuFields = {};
       if (input.name !== undefined) fields.name = input.name;
       if (input.isActive !== undefined) fields.isActive = input.isActive;
+      /**
+       * `undefined` and `null` are different answers here, so the test is against `undefined`
+       * alone: an omitted key leaves the configured threshold alone, an explicit `null` clears
+       * it. A `??` or a truthiness check would collapse both — and would also swallow `0`, which
+       * is a meaningful threshold rather than an absent one.
+       */
+      if (input.lowStockThreshold !== undefined) {
+        fields.lowStockThreshold = input.lowStockThreshold;
+      }
       if (input.price !== undefined) {
         fields.price = toDb(money(input.price, requireCurrency(storeId, params.currency)));
       }

@@ -19,10 +19,13 @@ import {
   RETURN_NUMBER_ALPHABET,
   RETURN_NUMBER_SUFFIX_LENGTH,
   RETURN_STATUSES,
+  type ReturnEventRecord,
   type ReturnLineRecord,
   type ReturnRecord,
   type ReturnsRepository,
   type ReturnStatus,
+  type StaffReturnDetailExtras,
+  type StaffReturnListExtras,
 } from './returns.repository.js';
 import { canTransition, isCustomerCancellable, isTerminal } from './return.state.js';
 
@@ -78,6 +81,66 @@ export type ReturnFulfilment = {
   deliveredAtForOrder(params: { orderId: string; storeId: string }): Promise<Date | null>;
 };
 
+/**
+ * Refunds, adapted. **Declared here, implemented in `container.ts`.**
+ *
+ * This module knows a refund can be raised and what came back. It does not know there is a
+ * payments module, a gateway, or a provider called Razorpay, and it must not: a returns service
+ * that imported a gateway could not be tested without one, and the no-cross-module-imports rule
+ * says so structurally.
+ *
+ * The three outcomes are the port's whole point. `unresolved` is not an error — it is a fact
+ * about the provider that the caller must be able to act on differently from a failure, because
+ * a failure may be retried and an unresolved attempt must not be.
+ */
+export type ReturnRefunds = {
+  refundForReturn(params: {
+    storeId: string;
+    orderId: string;
+    returnId: string;
+    amount: string;
+    actor: AuditActor;
+  }): Promise<{
+    readonly refundNumber: string;
+    readonly status: 'pending' | 'processing' | 'succeeded' | 'failed';
+    readonly mode: 'provider' | 'manual';
+    readonly amount: string;
+    readonly currency: string;
+    readonly failureCode: string | null;
+  }>;
+  /** Every refund raised for one return, for the staff detail read. */
+  listForReturn(params: { returnId: string; storeId: string }): Promise<
+    readonly {
+      readonly refundNumber: string;
+      readonly status: string;
+      readonly mode: string;
+      readonly amount: string;
+      readonly currency: string;
+      readonly providerRefundId: string | null;
+      readonly failureCode: string | null;
+      readonly createdAt: Date;
+      readonly settledAt: Date | null;
+    }[]
+  >;
+};
+
+/**
+ * Inventory, adapted. **Declared here, implemented in `container.ts`.**
+ *
+ * One call: put the good-to-sell units back. Returns does not touch `stock_item` or
+ * `stock_ledger` — it cannot, since `schema-only-in-repositories` puts those tables behind the
+ * inventory module's own repository, and going around that would put the ledger arithmetic in
+ * two places.
+ */
+export type ReturnInventory = {
+  restockForReturn(params: {
+    storeId: string;
+    lines: readonly { skuId: string; quantity: number }[];
+    actorUserId: string;
+    note?: string;
+  }): Promise<{ skuCount: number; totalUnits: number }>;
+};
+
 /** The idempotency store, narrowed to the one call this module makes. */
 export type ReturnIdempotency = {
   complete(params: {
@@ -111,6 +174,45 @@ export class ReturnQuantityUnavailable extends BusinessRuleViolation {
   }
 }
 
+/**
+ * Inspection did not account for the goods. A `422`.
+ *
+ * Every line that came back must be inspected, and each one's good-plus-written-off must equal
+ * the quantity returned. Anything else is a half-finished inspection, and completing on top of
+ * one would restock a number nobody decided.
+ */
+export class ReturnInspectionIncomplete extends BusinessRuleViolation {
+  override readonly code = 'RETURN_INSPECTION_INCOMPLETE';
+  constructor(detail: string, context: Record<string, unknown>) {
+    super(detail, context);
+  }
+}
+
+/**
+ * The refund did not succeed, so the return stays open. A `422`.
+ *
+ * Separate from `ReturnNotTransitionable` because nothing is wrong with the return's state —
+ * the money is the problem, and the operator's next action is different for each of the two
+ * outcomes this covers:
+ *
+ *  - `failed` — the provider refused. Fix the cause and complete again; a new attempt is safe.
+ *  - `processing` — the provider never answered. **Do not retry.** The refund may already have
+ *    gone through, so it must be reconciled against the provider before anything else happens.
+ *
+ * The distinction is carried in `details.refundStatus` so the screen can say which.
+ */
+export class ReturnRefundNotSettled extends BusinessRuleViolation {
+  override readonly code = 'RETURN_REFUND_NOT_SETTLED';
+  constructor(refundNumber: string, refundStatus: string, failureCode: string | null) {
+    super(
+      refundStatus === 'processing'
+        ? `refund ${refundNumber} has no confirmed outcome from the provider; it must be reconciled before this return can be completed, and it must NOT be retried`
+        : `refund ${refundNumber} did not succeed, so this return cannot be completed`,
+      { refundNumber, refundStatus, failureCode },
+    );
+  }
+}
+
 /** The return cannot move to the requested state. A `409`: a conflict with existing state. */
 export class ReturnNotTransitionable extends Conflict {
   override readonly code = 'RETURN_NOT_TRANSITIONABLE';
@@ -135,6 +237,26 @@ export type ReturnView = {
  */
 export type StaffReturnView = ReturnView;
 
+/** One row of the staff queue: the header, its lines, and who it belongs to. Increment 61. */
+export type StaffReturnListView = {
+  readonly header: ReturnRecord & StaffReturnListExtras;
+  readonly lines: readonly ReturnLineRecord[];
+};
+
+/**
+ * Everything the admin DETAIL page shows. Increment 61.
+ *
+ * `remainingBySkuId` is keyed by SKU id internally and projected onto lines by SKU code at the
+ * DTO boundary — no internal id reaches a response.
+ */
+export type StaffReturnDetailView = {
+  readonly header: ReturnRecord & StaffReturnDetailExtras;
+  readonly lines: readonly ReturnLineRecord[];
+  readonly events: readonly ReturnEventRecord[];
+  readonly refunds: Awaited<ReturnType<ReturnRefunds['listForReturn']>>;
+  readonly remainingBySkuId: ReadonlyMap<string, number>;
+};
+
 export type ReturnsService = ReturnType<typeof createReturnsService>;
 
 /** The approved window, in whole days from delivery. */
@@ -157,13 +279,18 @@ export function createReturnsService(deps: {
   orders: ReturnOrders;
   fulfilment: ReturnFulfilment;
   idempotency: ReturnIdempotency;
+  /** Increment 59. Raises the money side of a completion. */
+  refunds: ReturnRefunds;
+  /** Increment 59. Puts the good-to-sell units back. */
+  inventory: ReturnInventory;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
   /** Injected so a test can freeze the return window without waiting seven days. */
   now?: () => Date;
 }) {
-  const { repository, orders, fulfilment, idempotency, db, audit, logger } = deps;
+  const { repository, orders, fulfilment, idempotency, refunds, inventory, db, audit, logger } =
+    deps;
   const now = deps.now ?? (() => new Date());
 
   /**
@@ -670,6 +797,340 @@ export function createReturnsService(deps: {
     },
 
     /**
+     * Receive the goods. `approved -> received`. Increment 59.
+     *
+     * The warehouse has the parcel. Nothing about money or stock happens here — the units are
+     * physically present but not yet judged, so restocking them would put unexamined goods on
+     * sale. That judgement is `inspectReturn`.
+     *
+     * The received instant is the `return_event` row this writes, not a new column: the event
+     * log is already the append-only record of when each transition happened, and a second
+     * timestamp on the header would be the same fact stored twice and free to disagree.
+     */
+    async receiveReturn(params: {
+      returnNumber: string;
+      storeId: string;
+      actor: AuditActor;
+      staffNote?: string;
+    }): Promise<ReturnView> {
+      return this.transitionByStaff({
+        ...params,
+        toStatus: 'received',
+        auditAction: RETURN_AUDIT.received,
+      });
+    },
+
+    /**
+     * Inspect the goods and record the split. `received -> inspected`. Increment 59.
+     *
+     * **The counts are the output of this step and the input to completion.** For every line
+     * that came back, staff say how many units are good to sell and how many are written off.
+     * Neither number decides whether the customer is refunded — a smashed jar is still a jar
+     * they sent back, and the frozen refund snapshot taken at creation is never touched here.
+     *
+     * Every line must be accounted for, and each line's two counts must sum EXACTLY to the
+     * quantity returned. A partial inspection would leave completion restocking a number nobody
+     * decided, so it is refused rather than defaulted. `ck_return_line_inspection_quantity`
+     * catches the over-count; this catches the under-count, which a CHECK cannot see because it
+     * cannot know the status.
+     *
+     * Rejection after inspection is deliberately impossible — `received -> rejected` is the
+     * refusal edge, taken INSTEAD of this one. Reaching `inspected` already means accepted,
+     * which is what makes `inspected -> completed` unconditional.
+     */
+    async inspectReturn(params: {
+      returnNumber: string;
+      storeId: string;
+      actor: AuditActor;
+      lines: readonly { skuCode: string; restockQuantity: number; writeOffQuantity: number }[];
+      staffNote?: string;
+    }): Promise<ReturnView> {
+      return withTransaction(db, logger, async () => {
+        const locked = await repository.lockStoreReturnByNumber({
+          returnNumber: params.returnNumber,
+          storeId: params.storeId,
+        });
+        if (!locked) throw new NotFound('return');
+
+        if (!canTransition(locked.status, 'inspected')) {
+          throw new ReturnNotTransitionable(locked.status, 'inspected');
+        }
+
+        const existing = await repository.listReturnLines({
+          returnId: locked.id,
+          storeId: params.storeId,
+        });
+
+        const byCode = new Map(existing.map((line) => [line.skuCode, line]));
+
+        /* Every submitted code must name a line of THIS return. */
+        for (const submitted of params.lines) {
+          if (!byCode.has(submitted.skuCode)) {
+            throw new ReturnInspectionIncomplete(
+              `${submitted.skuCode} is not a line of this return`,
+              { skuCode: submitted.skuCode },
+            );
+          }
+        }
+
+        const submittedCodes = new Set(params.lines.map((line) => line.skuCode));
+        const missing = existing
+          .filter((line) => !submittedCodes.has(line.skuCode))
+          .map((line) => line.skuCode);
+
+        if (missing.length > 0) {
+          throw new ReturnInspectionIncomplete(
+            'every returned line must be inspected before the return can move on',
+            { missing },
+          );
+        }
+
+        if (submittedCodes.size !== params.lines.length) {
+          throw new ReturnInspectionIncomplete('a line was inspected more than once', {});
+        }
+
+        for (const submitted of params.lines) {
+          /* Present: checked above. */
+          const line = byCode.get(submitted.skuCode) as (typeof existing)[number];
+          const accounted = submitted.restockQuantity + submitted.writeOffQuantity;
+
+          if (accounted !== line.quantity) {
+            throw new ReturnInspectionIncomplete(
+              `inspection of ${submitted.skuCode} accounts for ${String(accounted)} unit(s) but ${String(line.quantity)} came back`,
+              {
+                skuCode: submitted.skuCode,
+                accounted,
+                returned: line.quantity,
+              },
+            );
+          }
+
+          const written = await repository.recordInspection({
+            returnId: locked.id,
+            storeId: params.storeId,
+            skuId: line.skuId,
+            restockQuantity: submitted.restockQuantity,
+            writeOffQuantity: submitted.writeOffQuantity,
+          });
+
+          /* istanbul ignore next -- the line was read under this transaction's lock. */
+          if (!written) {
+            throw new InvariantViolation(
+              `inspection of ${submitted.skuCode} matched no line under the return lock`,
+            );
+          }
+        }
+
+        const moved = await repository.transitionStatus({
+          returnId: locked.id,
+          storeId: params.storeId,
+          fromStatus: locked.status,
+          toStatus: 'inspected',
+          closedAt: null,
+          ...(params.staffNote === undefined ? {} : { staffNote: params.staffNote }),
+        });
+        if (!moved) throw new ReturnNotTransitionable(locked.status, 'inspected');
+
+        await repository.insertEvent({
+          returnId: locked.id,
+          storeId: params.storeId,
+          fromStatus: locked.status,
+          toStatus: 'inspected',
+          actorType: 'staff',
+          actorUserId: params.actor.type === 'staff' ? (params.actor.userId ?? null) : null,
+          ...(params.staffNote === undefined ? {} : { note: params.staffNote }),
+        });
+
+        await audit.record({
+          storeId: params.storeId,
+          actor: params.actor,
+          action: RETURN_AUDIT.inspected,
+          resourceType: RETURN_RESOURCE,
+          resourceId: locked.id,
+          metadata: {
+            returnNumber: locked.returnNumber,
+            fromStatus: locked.status,
+            toStatus: 'inspected',
+            restockUnits: params.lines.reduce((total, line) => total + line.restockQuantity, 0),
+            writeOffUnits: params.lines.reduce((total, line) => total + line.writeOffQuantity, 0),
+          },
+        });
+
+        return this.getStoreReturn({
+          returnNumber: params.returnNumber,
+          storeId: params.storeId,
+        });
+      });
+    },
+
+    /**
+     * Complete the return. `inspected -> completed`. Increment 59.
+     *
+     * **Not "set status = completed".** Completion is the point at which the money and the
+     * stock actually move, and the ordering between them is the whole safety property:
+     *
+     *   1. lock the return and check the transition;
+     *   2. raise the refund for the FROZEN `refundTotal` — never a figure recomputed from
+     *      today's catalogue;
+     *   3. **stop unless the refund succeeded.** A `failed` refund leaves the return in
+     *      `inspected`, ready to try again. A `processing` one leaves it there too, and the
+     *      error says explicitly that it must be reconciled rather than retried;
+     *   4. restock the good-to-sell units;
+     *   5. move the status, write the event and the audit row.
+     *
+     * Refund before restock, deliberately. If the refund fails we have moved nothing; if the
+     * restock failed after a successful refund we would have given money back for goods the
+     * system says are still with the customer — recoverable, but only by hand. The cheaper
+     * failure goes first.
+     *
+     * **Restock happens exactly once**, and the guarantee is the `inspected -> completed` CAS
+     * inside this transaction, not a flag: a second completion matches no row, throws, and rolls
+     * back its own stock movement. `uq_refund_return_live` is the second line — a concurrent
+     * pair cannot both insert a live refund for one return.
+     *
+     * A refund of nothing is not raised at all. A return whose frozen `refundTotal` is zero is
+     * possible (a fully discounted line), and asking a gateway to move zero rupees would be a
+     * request the provider rejects and an operator has to explain.
+     */
+    async completeReturn(params: {
+      returnNumber: string;
+      storeId: string;
+      actor: AuditActor;
+      staffNote?: string;
+    }): Promise<ReturnView> {
+      return withTransaction(db, logger, async () => {
+        const locked = await repository.lockStoreReturnByNumber({
+          returnNumber: params.returnNumber,
+          storeId: params.storeId,
+        });
+        if (!locked) throw new NotFound('return');
+
+        if (!canTransition(locked.status, 'completed')) {
+          throw new ReturnNotTransitionable(locked.status, 'completed');
+        }
+
+        const lines = await repository.listReturnLines({
+          returnId: locked.id,
+          storeId: params.storeId,
+        });
+
+        /*
+         * The FROZEN figure, from the header written at creation. Never recomputed, and never
+         * summed from the current catalogue — that is the rule the whole returns increment is
+         * built on and completion is where it would be easiest to break.
+         */
+        const refundAmount = locked.refundTotal;
+        const refundable = Number.parseFloat(refundAmount) > 0;
+
+        let raised: Awaited<ReturnType<ReturnRefunds['refundForReturn']>> | null = null;
+
+        if (refundable) {
+          raised = await refunds.refundForReturn({
+            storeId: params.storeId,
+            orderId: locked.orderId,
+            returnId: locked.id,
+            amount: refundAmount,
+            actor: params.actor,
+          });
+
+          /*
+           * A manual refund is an OBLIGATION, not a transfer, and it is `pending` by design —
+           * COD money goes back by a route this backend has no visibility of. Blocking
+           * completion on it would mean a COD return could never close. A provider refund is
+           * different: the gateway is authoritative and its answer is available now.
+           */
+          if (raised.mode === 'provider' && raised.status !== 'succeeded') {
+            throw new ReturnRefundNotSettled(
+              raised.refundNumber,
+              raised.status,
+              raised.failureCode,
+            );
+          }
+        }
+
+        const restockLines = lines
+          .filter((line) => line.restockQuantity > 0)
+          .map((line) => ({ skuId: line.skuId, quantity: line.restockQuantity }));
+
+        if (restockLines.length > 0) {
+          const actorUserId = params.actor.type === 'staff' ? params.actor.userId : undefined;
+          /* istanbul ignore next -- `requireStaff` runs before this route's handler. */
+          if (actorUserId === undefined) {
+            throw new InvariantViolation('completing a return requires a staff actor');
+          }
+
+          await inventory.restockForReturn({
+            storeId: params.storeId,
+            lines: restockLines,
+            actorUserId,
+            note: `return ${locked.returnNumber}`,
+          });
+        }
+
+        const closedAt = now();
+
+        const moved = await repository.transitionStatus({
+          returnId: locked.id,
+          storeId: params.storeId,
+          fromStatus: locked.status,
+          toStatus: 'completed',
+          closedAt,
+          ...(params.staffNote === undefined ? {} : { staffNote: params.staffNote }),
+        });
+        /*
+         * The CAS matched nothing under the row lock, so a concurrent completion committed
+         * first. Throwing rolls THIS transaction back — including its restock — so the units
+         * are put back exactly once however many staff click at once.
+         */
+        if (!moved) throw new ReturnNotTransitionable(locked.status, 'completed');
+
+        await repository.insertEvent({
+          returnId: locked.id,
+          storeId: params.storeId,
+          fromStatus: locked.status,
+          toStatus: 'completed',
+          actorType: 'staff',
+          actorUserId: params.actor.type === 'staff' ? (params.actor.userId ?? null) : null,
+          ...(params.staffNote === undefined ? {} : { note: params.staffNote }),
+        });
+
+        await audit.record({
+          storeId: params.storeId,
+          actor: params.actor,
+          action: RETURN_AUDIT.completed,
+          resourceType: RETURN_RESOURCE,
+          resourceId: locked.id,
+          metadata: {
+            returnNumber: locked.returnNumber,
+            fromStatus: locked.status,
+            toStatus: 'completed',
+            refundTotal: refundAmount,
+            currency: locked.currency,
+            restockedUnits: restockLines.reduce((total, line) => total + line.quantity, 0),
+            ...(raised === null
+              ? { refunded: false }
+              : { refunded: true, refundNumber: raised.refundNumber, refundMode: raised.mode }),
+          },
+        });
+
+        logger.info(
+          {
+            storeId: params.storeId,
+            returnNumber: locked.returnNumber,
+            refundTotal: refundAmount,
+            ...(raised === null ? {} : { refundNumber: raised.refundNumber }),
+          },
+          'return_completed',
+        );
+
+        return this.getStoreReturn({
+          returnNumber: params.returnNumber,
+          storeId: params.storeId,
+        });
+      });
+    },
+
+    /**
      * **Return counts by status for the store.** Increment 53. Read-only.
      *
      * Every status in `RETURN_STATUSES` appears, including the ones at zero. Zero-filling happens
@@ -691,6 +1152,22 @@ export function createReturnsService(deps: {
       return totals;
     },
 
+    /**
+     * The refunds raised for one return. Increment 59.
+     *
+     * Goes out through the same port a completion uses, so there is one definition of what a
+     * refund looks like from this module's side rather than two that could disagree. Resolves
+     * the return by number first, so a number from another store answers `404` rather than an
+     * empty list — an empty list would say "this return has no refunds", which is a different
+     * and wrong fact.
+     */
+    async refundsForReturn(params: { returnNumber: string; storeId: string }) {
+      const header = await repository.findStoreReturnByNumber(params);
+      if (!header) throw new NotFound('return');
+
+      return refunds.listForReturn({ returnId: header.id, storeId: params.storeId });
+    },
+
     /** One return in the store, whoever raised it. Staff read. */
     async getStoreReturn(params: { returnNumber: string; storeId: string }): Promise<ReturnView> {
       const header = await repository.findStoreReturnByNumber(params);
@@ -703,14 +1180,67 @@ export function createReturnsService(deps: {
       return { header, lines };
     },
 
+    /**
+     * One return, with everything an admin detail page shows. Increment 61.
+     *
+     * Four reads, fixed — header, lines, lifecycle history, refunds — and not one of them is
+     * per-row. The refunds come through the existing `ReturnRefunds` port, which Increment 59
+     * built and documented as being *"for the staff detail read"*; until now it was wired only
+     * into the completion response.
+     */
+    async getStoreReturnDetail(params: {
+      returnNumber: string;
+      storeId: string;
+    }): Promise<StaffReturnDetailView> {
+      const header = await repository.findStoreReturnDetailByNumber(params);
+      if (!header) throw new NotFound('return');
+
+      const [lines, events, refundRows] = await Promise.all([
+        repository.listReturnLines({ returnId: header.id, storeId: params.storeId }),
+        repository.listReturnEvents({ returnId: header.id, storeId: params.storeId }),
+        refunds.listForReturn({ returnId: header.id, storeId: params.storeId }),
+      ]);
+
+      /*
+       * How much of each ordered line is still returnable, computed from the SAME source the
+       * create path caps against — every quantity-consuming return on the order, not just this
+       * one. Published so staff can see "1 of 3 still returnable" without opening every other
+       * return on the order and adding up.
+       *
+       * A read. It re-uses the existing cap query and changes no decision; the create path
+       * still recomputes it under the order lock, because only a locked read is safe to write
+       * against.
+       */
+      const [consumed, ordered] = await Promise.all([
+        repository.sumReturnedQuantities({ orderId: header.orderId, storeId: params.storeId }),
+        repository.sumOrderedQuantities({ orderId: header.orderId, storeId: params.storeId }),
+      ]);
+
+      return {
+        header,
+        lines,
+        events,
+        refunds: refundRows,
+        remainingBySkuId: new Map(
+          [...ordered].map(([skuId, qty]) => [
+            skuId,
+            Math.max(qty - (consumed.get(skuId) ?? 0), 0),
+          ]),
+        ),
+      };
+    },
+
     /** The staff work queue: every return in the store, newest first, optionally by status. */
     async listStoreReturns(params: {
       storeId: string;
       status?: ReturnStatus;
+      q?: string;
+      requestedFrom?: Date;
+      requestedTo?: Date;
       limit: number;
       offset: number;
     }): Promise<{
-      items: readonly ReturnView[];
+      items: readonly StaffReturnListView[];
       total: number;
       limit: number;
       offset: number;

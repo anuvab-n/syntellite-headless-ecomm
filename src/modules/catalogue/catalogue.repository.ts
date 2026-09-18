@@ -1,13 +1,40 @@
-import { and, count, desc, eq, exists, gte, ilike, inArray, isNull, lte } from 'drizzle-orm';
+import {
+  and,
+  count,
+  desc,
+  eq,
+  exists,
+  gte,
+  ilike,
+  asc,
+  inArray,
+  isNotNull,
+  isNull,
+  ne,
+  not,
+  lte,
+  or,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import {
   product,
+  productMedia,
   productOption,
   productOptionValue,
   sku,
   skuOptionValue,
 } from '../../db/schema/catalogue.js';
+/*
+ * Increment 63. The admin product list filters by aggregate stock state, which lives here.
+ *
+ * `schema-only-in-repositories` permits a repository to name any table, and `db/schema/` is not
+ * a module. `no-cross-module-imports` would forbid importing `modules/inventory` — its service,
+ * its repository or even one of its types — and this imports none of them.
+ */
+import { stockItem } from '../../db/schema/inventory.js';
 import { executor, type Executor } from '../../db/transaction.js';
 
 /**
@@ -105,6 +132,8 @@ export type EditableSkuFields = {
   /** Already normalised to the column scale by the service. */
   price?: string;
   isActive?: boolean;
+  /** `null` clears the reorder point back to never-warn; absent leaves it untouched. */
+  lowStockThreshold?: number | null;
 };
 
 export type InsertSkuValues = {
@@ -116,6 +145,8 @@ export type InsertSkuValues = {
   /** Already normalised to the column's scale by the service. */
   price: string;
   isActive: boolean;
+  /** `null` when the merchant configured no reorder point. Never defaulted to zero. */
+  lowStockThreshold: number | null;
 };
 
 /**
@@ -132,6 +163,7 @@ export type SkuRecord = {
   readonly name: string;
   readonly price: string;
   readonly isActive: boolean;
+  readonly lowStockThreshold: number | null;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 };
@@ -143,12 +175,92 @@ const SKU_COLUMNS = {
   name: sku.name,
   price: sku.price,
   isActive: sku.isActive,
+  lowStockThreshold: sku.lowStockThreshold,
   createdAt: sku.createdAt,
   updatedAt: sku.updatedAt,
 } as const;
 
 /** The partial unique index on `(store_id, code) WHERE deleted_at IS NULL`. */
 export const SKU_CODE_UNIQUE_CONSTRAINT = 'uq_sku_code_active';
+
+/* ── Media. Increment 58. ────────────────────────────────────────────────── */
+
+/**
+ * One image as the rest of the system sees it.
+ *
+ * `storeId` and `deletedAt` are absent for the same reasons they are absent from every other
+ * record here. `productId` and `skuId` ARE present: both are relationships a caller legitimately
+ * needs in order to group a gallery and to show a variant shot beside its SKU.
+ *
+ * `storageKey` is the object's key in the bucket, not a URL — see the column's own note. The
+ * response mapper composes a URL from configuration and this key, so a change of delivery host
+ * is a configuration change rather than a data migration.
+ */
+export type MediaRecord = {
+  readonly id: string;
+  readonly productId: string;
+  readonly skuId: string | null;
+  readonly storageKey: string;
+  readonly contentType: string;
+  readonly altText: string;
+  readonly width: number | null;
+  readonly height: number | null;
+  readonly byteSize: number | null;
+  readonly position: number;
+  readonly isPrimary: boolean;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+};
+
+const MEDIA_COLUMNS = {
+  id: productMedia.id,
+  productId: productMedia.productId,
+  skuId: productMedia.skuId,
+  storageKey: productMedia.storageKey,
+  contentType: productMedia.contentType,
+  altText: productMedia.altText,
+  width: productMedia.width,
+  height: productMedia.height,
+  byteSize: productMedia.byteSize,
+  position: productMedia.position,
+  isPrimary: productMedia.isPrimary,
+  createdAt: productMedia.createdAt,
+  updatedAt: productMedia.updatedAt,
+} as const;
+
+export type InsertMediaValues = {
+  id: string;
+  storeId: string;
+  productId: string;
+  skuId: string | null;
+  storageKey: string;
+  contentType: string;
+  altText: string;
+  width: number | null;
+  height: number | null;
+  byteSize: number | null;
+  position: number;
+  isPrimary: boolean;
+};
+
+/**
+ * The media columns an edit may write.
+ *
+ * Same discipline as every other `Editable…` here: NOT a `Partial<Insert…>`, which would admit
+ * `storeId`, `productId`, `skuId` and `storageKey` and let an edit repoint an image at another
+ * tenant's product or at a different object entirely.
+ */
+export type EditableMediaFields = {
+  altText?: string;
+  position?: number;
+  isPrimary?: boolean;
+};
+
+/** The partial unique index on `(product_id) WHERE is_primary AND deleted_at IS NULL`. */
+export const MEDIA_PRIMARY_UNIQUE_CONSTRAINT = 'uq_product_media_primary';
+
+/** The partial unique index on `(store_id, storage_key) WHERE deleted_at IS NULL`. */
+export const MEDIA_KEY_UNIQUE_CONSTRAINT = 'uq_product_media_key';
 
 /* ── Options ─────────────────────────────────────────────────────────────── */
 
@@ -352,6 +464,118 @@ export function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (character) => `\\${character}`);
 }
 
+/**
+ * The filters the STAFF product list accepts. Both optional. Increment 58.
+ *
+ * Deliberately narrower than the storefront's: no price band, because a merchant's list is a
+ * work queue rather than a shopping surface, and the price of a product with several SKUs is not
+ * a single number to filter on.
+ */
+export type AdminProductFilters = {
+  readonly status?: string;
+  readonly q?: string;
+  /** Increment 63. Aggregated across the product's live SKUs — see `hasStockState`. */
+  readonly stockState?: ProductStockStateFilter;
+};
+
+/**
+ * The stock states the admin product list may filter by. Increment 63.
+ *
+ * Exported so the DTO enumerates exactly what the predicate implements.
+ */
+export const PRODUCT_STOCK_STATE_FILTERS = ['in_stock', 'low_stock', 'out_of_stock'] as const;
+
+export type ProductStockStateFilter = (typeof PRODUCT_STOCK_STATE_FILTERS)[number];
+
+/**
+ * "Does this product have a live SKU in the given stock state?" Increment 63.
+ *
+ * An `EXISTS`, never a join. A product has MANY SKUs, so joining `stock_item` to filter would
+ * emit one product row per matching SKU — duplicating the page and inflating the total. That is
+ * the same reason `hasSellableSku` above is an `EXISTS`, and the reason is stated there too.
+ *
+ * The per-SKU predicates are the inventory module's own, restated here because
+ * `no-cross-module-imports` forbids importing them and `schema-only-in-repositories` permits
+ * this file to name the table. A test asserts the two agree, so the duplication cannot drift
+ * silently:
+ *
+ *  - out of stock — `available <= 0`
+ *  - low          — `available > 0 AND threshold IS NOT NULL AND available <= threshold`
+ *  - in stock     — `available > 0`
+ *
+ * **`out_of_stock` is a NOT EXISTS over the in-stock predicate**, not an EXISTS over the
+ * out-of-stock one. A product with one sold-out variant and one in stock is not out of stock,
+ * and the naive form would list it as though it were. A product with no live SKUs at all is
+ * also out of stock, which the NOT EXISTS gives for free and an EXISTS could never express.
+ *
+ * `available` is the GENERATED column, so nothing is recomputed here.
+ */
+function hasStockState(ex: Executor, storeId: string, state: ProductStockStateFilter) {
+  const liveSkuOfProduct = and(
+    eq(sku.productId, product.id),
+    eq(sku.storeId, storeId),
+    isNull(sku.deletedAt),
+  );
+
+  const withAvailability = (extra: SQL | undefined) =>
+    exists(
+      ex
+        .select({ one: sku.id })
+        .from(sku)
+        .innerJoin(stockItem, eq(stockItem.skuId, sku.id))
+        .where(and(liveSkuOfProduct, eq(stockItem.storeId, storeId), extra)),
+    );
+
+  const inStock = withAvailability(sql`${stockItem.available} > 0`);
+
+  if (state === 'in_stock') return inStock;
+  if (state === 'out_of_stock') return not(inStock);
+
+  return withAvailability(
+    and(
+      isNotNull(sku.lowStockThreshold),
+      sql`${stockItem.available} > 0`,
+      sql`${stockItem.available} <= ${sku.lowStockThreshold}`,
+    ),
+  );
+}
+
+/**
+ * The staff list's WHERE clause: tenancy and liveness, then whichever filters were supplied.
+ *
+ * A free function rather than a closure inside the factory because it takes everything it needs
+ * and captures nothing — which is what makes it readable as the one place tenancy is applied.
+ * The first two conjuncts are not optional, and every filter below can only narrow, so no
+ * combination of query parameters reaches past one tenant.
+ *
+ * The search is a case-insensitive substring over `name` and `slug` — the two fields a merchant
+ * has in hand when looking for their own product. Description is deliberately excluded: it is
+ * long-form prose, and matching it turns a lookup into a full-text search this system has no
+ * index for. Wildcards are escaped by `escapeLikePattern`, so a typed `%` means a percent sign.
+ */
+function adminProductPredicate(
+  ex: Executor,
+  storeId: string,
+  filters: AdminProductFilters,
+): SQL | undefined {
+  const clauses: SQL[] = [eq(product.storeId, storeId), isNull(product.deletedAt)];
+
+  if (filters.status !== undefined) clauses.push(eq(product.status, filters.status));
+
+  if (filters.q !== undefined && filters.q.length > 0) {
+    const term = `%${escapeLikePattern(filters.q)}%`;
+    const match = or(ilike(product.name, term), ilike(product.slug, term));
+    if (match) clauses.push(match);
+  }
+
+  /* Increment 63. An EXISTS, so a multi-SKU product stays one row. */
+  if (filters.stockState !== undefined) {
+    clauses.push(hasStockState(ex, storeId, filters.stockState));
+  }
+
+  return and(...clauses);
+}
+
 export function createCatalogueRepository(deps: { db: Database }) {
   const { db } = deps;
 
@@ -514,12 +738,38 @@ export function createCatalogueRepository(deps: { db: Database }) {
      * `(store_id, created_at DESC, id DESC)` index is the obvious optimisation once there is
      * evidence it is needed — see `docs/DECISIONS.md` §28.
      */
+    /**
+     * **How many products this store can currently sell.** Increment 57. Read-only.
+     *
+     * `status = 'active'` AND not soft-deleted — the approved definition of the dashboard's
+     * "Total Products" tile. `draft` and `archived` are excluded on purpose: a draft is a listing
+     * a merchant has not finished, and an archived one is a listing they have withdrawn. Counting
+     * either would make the tile disagree with what a shopper can actually buy, which is the only
+     * reading of "products" a storefront dashboard can defend.
+     *
+     * Served by `ix_product_store_status` on `(store_id, status)`.
+     */
+    async countActiveForStore(params: { storeId: string }): Promise<number> {
+      const [row] = await executor(db)
+        .select({ total: count() })
+        .from(product)
+        .where(
+          and(
+            eq(product.storeId, params.storeId),
+            eq(product.status, PUBLIC_PRODUCT_STATUS),
+            isNull(product.deletedAt),
+          ),
+        );
+      return Number(row?.total ?? 0);
+    },
+
     async listForStore(params: {
       storeId: string;
       limit: number;
       offset: number;
+      filters?: AdminProductFilters;
     }): Promise<{ items: ProductRecord[]; total: number }> {
-      const visible = and(eq(product.storeId, params.storeId), isNull(product.deletedAt));
+      const visible = adminProductPredicate(executor(db), params.storeId, params.filters ?? {});
 
       const [items, [counted]] = await Promise.all([
         executor(db)
@@ -533,6 +783,102 @@ export function createCatalogueRepository(deps: { db: Database }) {
       ]);
 
       return { items, total: Number(counted?.total ?? 0) };
+    },
+
+    /**
+     * **Resolve several slugs to live products, in one statement.** Increment 58.
+     *
+     * The bulk action's first stage. One `IN` rather than a lookup per slug — a selection of
+     * fifty products must not cost fifty round trips, and the caller needs the whole resolution
+     * before it writes anything so it can refuse the batch as a unit.
+     *
+     * Store-scoped and soft-delete aware, so an unknown slug, another tenant's slug and a
+     * deleted one are all simply ABSENT from the result. The caller reports them identically,
+     * which is what stops the response being usable to probe a neighbouring store's catalogue.
+     */
+    async findProductsBySlugs(params: {
+      storeId: string;
+      slugs: readonly string[];
+    }): Promise<{ id: string; slug: string; status: string }[]> {
+      if (params.slugs.length === 0) return [];
+
+      return executor(db)
+        .select({ id: product.id, slug: product.slug, status: product.status })
+        .from(product)
+        .where(
+          and(
+            eq(product.storeId, params.storeId),
+            isNull(product.deletedAt),
+            inArray(product.slug, [...params.slugs]),
+          ),
+        );
+    },
+
+    /**
+     * **Move several products to a new lifecycle status, in one statement.** Increment 58.
+     *
+     * The `from` predicate is in the UPDATE, not merely checked beforehand: a product whose
+     * status changed between the caller's resolve and this write simply does not match, so a
+     * concurrent publish cannot be overwritten by a stale archive. The returned rows are the
+     * ones that actually moved, which is what the caller reports as affected.
+     *
+     * Store-scoped and soft-delete aware, like every other write in this file.
+     */
+    async setStatusForProducts(params: {
+      storeId: string;
+      productIds: readonly string[];
+      from: readonly string[];
+      to: string;
+      at: Date;
+      /*
+       * The FULL record, not `{ id, slug, status }`.
+       *
+       * The service records each moved product through `recordProductChange`, which builds the
+       * same event payload the single-product route builds — and that payload names the product,
+       * not only its id. Returning a narrow row here would have forced either a second read per
+       * product or a second, thinner event shape for the same fact.
+       */
+    }): Promise<ProductRecord[]> {
+      if (params.productIds.length === 0) return [];
+
+      return executor(db)
+        .update(product)
+        .set({ status: params.to, updatedAt: params.at })
+        .where(
+          and(
+            eq(product.storeId, params.storeId),
+            isNull(product.deletedAt),
+            inArray(product.id, [...params.productIds]),
+            inArray(product.status, [...params.from]),
+          ),
+        )
+        .returning(RECORD_COLUMNS);
+    },
+
+    /**
+     * **How many products the store has in each lifecycle status.** Increment 58.
+     *
+     * The list screen's tabs. Tenancy and liveness ONLY — deliberately not the request's `q` or
+     * `status`. These counts tell an operator how many rows switching to a tab would show, and a
+     * count that moved as they typed could not answer that question. `pagination.total` is the
+     * filtered figure; this is the unfiltered one, and the two differing is correct.
+     *
+     * Soft-deleted products are excluded, exactly as they are from the list itself.
+     *
+     * One grouped scan over one store, served by `ix_product_store_status`. Only the statuses
+     * that occur come back; the caller zero-fills from the published vocabulary, because which
+     * statuses exist is domain knowledge rather than a fact about the rows.
+     */
+    async countByStatusForStore(params: {
+      storeId: string;
+    }): Promise<{ status: string; count: number }[]> {
+      const rows = await executor(db)
+        .select({ status: product.status, count: count() })
+        .from(product)
+        .where(and(eq(product.storeId, params.storeId), isNull(product.deletedAt)))
+        .groupBy(product.status);
+
+      return rows.map((row) => ({ status: row.status, count: Number(row.count) }));
     },
     /**
      * Update a product's editable data fields.
@@ -719,6 +1065,217 @@ export function createCatalogueRepository(deps: { db: Database }) {
       const [row] = await executor(db).insert(sku).values(values).returning(SKU_COLUMNS);
       // Drizzle returns exactly one row for a single-row insert; a failure throws.
       return row!;
+    },
+
+    /* ── Media. Increment 58. ──────────────────────────────────────────────── */
+
+    /**
+     * One product's live imagery, in the merchant's order.
+     *
+     * Store-scoped in its own right, not merely via the product the caller resolved: this method
+     * is safe to call with any product id, which is what keeps the predicate from being lost the
+     * day a second caller appears.
+     *
+     * `position` then `id` — the tiebreaker is load-bearing. Two images a merchant never
+     * reordered both sit at position 0, and without a second key they would swap places between
+     * requests, which reads as a bug in the gallery.
+     *
+     * Served by `ix_product_media_product`.
+     */
+    async listMediaForProduct(params: {
+      storeId: string;
+      productId: string;
+    }): Promise<MediaRecord[]> {
+      return executor(db)
+        .select(MEDIA_COLUMNS)
+        .from(productMedia)
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            eq(productMedia.productId, params.productId),
+            isNull(productMedia.deletedAt),
+          ),
+        )
+        .orderBy(asc(productMedia.position), asc(productMedia.id));
+    },
+
+    /**
+     * Live imagery for SEVERAL products, keyed by product id — ONE statement.
+     *
+     * The list read's batch loader, the same shape `listSkusForProducts` uses and for the same
+     * reason: a page of twenty products must not cost twenty gallery queries.
+     */
+    async listMediaForProducts(params: {
+      storeId: string;
+      productIds: readonly string[];
+    }): Promise<MediaRecord[]> {
+      if (params.productIds.length === 0) return [];
+
+      return executor(db)
+        .select(MEDIA_COLUMNS)
+        .from(productMedia)
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            inArray(productMedia.productId, [...params.productIds]),
+            isNull(productMedia.deletedAt),
+          ),
+        )
+        .orderBy(asc(productMedia.position), asc(productMedia.id));
+    },
+
+    /**
+     * Merchant codes for a set of SKU ids, in ONE statement.
+     *
+     * The media mapper publishes a SKU's CODE rather than its id, and a gallery can reference
+     * several variants; resolving them one at a time would be an N+1 hidden inside a response
+     * mapper. Store-scoped, so an id from another tenant simply does not come back.
+     *
+     * Deleted SKUs are included deliberately: an image attached to a SKU that was later removed
+     * still belongs to a variant that existed, and blanking the code would make the row look
+     * like a product-level image it never was.
+     */
+    async findSkuCodesByIds(params: {
+      storeId: string;
+      skuIds: readonly string[];
+    }): Promise<{ id: string; code: string }[]> {
+      if (params.skuIds.length === 0) return [];
+
+      return executor(db)
+        .select({ id: sku.id, code: sku.code })
+        .from(sku)
+        .where(and(eq(sku.storeId, params.storeId), inArray(sku.id, [...params.skuIds])));
+    },
+
+    /** One image by id, store-scoped. A deleted or foreign row is `undefined`. */
+    async findMediaById(params: {
+      storeId: string;
+      mediaId: string;
+    }): Promise<MediaRecord | undefined> {
+      const [row] = await executor(db)
+        .select(MEDIA_COLUMNS)
+        .from(productMedia)
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            eq(productMedia.id, params.mediaId),
+            isNull(productMedia.deletedAt),
+          ),
+        )
+        .limit(1);
+      return row;
+    },
+
+    async insertMedia(values: InsertMediaValues): Promise<MediaRecord> {
+      const [row] = await executor(db).insert(productMedia).values(values).returning(MEDIA_COLUMNS);
+      if (!row) throw new Error('insert returned no row');
+      return row;
+    },
+
+    /**
+     * Update an image's editable fields. ONE store-scoped statement.
+     *
+     * `store_id`, `id` and `deleted_at IS NULL` are all in the predicate, so a cross-store or
+     * deleted image matches nothing and the service reports it as not found rather than
+     * discovering the mismatch afterwards.
+     */
+    async updateMedia(params: {
+      storeId: string;
+      mediaId: string;
+      fields: EditableMediaFields;
+      at: Date;
+    }): Promise<MediaRecord | undefined> {
+      const [row] = await executor(db)
+        .update(productMedia)
+        .set({ ...params.fields, updatedAt: params.at })
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            eq(productMedia.id, params.mediaId),
+            isNull(productMedia.deletedAt),
+          ),
+        )
+        .returning(MEDIA_COLUMNS);
+      return row;
+    },
+
+    /**
+     * Clear the primary flag from a product's other images.
+     *
+     * Run inside the same transaction as the promotion that follows it, because
+     * `uq_product_media_primary` would otherwise refuse the second primary. Excluding the row
+     * being promoted keeps the statement idempotent: re-promoting the current primary clears
+     * nothing and then sets what is already set.
+     */
+    async clearPrimaryMedia(params: {
+      storeId: string;
+      productId: string;
+      exceptMediaId: string;
+      at: Date;
+    }): Promise<void> {
+      await executor(db)
+        .update(productMedia)
+        .set({ isPrimary: false, updatedAt: params.at })
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            eq(productMedia.productId, params.productId),
+            eq(productMedia.isPrimary, true),
+            ne(productMedia.id, params.exceptMediaId),
+            isNull(productMedia.deletedAt),
+          ),
+        );
+    },
+
+    /**
+     * Soft-delete one image.
+     *
+     * The row survives so a future sweeper can reconcile the bucket against the catalogue — a
+     * hard delete would strand the object with nothing left to say it should be reclaimed.
+     */
+    async softDeleteMedia(params: {
+      storeId: string;
+      mediaId: string;
+      at: Date;
+    }): Promise<MediaRecord | undefined> {
+      const [row] = await executor(db)
+        .update(productMedia)
+        .set({ deletedAt: params.at, updatedAt: params.at, isPrimary: false })
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            eq(productMedia.id, params.mediaId),
+            isNull(productMedia.deletedAt),
+          ),
+        )
+        .returning(MEDIA_COLUMNS);
+      return row;
+    },
+
+    /**
+     * Cascade a product's imagery when the product itself is deleted.
+     *
+     * Same shape as the SKU and option cascades, and run inside the same transaction: a product
+     * whose images outlived it would keep its storage objects referenced by rows nothing can
+     * reach.
+     */
+    async softDeleteMediaForProduct(params: {
+      storeId: string;
+      productId: string;
+      at: Date;
+    }): Promise<number> {
+      const rows = await executor(db)
+        .update(productMedia)
+        .set({ deletedAt: params.at, updatedAt: params.at, isPrimary: false })
+        .where(
+          and(
+            eq(productMedia.storeId, params.storeId),
+            eq(productMedia.productId, params.productId),
+            isNull(productMedia.deletedAt),
+          ),
+        )
+        .returning({ id: productMedia.id });
+      return rows.length;
     },
 
     /**

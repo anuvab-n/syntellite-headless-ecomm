@@ -5,6 +5,7 @@ import { boundedIntParam, type PaginationResponse } from '../../shared/paginatio
 import {
   MAX_PROMOTION_PERCENT,
   PROMOTION_DISCOUNT_TYPES,
+  PROMOTION_STATUS_FILTERS,
   type PromotionRecord,
 } from './promotions.repository.js';
 
@@ -152,6 +153,20 @@ export const ListPromotionsQuerySchema = z.strictObject({
     default: PROMOTION_LIST_DEFAULT_LIMIT,
   }),
   offset: boundedIntParam({ min: 0, default: 0 }),
+
+  /**
+   * The operator's search box: promotion code or name, case-insensitive substring. Increment 63.
+   */
+  q: z.string().trim().min(1).max(300).optional(),
+
+  /**
+   * Lifecycle state, DERIVED from `isActive`, `startsAt` and `endsAt`. Increment 63.
+   *
+   * The enum comes from the repository so the API accepts exactly what the predicates implement.
+   * There is no status COLUMN and this increment does not add one: a stored status would be a
+   * second source of truth the customer-facing usability predicate could contradict.
+   */
+  status: z.enum(PROMOTION_STATUS_FILTERS).optional(),
 });
 
 export type ListPromotionsQuery = z.infer<typeof ListPromotionsQuerySchema>;

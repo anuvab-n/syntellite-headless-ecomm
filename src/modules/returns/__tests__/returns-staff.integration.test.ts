@@ -804,4 +804,394 @@ describe('returns — staff approval and rejection (integration)', () => {
       expect(await snapshot()).toEqual(before);
     });
   });
+
+  /* ══ 6. The admin queue: search, dates, projection. Increment 61. ══════ */
+
+  describe('the admin queue', () => {
+    const list = (query = '') => api().get(`/api/v1/admin/returns${query}`).set(asStaff());
+
+    const returnRow = async (returnNumber: string) => {
+      const [row] = await db()
+        .select()
+        .from(returnRequest)
+        .where(eq(returnRequest.returnNumber, returnNumber));
+      return row!;
+    };
+
+    it('projects the customer onto every row, with no internal ids', async () => {
+      const ctx = await givenRequestedReturn();
+
+      const response = await list();
+      expect(response.status).toBe(200);
+
+      const row = (response.body.returns as Record<string, unknown>[]).find(
+        (r) => r['returnNumber'] === ctx.returnNumber,
+      );
+      expect(row).toBeDefined();
+      expect(row!['customer']).toEqual({
+        email: expect.stringContaining('@example.com'),
+        firstName: 'A',
+        lastName: 'B',
+      });
+
+      expect(JSON.stringify(row)).not.toContain(ctx.orderId);
+      expect(JSON.stringify(row)).not.toContain(ctx.skuId);
+    });
+
+    it('orders deterministically by requestedAt then returnNumber, newest first', async () => {
+      await givenRequestedReturn();
+      await givenRequestedReturn();
+
+      const rows = (await list('?limit=50')).body.returns as {
+        requestedAt: string;
+        returnNumber: string;
+      }[];
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+
+      const sorted = [...rows].sort((a, b) =>
+        a.requestedAt === b.requestedAt
+          ? b.returnNumber.localeCompare(a.returnNumber)
+          : b.requestedAt.localeCompare(a.requestedAt),
+      );
+      expect(rows).toEqual(sorted);
+    });
+
+    it('paginates with a total that agrees with the filter', async () => {
+      await givenRequestedReturn();
+      await givenRequestedReturn();
+
+      const page = (await list('?limit=1&offset=0')).body;
+      expect(page.returns).toHaveLength(1);
+      expect(page.limit).toBe(1);
+      expect(page.offset).toBe(0);
+      expect(page.total).toBeGreaterThanOrEqual(2);
+
+      const second = (await list('?limit=1&offset=1')).body;
+      expect(second.total).toBe(page.total);
+      expect(second.returns[0].returnNumber).not.toBe(page.returns[0].returnNumber);
+    });
+
+    it('filters by status', async () => {
+      const ctx = await givenRequestedReturn();
+      expect(
+        (
+          await api()
+            .post(`/api/v1/admin/returns/${ctx.returnNumber}/approve`)
+            .set(asStaff())
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      const approved = (await list('?status=approved&limit=50')).body.returns as {
+        returnNumber: string;
+        status: string;
+      }[];
+      expect(approved.every((r) => r.status === 'approved')).toBe(true);
+      expect(approved.some((r) => r.returnNumber === ctx.returnNumber)).toBe(true);
+
+      const requested = (await list('?status=requested&limit=50')).body.returns as {
+        returnNumber: string;
+      }[];
+      expect(requested.some((r) => r.returnNumber === ctx.returnNumber)).toBe(false);
+    });
+
+    it('finds a return by its exact number, and by a substring of it', async () => {
+      const ctx = await givenRequestedReturn();
+
+      const exact = (await list(`?q=${ctx.returnNumber}`)).body.returns as {
+        returnNumber: string;
+      }[];
+      expect(exact).toHaveLength(1);
+      expect(exact[0]!.returnNumber).toBe(ctx.returnNumber);
+
+      /* Contains, not prefix: the distinctive tail alone finds it. */
+      const partial = (await list(`?q=${ctx.returnNumber.slice(-6)}`)).body.returns as {
+        returnNumber: string;
+      }[];
+      expect(partial.some((r) => r.returnNumber === ctx.returnNumber)).toBe(true);
+    });
+
+    it('finds a return by its order number', async () => {
+      const ctx = await givenRequestedReturn();
+
+      const rows = (await list(`?q=${ctx.orderNumber}`)).body.returns as {
+        returnNumber: string;
+        orderNumber: string;
+      }[];
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.orderNumber).toBe(ctx.orderNumber);
+    });
+
+    it('finds a return by the customer email', async () => {
+      const ctx = await givenRequestedReturn();
+      const detail = await api().get(`/api/v1/admin/returns/${ctx.returnNumber}`).set(asStaff());
+      const email = detail.body.return.customer.email as string;
+
+      const rows = (await list(`?q=${encodeURIComponent(email)}`)).body.returns as {
+        returnNumber: string;
+      }[];
+      expect(rows.some((r) => r.returnNumber === ctx.returnNumber)).toBe(true);
+    });
+
+    it('finds a return by a SKU code on one of its lines, without duplicating the row', async () => {
+      const ctx = await givenRequestedReturn();
+
+      const body = (await list(`?q=${ctx.skuCode}&limit=50`)).body;
+      const matching = (body.returns as { returnNumber: string }[]).filter(
+        (r) => r.returnNumber === ctx.returnNumber,
+      );
+      /*
+       * EXACTLY one row. The SKU arm is an EXISTS rather than a join for this reason: a join
+       * would emit one row per matching line and inflate both the page and the total.
+       */
+      expect(matching).toHaveLength(1);
+      expect(body.total).toBe((body.returns as unknown[]).length);
+    });
+
+    it('treats LIKE wildcards in the search term as literal characters', async () => {
+      await givenRequestedReturn();
+
+      /* An unescaped `%` would match every return in the store. */
+      expect((await list('?q=%25&limit=50')).body.returns).toEqual([]);
+      expect((await list('?q=_&limit=50')).body.returns).toEqual([]);
+    });
+
+    it('returns an empty page rather than an error when nothing matches', async () => {
+      const body = (await list('?q=NO-SUCH-RETURN-ANYWHERE')).body;
+      expect(body.returns).toEqual([]);
+      expect(body.total).toBe(0);
+    });
+
+    it('filters by requestedFrom', async () => {
+      const ctx = await givenRequestedReturn();
+      const row = await returnRow(ctx.returnNumber);
+
+      const after = new Date(row.requestedAt.getTime() + 1000).toISOString();
+      const excluded = (await list(`?requestedFrom=${encodeURIComponent(after)}&limit=50`)).body
+        .returns as { returnNumber: string }[];
+      expect(excluded.some((r) => r.returnNumber === ctx.returnNumber)).toBe(false);
+
+      const at = row.requestedAt.toISOString();
+      const included = (await list(`?requestedFrom=${encodeURIComponent(at)}&limit=50`)).body
+        .returns as { returnNumber: string }[];
+      expect(included.some((r) => r.returnNumber === ctx.returnNumber)).toBe(true);
+    });
+
+    it('includes the whole millisecond named by requestedTo', async () => {
+      const ctx = await givenRequestedReturn();
+      const row = await returnRow(ctx.returnNumber);
+
+      /*
+       * The bound is the return's OWN published timestamp, which `toISOString()` truncates to
+       * milliseconds. A plain `<=` would drop the row whenever the stored microseconds are
+       * non-zero — the exact bug `exclusiveEndOfMillisecond` exists to prevent, and the reason
+       * this asserts against the value a client would copy off the response.
+       */
+      const bound = row.requestedAt.toISOString();
+      const rows = (await list(`?requestedTo=${encodeURIComponent(bound)}&limit=50`)).body
+        .returns as { returnNumber: string }[];
+      expect(rows.some((r) => r.returnNumber === ctx.returnNumber)).toBe(true);
+    });
+
+    it('excludes a return one millisecond before its own requestedAt', async () => {
+      const ctx = await givenRequestedReturn();
+      const row = await returnRow(ctx.returnNumber);
+
+      const before = new Date(row.requestedAt.getTime() - 1).toISOString();
+      const rows = (await list(`?requestedTo=${encodeURIComponent(before)}&limit=50`)).body
+        .returns as { returnNumber: string }[];
+      expect(rows.some((r) => r.returnNumber === ctx.returnNumber)).toBe(false);
+    });
+
+    it('combines a date window with a status filter', async () => {
+      const ctx = await givenRequestedReturn();
+      const row = await returnRow(ctx.returnNumber);
+      const at = encodeURIComponent(row.requestedAt.toISOString());
+
+      const rows = (await list(`?status=requested&requestedFrom=${at}&requestedTo=${at}&limit=50`))
+        .body.returns as { returnNumber: string }[];
+      expect(rows.some((r) => r.returnNumber === ctx.returnNumber)).toBe(true);
+    });
+
+    it('rejects an unknown query field', async () => {
+      expect((await list('?storeId=whatever')).status).toBe(400);
+      expect((await list('?sort=asc')).status).toBe(400);
+    });
+
+    it('rejects a malformed date and an out-of-range search term', async () => {
+      /* A date-only bound is refused rather than silently widened into a timezone. */
+      expect((await list('?requestedFrom=2026-09-01')).status).toBe(400);
+      expect((await list('?requestedTo=not-a-date')).status).toBe(400);
+      expect((await list(`?q=${'x'.repeat(321)}`)).status).toBe(400);
+      expect((await list('?q=')).status).toBe(400);
+    });
+  });
+
+  /* ══ 7. The admin detail. Increment 61. ════════════════════════════════ */
+
+  describe('the admin detail', () => {
+    const detailOf = (returnNumber: string) =>
+      api().get(`/api/v1/admin/returns/${returnNumber}`).set(asStaff());
+
+    const returnRow = async (returnNumber: string) => {
+      const [row] = await db()
+        .select()
+        .from(returnRequest)
+        .where(eq(returnRequest.returnNumber, returnNumber));
+      return row!;
+    };
+
+    it('publishes the customer, the order snapshot address and the delivery fact', async () => {
+      const ctx = await givenRequestedReturn();
+
+      const response = await detailOf(ctx.returnNumber);
+      expect(response.status).toBe(200);
+      const body = response.body.return;
+
+      expect(body.customer).toEqual({
+        email: expect.stringContaining('@example.com'),
+        firstName: 'A',
+        lastName: 'B',
+      });
+
+      const [orderRow] = await db().select().from(order).where(eq(order.id, ctx.orderId));
+      expect(body.shippingAddress).toEqual({
+        recipientName: orderRow!.shipRecipientName,
+        phone: orderRow!.shipPhone,
+        line1: orderRow!.shipLine1,
+        line2: orderRow!.shipLine2,
+        landmark: orderRow!.shipLandmark,
+        city: orderRow!.shipCity,
+        state: orderRow!.shipState,
+        postalCode: orderRow!.shipPostalCode,
+        countryCode: orderRow!.shipCountryCode,
+      });
+
+      expect(body.deliveredAt).toEqual(expect.any(String));
+      expect(JSON.stringify(body)).not.toContain(ctx.orderId);
+      expect(JSON.stringify(body)).not.toContain(ctx.skuId);
+    });
+
+    it('reads the order snapshot, so a later edit to it is what moves the address', async () => {
+      const ctx = await givenRequestedReturn();
+      const before = (await detailOf(ctx.returnNumber)).body.return.shippingAddress;
+
+      await db().update(order).set({ shipCity: 'SomewhereElse' }).where(eq(order.id, ctx.orderId));
+
+      const after = (await detailOf(ctx.returnNumber)).body.return.shippingAddress;
+      expect(after.city).toBe('SomewhereElse');
+      expect(before.city).not.toBe(after.city);
+    });
+
+    it('publishes the append-only lifecycle timeline, oldest first', async () => {
+      const ctx = await givenRequestedReturn();
+      await api().post(`/api/v1/admin/returns/${ctx.returnNumber}/approve`).set(asStaff()).send({});
+      await api().post(`/api/v1/admin/returns/${ctx.returnNumber}/receive`).set(asStaff()).send({});
+
+      const timeline = (await detailOf(ctx.returnNumber)).body.return.timeline as {
+        fromStatus: string | null;
+        toStatus: string;
+        actorType: string;
+        at: string;
+      }[];
+
+      expect(timeline.map((e) => e.toStatus)).toEqual(['requested', 'approved', 'received']);
+      expect(timeline[0]!.fromStatus).toBeNull();
+      expect(timeline[1]!.fromStatus).toBe('requested');
+      expect(timeline[1]!.actorType).toBe('staff');
+
+      const times = timeline.map((e) => Date.parse(e.at));
+      expect([...times].sort((a, b) => a - b)).toEqual(times);
+
+      /* Actor USER ids are never published on this read. */
+      expect(JSON.stringify(timeline)).not.toContain(ctx.staffId);
+    });
+
+    it('agrees exactly with the stored return_event rows', async () => {
+      const ctx = await givenRequestedReturn();
+      await api().post(`/api/v1/admin/returns/${ctx.returnNumber}/approve`).set(asStaff()).send({});
+
+      const row = await returnRow(ctx.returnNumber);
+      const stored = await db().select().from(returnEvent).where(eq(returnEvent.returnId, row.id));
+
+      const timeline = (await detailOf(ctx.returnNumber)).body.return.timeline as unknown[];
+      expect(timeline).toHaveLength(stored.length);
+    });
+
+    it('publishes the product name, inspection counts and remaining returnable quantity', async () => {
+      /* Three ordered, one returned: two units must still be returnable. */
+      const ctx = await givenRequestedReturn(1);
+
+      const lines = (await detailOf(ctx.returnNumber)).body.return.lines as {
+        skuCode: string;
+        productName: string;
+        quantity: number;
+        restockQuantity: number;
+        writeOffQuantity: number;
+        remainingReturnable: number;
+      }[];
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0]!.skuCode).toBe(ctx.skuCode);
+      expect(lines[0]!.productName.length).toBeGreaterThan(0);
+      expect(lines[0]!.quantity).toBe(1);
+      expect(lines[0]!.restockQuantity).toBe(0);
+      expect(lines[0]!.writeOffQuantity).toBe(0);
+      expect(lines[0]!.remainingReturnable).toBe(2);
+    });
+
+    it('keeps money as strings, never as numbers', async () => {
+      const ctx = await givenRequestedReturn();
+      const body = (await detailOf(ctx.returnNumber)).body.return;
+
+      for (const field of ['refundTotal', 'refundTaxableValue', 'refundTaxTotal']) {
+        expect(typeof body[field]).toBe('string');
+        expect(body[field]).toMatch(/^\d+\.\d{4}$/);
+      }
+      expect(typeof body.lines[0].refundTotal).toBe('string');
+    });
+
+    it('publishes an empty refunds array before a refund is ever raised', async () => {
+      const ctx = await givenRequestedReturn();
+      expect((await detailOf(ctx.returnNumber)).body.return.refunds).toEqual([]);
+    });
+
+    it('404s an unknown return number', async () => {
+      expect((await detailOf('RET-20260101-ZZZZZZ')).status).toBe(404);
+    });
+  });
+
+  /* ══ 8. The new surfaces leak no tenancy. Increment 61. ════════════════ */
+
+  describe('tenancy on the new surfaces', () => {
+    /*
+     * Cross-TENANT search is asserted in `returns-repository.integration.test.ts`, where two
+     * stores can be built directly — the container's store-resolver cache makes a second tenant
+     * unreachable over HTTP in this harness, which is the same reason the existing store-scoping
+     * test above stops where it does.
+     *
+     * What IS assertable here: no tenancy identifier reaches a response.
+     */
+    it('publishes no store or user identifier on the queue or the detail', async () => {
+      const ctx = await givenRequestedReturn();
+
+      const row = (
+        (await api().get('/api/v1/admin/returns?limit=50').set(asStaff())).body.returns as Record<
+          string,
+          unknown
+        >[]
+      ).find((r) => r['returnNumber'] === ctx.returnNumber);
+      expect(row).toBeDefined();
+      expect(row).not.toHaveProperty('storeId');
+      expect(row).not.toHaveProperty('userId');
+      expect(row!['customer']).not.toHaveProperty('id');
+
+      const detail = (await api().get(`/api/v1/admin/returns/${ctx.returnNumber}`).set(asStaff()))
+        .body.return;
+      expect(detail).not.toHaveProperty('storeId');
+      expect(detail).not.toHaveProperty('userId');
+      expect(detail.customer).not.toHaveProperty('id');
+      expect(JSON.stringify(detail)).not.toContain(storeId);
+    });
+  });
 });

@@ -38,5 +38,13 @@ export {
   type OrderLineRecord,
 } from './orders.repository.js';
 export { createOrdersRoutes } from './orders.routes.js';
+
+/**
+ * The admin order list's row mapper, re-exported for the DASHBOARD's recent-orders widget.
+ *
+ * Exported rather than duplicated: the dashboard publishes the same rows the orders screen does,
+ * and two mappers producing 'the same' order shape is how they stop being the same.
+ */
+export { toAdminOrderListResponse, type AdminOrderSummaryResponse } from './dto.js';
 export { renderInvoice, type InvoiceInput, type InvoicePaymentState } from './invoice.js';
 export { ORDER_AUDIT, ORDER_RESOURCE } from './orders.events.js';

@@ -229,6 +229,39 @@ describe('API documentation', () => {
     apiRouter.post('/admin/products/:slug/archive', (_req, res) => {
       res.status(200).json({ ok: true });
     });
+    apiRouter.post('/admin/orders/:orderNumber/refund', (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    apiRouter.post('/admin/refunds/:refundNumber/settle', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/returns/:returnNumber/receive', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/returns/:returnNumber/inspect', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/returns/:returnNumber/complete', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/products/bulk', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/products/:slug/media', (_req, res) => {
+      res.status(201).json({ ok: true });
+    });
+    apiRouter.get('/admin/products/:slug/media', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.post('/admin/products/:slug/media/upload-target', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.patch('/admin/media/:id', (_req, res) => {
+      res.status(200).json({ ok: true });
+    });
+    apiRouter.delete('/admin/media/:id', (_req, res) => {
+      res.status(204).send();
+    });
     apiRouter.post('/auth/forgot-password', (_req, res) => {
       res.status(204).send();
     });
@@ -259,6 +292,9 @@ describe('API documentation', () => {
     apiRouter.get('/admin/payments', (_req, res) => {
       res.status(200).json({ payments: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
+    apiRouter.get('/admin/dashboard', (_req, res) => {
+      res.status(200).json({});
+    });
     apiRouter.get('/admin/customers', (_req, res) => {
       res.status(200).json({ customers: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
@@ -278,11 +314,38 @@ describe('API documentation', () => {
     apiRouter.get('/admin/inventory/summary', (_req, res) => {
       res.status(200).json({ inventory: { outOfStockSkus: 0 } });
     });
+    apiRouter.get('/admin/customers/:customerId/addresses', (_req, res) => {
+      res.status(200).json({ addresses: [] });
+    });
+    apiRouter.get('/admin/customers/:customerId/sessions', (_req, res) => {
+      res.status(200).json({ sessions: [], pagination: { limit: 20, offset: 0, total: 0 } });
+    });
+    apiRouter.delete('/admin/customers/:customerId/sessions/:sessionId', (_req, res) => {
+      res.status(204).send();
+    });
     apiRouter.get('/admin/customers/:customerId/orders', (_req, res) => {
       res.status(200).json({ orders: [], pagination: { limit: 25, offset: 0, total: 0 } });
     });
+    apiRouter.post('/admin/customers/:customerId/activation', (_req, res) => {
+      res.status(200).json({ customer: {} });
+    });
     apiRouter.get('/admin/customers/:customerId', (_req, res) => {
       res.status(200).json({ customer: {} });
+    });
+    apiRouter.get('/admin/audit-logs', (_req, res) => {
+      res.status(200).json({ auditLogs: [], pagination: { limit: 20, offset: 0, total: 0 } });
+    });
+    apiRouter.get('/admin/business-profile', (_req, res) => {
+      res.status(200).json({ businessProfile: {} });
+    });
+    apiRouter.patch('/admin/business-profile', (_req, res) => {
+      res.status(200).json({ businessProfile: {} });
+    });
+    apiRouter.get('/admin/orders/:orderNumber/timeline', (_req, res) => {
+      res.status(200).json({ timeline: [] });
+    });
+    apiRouter.post('/admin/orders/:orderNumber/cancel', (_req, res) => {
+      res.status(200).json({ order: {} });
     });
     /*
      * Registered AFTER `/admin/orders/fulfilment` above, mirroring production: in the real
@@ -480,13 +543,21 @@ describe('API documentation', () => {
       // Explicit, so removing an endpoint from the spec without removing the route is caught
       // — the inverse drift of the test above.
       expect(paths.sort()).toEqual([
+        '/api/v1/admin/audit-logs',
+        '/api/v1/admin/business-profile',
         '/api/v1/admin/customers',
         '/api/v1/admin/customers/{customerId}',
+        '/api/v1/admin/customers/{customerId}/activation',
+        '/api/v1/admin/customers/{customerId}/addresses',
         '/api/v1/admin/customers/{customerId}/orders',
+        '/api/v1/admin/customers/{customerId}/sessions',
+        '/api/v1/admin/customers/{customerId}/sessions/{sessionId}',
+        '/api/v1/admin/dashboard',
         '/api/v1/admin/inventory',
         '/api/v1/admin/inventory/adjustments',
         '/api/v1/admin/inventory/summary',
         '/api/v1/admin/inventory/{skuCode}/history',
+        '/api/v1/admin/media/{id}',
         '/api/v1/admin/option-values/{id}',
         '/api/v1/admin/options/{id}',
         '/api/v1/admin/options/{id}/values',
@@ -494,22 +565,32 @@ describe('API documentation', () => {
         '/api/v1/admin/orders/fulfilment',
         '/api/v1/admin/orders/summary',
         '/api/v1/admin/orders/{orderNumber}',
+        '/api/v1/admin/orders/{orderNumber}/cancel',
         '/api/v1/admin/orders/{orderNumber}/invoice',
         '/api/v1/admin/orders/{orderNumber}/payment',
+        '/api/v1/admin/orders/{orderNumber}/refund',
         '/api/v1/admin/orders/{orderNumber}/shipments',
+        '/api/v1/admin/orders/{orderNumber}/timeline',
         '/api/v1/admin/payments',
         '/api/v1/admin/products',
+        '/api/v1/admin/products/bulk',
         '/api/v1/admin/products/{slug}',
         '/api/v1/admin/products/{slug}/archive',
+        '/api/v1/admin/products/{slug}/media',
+        '/api/v1/admin/products/{slug}/media/upload-target',
         '/api/v1/admin/products/{slug}/options',
         '/api/v1/admin/products/{slug}/publish',
         '/api/v1/admin/products/{slug}/skus',
         '/api/v1/admin/promotions',
         '/api/v1/admin/promotions/{code}',
+        '/api/v1/admin/refunds/{refundNumber}/settle',
         '/api/v1/admin/returns',
         '/api/v1/admin/returns/summary',
         '/api/v1/admin/returns/{returnNumber}',
         '/api/v1/admin/returns/{returnNumber}/approve',
+        '/api/v1/admin/returns/{returnNumber}/complete',
+        '/api/v1/admin/returns/{returnNumber}/inspect',
+        '/api/v1/admin/returns/{returnNumber}/receive',
         '/api/v1/admin/returns/{returnNumber}/reject',
         '/api/v1/admin/shipments',
         '/api/v1/admin/shipments/{id}',

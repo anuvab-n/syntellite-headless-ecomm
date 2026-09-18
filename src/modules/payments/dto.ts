@@ -371,3 +371,134 @@ export function toAdminPaymentDetailResponse(
     providerTransactionId: record.providerTransactionId,
   };
 }
+
+/* ── Refunds. Increment 59. ──────────────────────────────────────────────── */
+
+/**
+ * A refund amount on the wire.
+ *
+ * A STRING, for the reason every other money field in this API is one: JSON numbers are
+ * IEEE-754 doubles, so `19.99` has already lost precision by the time `JSON.parse` returns it,
+ * and a refund is the last place to accept that. At most 4 decimal places, matching
+ * `NUMERIC(19,4)` — extra precision is rejected rather than silently rounded, because a
+ * merchant who typed one digit too many should be told rather than quietly overruled.
+ *
+ * `\d{1,15}` bounds the integer part to what `money.ts` can carry. Zero passes the pattern and
+ * is refused by the service, which is where "a refund must move a positive amount" belongs: the
+ * regex describes the FORM of a decimal, and a second rule about its value would be a business
+ * rule hidden in a pattern.
+ */
+const refundAmountField = z
+  .string()
+  .trim()
+  .regex(/^\d{1,15}(?:\.\d{1,4})?$/, 'must be a decimal amount with at most 4 decimal places');
+
+/**
+ * The admin refund body.
+ *
+ * `amount` only. `strictObject`, so note what is therefore unreachable rather than ignored:
+ * `paymentId`, `orderId`, `storeId`, `userId`, `provider`, `providerRefundId`, `status`, and
+ * `currency`. Every one of them is server-derived from the order the path names, and accepting
+ * any of them would let a caller aim a refund at a payment that is not the one they addressed.
+ *
+ * The currency in particular is NOT a field: it is copied from the payment. A refund that could
+ * name its own currency would be a refund that could claim ₹100 against a $100 charge.
+ *
+ * Partial refunds are expressed by sending less than the remaining balance — there is no
+ * `partial` flag, because the amount already says everything a flag would.
+ */
+export const CreateRefundRequestSchema = z.strictObject({
+  amount: refundAmountField,
+  reason: z.string().trim().max(500).optional(),
+});
+
+export type CreateRefundRequest = z.infer<typeof CreateRefundRequestSchema>;
+
+/** `RFD-YYYYMMDD-XXXXXX`, validated as a shape so a malformed id is a 400 rather than a 404. */
+const refundNumberField = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(/^RFD-\d{8}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/, 'must be a valid refund number');
+
+export const RefundNumberParamsSchema = z.object({ refundNumber: refundNumberField });
+export type RefundNumberParams = z.infer<typeof RefundNumberParamsSchema>;
+
+/**
+ * One refund on the wire.
+ *
+ * The public **number**, never the row's UUID — the same contract `order_number` and
+ * `return_number` hold. `providerRefundId` is published because a merchant reconciling against
+ * the gateway's dashboard needs it, and it is an opaque identifier the provider displays there
+ * itself; it is not authentication material.
+ *
+ * Deliberately absent: `paymentId`, `orderId`, `returnId`, `storeId`, `initiatedBy` (internal
+ * keys), `amountMinor` (money leaves as a decimal string), and `requestKey` (a reconciliation
+ * correlation, not a client's concern).
+ */
+export type RefundResponse = {
+  refundNumber: string;
+  status: string;
+  mode: string;
+  amount: string;
+  currency: string;
+  provider: string | null;
+  providerRefundId: string | null;
+  failureCode: string | null;
+  createdAt: string;
+  settledAt: string | null;
+};
+
+export function toRefundResponse(record: {
+  readonly refundNumber: string;
+  readonly status: string;
+  readonly mode: string;
+  readonly amount: string;
+  readonly currency: string;
+  readonly provider: string | null;
+  readonly providerRefundId: string | null;
+  readonly failureCode: string | null;
+  readonly createdAt: Date;
+  readonly settledAt: Date | null;
+}): RefundResponse {
+  return {
+    refundNumber: record.refundNumber,
+    status: record.status,
+    mode: record.mode,
+    amount: record.amount,
+    currency: record.currency,
+    provider: record.provider,
+    providerRefundId: record.providerRefundId,
+    failureCode: record.failureCode,
+    createdAt: record.createdAt.toISOString(),
+    settledAt: record.settledAt === null ? null : record.settledAt.toISOString(),
+  };
+}
+
+/**
+ * A payment's refund position.
+ *
+ * `refunded` and `claimed` are different figures and both are published, because an operator
+ * looking at a payment that will not accept another refund is owed the reason. They are equal
+ * in the ordinary case and differ exactly while an attempt is `pending` or `processing` — the
+ * window in which reporting either as the other would be a lie.
+ */
+export type RefundBalanceResponse = {
+  currency: string;
+  captured: string;
+  refunded: string;
+  claimed: string;
+  remaining: string;
+};
+
+/**
+ * The admin payment detail, plus everything about refunds. Increment 59.
+ *
+ * **Extended, not modified.** `AdminPaymentDetailResponse` is the shipped contract; changing it
+ * would change the response of an endpoint clients already parse, so this composes on top of it
+ * exactly as that type composed on top of `AdminPaymentResponse`.
+ */
+export type AdminPaymentRefundsResponse = AdminPaymentDetailResponse & {
+  readonly refunds: RefundResponse[];
+  readonly refundBalance: RefundBalanceResponse;
+};

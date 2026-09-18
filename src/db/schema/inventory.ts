@@ -66,6 +66,18 @@ export const STOCK_REASONS = [
    * member who shipped it: `actor_user_id` stays NOT NULL and no system actor was introduced.
    */
   'shipment',
+
+  /**
+   * Goods physically came back. Written by returns, one row per restocked SKU, always with a
+   * POSITIVE delta, and only for units inspection judged good to sell.
+   *
+   * A MECHANISM like the four above it, which is why it belongs here while `damage` and
+   * `write_off` still do not: the units written off at inspection never enter the ledger at
+   * all — they were never returned to stock — so no accounting treatment is being decided here.
+   * It is a separate reason from `shipment` rather than a negative one, because "why did stock
+   * move" is the question the ledger is filtered by, and a return is not a reversed shipment.
+   */
+  'return_restock',
 ] as const;
 export type StockReason = (typeof STOCK_REASONS)[number];
 
@@ -296,7 +308,7 @@ export const stockLedger = pgTable(
      */
     check(
       'ck_stock_ledger_reason',
-      sql`${t.reason} in ('manual_increase', 'manual_decrease', 'correction', 'shipment')`,
+      sql`${t.reason} in ('manual_increase', 'manual_decrease', 'correction', 'shipment', 'return_restock')`,
     ),
   ],
 );

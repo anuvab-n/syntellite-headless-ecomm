@@ -6,9 +6,10 @@ import {
   Conflict,
   DomainError,
   InvalidCredentials,
+  InvariantViolation,
   NotFound,
 } from '../../shared/errors.js';
-import type { AuditTrail } from '../../shared/audit.js';
+import type { AuditActor, AuditTrail } from '../../shared/audit.js';
 import type { EventBus } from '../../shared/events.js';
 import { newId } from '../../shared/id.js';
 import type { Logger } from '../../shared/logger.js';
@@ -19,6 +20,7 @@ import {
   uniqueViolationConstraint,
   type AdminCustomerFilters,
   type AdminCustomerRecord,
+  type AuditLogRecord,
   type EditableUserFields,
   type IdentityRepository,
   type UserSubject,
@@ -26,6 +28,7 @@ import {
 import { hashPassword, needsRehash, verifyPassword } from './password.js';
 import {
   REFRESH_TOKEN_UNIQUE_CONSTRAINT,
+  type AdminSessionRecord,
   type RefreshSessionRepository,
 } from './refresh-session.repository.js';
 import { generateRefreshToken, hashRefreshToken } from './refresh-token.js';
@@ -35,7 +38,13 @@ import {
   PASSWORD_RESET_TTL_MINUTES,
 } from './password-reset-token.js';
 import type { PasswordResetRepository } from './password-reset.repository.js';
-import { AUTH_AUDIT, USER_AGGREGATE, USER_EVENTS, USER_RESOURCE } from './identity.events.js';
+import {
+  AUTH_AUDIT,
+  CUSTOMER_AUDIT,
+  USER_AGGREGATE,
+  USER_EVENTS,
+  USER_RESOURCE,
+} from './identity.events.js';
 import type { TokenService } from './tokens.js';
 import {
   toLoginResponse,
@@ -147,6 +156,16 @@ export const REVOKED_REASON_LOGOUT = 'logout';
 export const REVOKED_REASON_PASSWORD_CHANGE = 'password_change';
 
 /**
+ * `revoked_reason` written when STAFF revoke a customer's session. Increment 63.
+ *
+ * Distinct from every self-service reason above, and the distinction is the whole point: during
+ * an investigation, "the customer signed out", "the customer rotated their password" and
+ * "an operator cut this session" are three different facts about how an account moved hands.
+ * Collapsing them would lose exactly the one an incident review is looking for.
+ */
+export const REVOKED_REASON_STAFF_REVOKED = 'staff_revoked';
+
+/**
  * `revoked_reason` written when a password RESET invalidates every session.
  *
  * Distinct from `password_change`, and the distinction is the point: a change was made by
@@ -188,6 +207,58 @@ export type LoginAttemptTracker = {
   clear(params: { storeId: string; email: string }): Promise<void>;
 };
 
+/**
+ * **Order facts about this store's customers.** Increment 56. The module's first domain port.
+ *
+ * The staff customer list publishes an order count, a total and a last-order instant per row.
+ * Those are ORDER facts, and identity owns `app_user` — reading the order table here would
+ * invert a dependency that already runs the other way, since orders has joined `app_user` since
+ * Increment 50. So identity states what it needs and the composition root supplies it.
+ *
+ * Takes the whole page's ids at once. A per-customer call would be the N+1 this endpoint exists
+ * to avoid, and the port's shape is what makes that impossible rather than merely discouraged.
+ *
+ * **The implementation decides what counts**; this file only says which customers. The approved
+ * definition — cancelled orders excluded from all three answers — lives with the order table
+ * that can enforce it.
+ *
+ * A customer with no qualifying orders is simply absent from the result. Identity fills in zero
+ * and null, because "no orders" is a fact about the customer and this port reports facts about
+ * orders.
+ */
+export type CustomerOrderStats = {
+  forCustomers(params: { storeId: string; customerIds: readonly string[] }): Promise<
+    readonly {
+      readonly userId: string;
+      readonly orderCount: number;
+      readonly totalSpent: string;
+      readonly lastOrderAt: Date;
+    }[]
+  >;
+};
+
+/**
+ * A customer as the staff surface publishes them: the stored row plus its order aggregates.
+ *
+ * One type for the list and the detail, because both go through the same enrichment and must
+ * never disagree about the same person.
+ */
+export type AdminCustomerWithStats = AdminCustomerRecord & {
+  readonly orderCount: number;
+  readonly totalSpent: string;
+  readonly lastOrderAt: Date | null;
+};
+
+/**
+ * What a customer with no qualifying orders has spent, at `NUMERIC(19,4)` scale.
+ *
+ * A STRING, matching every other monetary value in this system: `money.ts` makes the canonical
+ * representation a decimal string precisely so nothing is ever rounded by binary floating point
+ * on its way to a response. `sum()` returns the same shape from the driver, so the zero case and
+ * the real case are indistinguishable to a client.
+ */
+const ZERO_MONEY = '0.0000';
+
 export function createIdentityService(deps: {
   repository: IdentityRepository;
   sessions: RefreshSessionRepository;
@@ -203,10 +274,59 @@ export function createIdentityService(deps: {
    * composition root always supplies one, so production is never unprotected.
    */
   loginAttempts?: LoginAttemptTracker;
+  /**
+   * Order aggregates for the staff customer surface. Increment 56.
+   *
+   * Optional for the reason `loginAttempts` is: several suites construct this service to assert
+   * authentication behaviour and have no orders module to hand. When absent, the customer reads
+   * report zero orders and no last-order date rather than failing — which is the same answer a
+   * store with no orders gets, and the composition root always supplies it.
+   */
+  customerOrderStats?: CustomerOrderStats;
   events: EventBus;
   audit: AuditTrail;
 }) {
   const { repository, sessions, passwordResets, tokens, db, config, logger, events, audit } = deps;
+  const { customerOrderStats } = deps;
+
+  /**
+   * Attach each customer's order aggregates. Increment 56.
+   *
+   * ONE call into the port for the whole set, so a page of 25 costs one extra statement rather
+   * than 25. The list and the detail both go through here, which is what stops them publishing
+   * different numbers for the same person.
+   *
+   * A customer the port did not mention has no qualifying orders, and gets the zero shape:
+   * `orderCount` 0, `totalSpent` the zero MONEY STRING — `money.ts` forbids a number — and
+   * `lastOrderAt` null. Null rather than an omitted key: "never ordered" is a fact, and a
+   * missing field would make it indistinguishable from a field the endpoint forgot.
+   */
+  const withOrderStats = async (
+    storeId: string,
+    customers: readonly AdminCustomerRecord[],
+  ): Promise<AdminCustomerWithStats[]> => {
+    if (customers.length === 0) return [];
+
+    const stats =
+      customerOrderStats === undefined
+        ? []
+        : await customerOrderStats.forCustomers({
+            storeId,
+            customerIds: customers.map((customer) => customer.id),
+          });
+
+    const byUser = new Map(stats.map((row) => [row.userId, row]));
+
+    return customers.map((customer) => {
+      const found = byUser.get(customer.id);
+      return {
+        ...customer,
+        orderCount: found?.orderCount ?? 0,
+        totalSpent: found?.totalSpent ?? ZERO_MONEY,
+        lastOrderAt: found?.lastOrderAt ?? null,
+      };
+    });
+  };
 
   /**
    * Report an attempt outcome to the failure budget. Never throws.
@@ -614,13 +734,34 @@ export function createIdentityService(deps: {
       limit: number;
       offset: number;
     }): Promise<{
-      items: readonly AdminCustomerRecord[];
+      items: readonly AdminCustomerWithStats[];
       total: number;
       limit: number;
       offset: number;
+      counts: { total: number; active: number; inactive: number };
     }> {
-      const page = await repository.listStoreCustomers(params);
-      return { ...page, limit: params.limit, offset: params.offset };
+      /*
+       * Three statements, and never more: the page, the status counts, and ONE aggregate for
+       * every customer on the page. The aggregate is issued after the page because it needs the
+       * page's ids; the counts are independent of both and run alongside.
+       */
+      const [page, counts] = await Promise.all([
+        repository.listStoreCustomers(params),
+        repository.countStoreCustomersByStatus({ storeId: params.storeId }),
+      ]);
+
+      const items = await withOrderStats(params.storeId, page.items);
+
+      const active = counts.find((row) => row.isActive)?.count ?? 0;
+      const inactive = counts.find((row) => !row.isActive)?.count ?? 0;
+
+      return {
+        items,
+        total: page.total,
+        limit: params.limit,
+        offset: params.offset,
+        counts: { total: active + inactive, active, inactive },
+      };
     },
 
     /**
@@ -637,13 +778,214 @@ export function createIdentityService(deps: {
      * entry would make "who looked at this customer" indistinguishable from "who changed this
      * customer", and the trail's value is that every row in it is a change.
      */
+    /**
+     * **How many live customers this store has.** Increment 57. Read-only.
+     *
+     * The same figure the customer list publishes as `counts`, exposed on its own because the
+     * DASHBOARD needs it without a page of customers attached. One source, so the tile and the
+     * screen it links to can never disagree.
+     *
+     * Tenant-scoped and soft-delete aware, by the repository query.
+     */
+    async countStoreCustomers(params: {
+      storeId: string;
+    }): Promise<{ total: number; active: number; inactive: number }> {
+      const counts = await repository.countStoreCustomersByStatus(params);
+      const active = counts.find((row) => row.isActive)?.count ?? 0;
+      const inactive = counts.find((row) => !row.isActive)?.count ?? 0;
+      return { total: active + inactive, active, inactive };
+    },
+
+    /**
+     * Activate or deactivate a customer account. Increment 62.
+     *
+     * A deactivated customer cannot sign in — `login` already refuses an inactive account, and
+     * refuses it AFTER verifying the password so the endpoint cannot be used as an account-state
+     * oracle. This endpoint only flips the flag that check reads; it adds no new authentication
+     * behaviour.
+     *
+     * **Not a privilege operation.** `is_staff` and `is_superuser` are neither read nor written
+     * here, and the repository method cannot touch them.
+     *
+     * The compare-and-swap in the repository makes a redundant request a `409` rather than a
+     * silent success, so the audit trail records decisions rather than repeated clicks.
+     */
+    async setCustomerActive(params: {
+      storeId: string;
+      customerId: string;
+      isActive: boolean;
+      actor: AuditActor;
+    }): Promise<AdminCustomerWithStats> {
+      return withTransaction(db, logger, async () => {
+        const existing = await repository.findStoreCustomerById({
+          storeId: params.storeId,
+          customerId: params.customerId,
+        });
+        /* Unknown, another tenant's, or soft-deleted — all indistinguishable, all 404. */
+        if (!existing) throw new NotFound('customer');
+
+        const moved = await repository.setCustomerActive({
+          storeId: params.storeId,
+          customerId: params.customerId,
+          isActive: params.isActive,
+          at: new Date(),
+        });
+
+        if (!moved) {
+          throw new Conflict(
+            params.isActive
+              ? 'This customer is already active.'
+              : 'This customer is already deactivated.',
+          );
+        }
+
+        await audit.record({
+          storeId: params.storeId,
+          actor: params.actor,
+          action: params.isActive ? CUSTOMER_AUDIT.activated : CUSTOMER_AUDIT.deactivated,
+          resourceType: USER_RESOURCE,
+          resourceId: params.customerId,
+          /* The decision and its subject. Never the email, which is PII the id already names. */
+          metadata: { from: !params.isActive, to: params.isActive },
+        });
+
+        const [enriched] = await withOrderStats(params.storeId, [moved]);
+        /* istanbul ignore next -- one row in, one row out. */
+        if (!enriched) throw new InvariantViolation('customer enrichment returned no row');
+        return enriched;
+      });
+    },
+
+    /**
+     * One customer's refresh sessions, for the admin detail screen. Increment 63.
+     *
+     * The customer is resolved FIRST, store-scoped, so an unknown or foreign id is a `404`
+     * rather than an empty list — which would otherwise tell an operator nothing about whether
+     * they had mistyped the id or the customer simply had no sessions.
+     *
+     * Nothing here loads a token hash: the repository projection has no such column.
+     */
+    async listCustomerSessions(params: {
+      storeId: string;
+      customerId: string;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly AdminSessionRecord[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const customer = await repository.findStoreCustomerById({
+        storeId: params.storeId,
+        customerId: params.customerId,
+      });
+      if (!customer) throw new NotFound('customer');
+
+      const page = await sessions.listSessionsForUser({
+        storeId: params.storeId,
+        userId: params.customerId,
+        limit: params.limit,
+        offset: params.offset,
+      });
+
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
+     * Revoke one of a customer's sessions, as staff. Increment 63.
+     *
+     * Revokes the whole FAMILY the session belongs to, which is what "revoke this session"
+     * means once refresh rotation is in play: a sign-in is a chain of rows sharing a
+     * `family_id`, and revoking only the named row would leave its successor live.
+     *
+     * A session that does not exist, belongs to another customer, belongs to another tenant, or
+     * is already revoked all produce the same `404`. Distinguishing them would turn the endpoint
+     * into an oracle for which session ids exist; and "already revoked" is indistinguishable
+     * from "never yours" in the only sense that matters, which is that nothing changed.
+     *
+     * Audited, because revoking someone's session is a security action taken on their account
+     * by somebody else.
+     */
+    async revokeCustomerSession(params: {
+      storeId: string;
+      customerId: string;
+      sessionId: string;
+      actor: AuditActor;
+    }): Promise<void> {
+      return withTransaction(db, logger, async () => {
+        const customer = await repository.findStoreCustomerById({
+          storeId: params.storeId,
+          customerId: params.customerId,
+        });
+        if (!customer) throw new NotFound('customer');
+
+        const revoked = await sessions.revokeFamilyForUserSession({
+          storeId: params.storeId,
+          userId: params.customerId,
+          sessionId: params.sessionId,
+          reason: REVOKED_REASON_STAFF_REVOKED,
+          at: new Date(),
+        });
+
+        if (revoked === 0) throw new NotFound('session');
+
+        await audit.record({
+          storeId: params.storeId,
+          actor: params.actor,
+          action: CUSTOMER_AUDIT.sessionRevoked,
+          resourceType: USER_RESOURCE,
+          resourceId: params.customerId,
+          /* How many rows the family covered. Never the session's token material. */
+          metadata: { sessionId: params.sessionId, revokedCount: revoked },
+        });
+      });
+    },
+
+    /**
+     * A page of the store's audit log. Increment 62.
+     *
+     * Read-only over an append-only table. Nothing in this module mutates `audit_log`, and this
+     * endpoint does not change that — it is the first READER the table has ever had.
+     */
+    async listStoreAuditLog(params: {
+      storeId: string;
+      action?: string;
+      actorType?: string;
+      actorUserId?: string;
+      resourceType?: string;
+      resourceId?: string;
+      from?: Date;
+      to?: Date;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly AuditLogRecord[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listStoreAuditLog(params);
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
     async getStoreCustomer(params: {
       storeId: string;
       customerId: string;
-    }): Promise<AdminCustomerRecord> {
+    }): Promise<AdminCustomerWithStats> {
       const customer = await repository.findStoreCustomerById(params);
       if (!customer) throw new NotFound('customer');
-      return customer;
+
+      /*
+       * The SAME enrichment the list uses, over a one-element page. One code path, so the detail
+       * and the list can never publish different numbers for the same customer — the property
+       * Increment 52 established when it made both reuse `toAdminCustomerResponse`.
+       */
+      const [enriched] = await withOrderStats(params.storeId, [customer]);
+
+      /* istanbul ignore next -- one row in, one row out. */
+      if (enriched === undefined) throw new NotFound('customer');
+      return enriched;
     },
 
     async getCurrentUser(params: { storeId: string; userId: string }): Promise<UserSubject> {

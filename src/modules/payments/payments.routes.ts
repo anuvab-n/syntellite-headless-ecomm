@@ -7,21 +7,27 @@ import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
 import {
   AdminListPaymentsQuerySchema,
+  CreateRefundRequestSchema,
   InitiatePaymentRequestSchema,
   ListPaymentsQuerySchema,
   OrderNumberParamsSchema,
+  RefundNumberParamsSchema,
   toAdminPaymentDetailResponse,
   toAdminPaymentListResponse,
   toPaymentListResponse,
   toHandoffResponse,
   toPaymentResponse,
+  toRefundResponse,
   type AdminListPaymentsQuery,
+  type CreateRefundRequest,
   type InitiatePaymentRequest,
   type ListPaymentsQuery,
   type OrderNumberParams,
+  type RefundNumberParams,
 } from './dto.js';
 import type { AdminPaymentFilters } from './payments.repository.js';
 import type { PaymentsService } from './payments.service.js';
+import type { RefundsService } from './refunds.service.js';
 
 /**
  * The payments module's HTTP surface: three customer routes and two staff routes.
@@ -77,11 +83,19 @@ export function createPaymentsRoutes(deps: {
    * `container.integration.test.ts` is what proves the composition root always supplies it.
    */
   requireStaff?: RequestHandler;
+  /**
+   * The refunds service. Increment 59.
+   *
+   * Optional and paired with `requireStaff`: every refund route is staff-only, so a harness
+   * that mounts this router without a scope loader gets neither the guard nor the routes. An
+   * unguarded refund endpoint is not a missing feature, it is a way to give away money.
+   */
+  refunds?: RefundsService;
   logger: Logger;
   // Annotated rather than inferred, matching every other routes file: without it `tsc` cannot
   // name the router type portably under pnpm's nested `node_modules`.
 }): Router {
-  const { payments, requireIdempotency, requireStaff, logger } = deps;
+  const { payments, requireIdempotency, requireStaff, refunds, logger } = deps;
 
   const router = Router();
   const auth: RequestHandler = requireAuth({
@@ -103,6 +117,18 @@ export function createPaymentsRoutes(deps: {
    */
   const customerActor = (req: Request): AuditActor => ({
     type: 'customer',
+    userId: requireUser(req).id,
+  });
+
+  /**
+   * The staff member raising a refund, for the audit trail and `refund.initiated_by`.
+   *
+   * From the VERIFIED token. `initiated_by` is NOT NULL and carries a composite FK to
+   * `app_user`, so a forged or absent id fails the insert rather than writing an
+   * unattributable refund — which for a money-moving row is the only acceptable behaviour.
+   */
+  const staffActor = (req: Request): AuditActor => ({
+    type: 'staff',
     userId: requireUser(req).id,
   });
 
@@ -298,12 +324,125 @@ export function createPaymentsRoutes(deps: {
       asyncHandler(async (req, res) => {
         const { orderNumber } = validatedParams<OrderNumberParams>(req);
 
-        const record = await payments.getStorePaymentForOrder({
+        const storeId = requireUser(req).storeId;
+        const record = await payments.getStorePaymentForOrder({ orderNumber, storeId });
+
+        const detail = toAdminPaymentDetailResponse(record);
+
+        /*
+         * Refund visibility, Increment 59. Composed onto the shipped contract rather than
+         * folded into it: every field `AdminPaymentDetailResponse` already published is
+         * unchanged, so a client parsing this response before the refund work still parses it.
+         */
+        if (refunds === undefined) {
+          res.status(200).json({ payment: detail });
+          return;
+        }
+
+        const [rows, balance] = await Promise.all([
+          refunds.listForPayment({ paymentId: record.id, storeId }),
+          refunds.balanceForOrder({ orderNumber, storeId }),
+        ]);
+
+        res.status(200).json({
+          payment: { ...detail, refunds: rows.map(toRefundResponse), refundBalance: balance },
+        });
+      }),
+    );
+  }
+
+  /* ── Refunds. Increment 59. Staff only, and mounted only when the guard exists. ────── */
+
+  if (requireStaff !== undefined && refunds !== undefined) {
+    /**
+     * `POST /admin/orders/{orderNumber}/refund`
+     *
+     * 201 with the refund and the payment's new refund position.
+     *
+     * Addressed by ORDER NUMBER, not by a payment id: `uq_payment_order` makes the two
+     * equivalent, and the order number is the identifier staff already have in front of them.
+     * The payment's internal UUID is published nowhere in this API and does not start here.
+     *
+     * **This is not a generic "refund any payment" endpoint.** The refund is bound to the
+     * payment behind the named order, its amount is checked against that payment's remaining
+     * refundable balance under a row lock, and the currency is copied from the payment rather
+     * than accepted from the caller.
+     *
+     * **Partial refunds** are expressed by sending less than the remaining balance; there is no
+     * flag, because the amount already says everything a flag would. Cumulative refunds are
+     * capped at the captured amount, and an attempt that is still `processing` holds its share
+     * of the balance so nobody refunds around an unresolved provider call.
+     *
+     * `Idempotency-Key` is REQUIRED. A client that never sees the response cannot know whether
+     * money moved, and its only sane move is to retry — which without a key would refund twice.
+     *
+     * A COD payment, or an online one whose provider charge id was never captured, produces a
+     * `manual` refund: a recorded obligation, settled offline and marked with
+     * `POST /admin/refunds/{refundNumber}/settle`. No gateway is called and none is faked.
+     *
+     * Failure modes: `400` for a malformed amount, an unknown field or a missing key; `401`;
+     * `403` without the `staff` scope; `404` for an unknown order or another store's; `422`
+     * for a payment that never succeeded, a non-positive amount, or an amount exceeding the
+     * remaining balance — `details.remaining` says what is left; `503` when the payment was
+     * taken online and this deployment has no provider configured.
+     */
+    router.post(
+      '/admin/orders/:orderNumber/refund',
+      auth,
+      requireStaff,
+      requireIdempotency,
+      validate({ params: OrderNumberParamsSchema, body: CreateRefundRequestSchema }),
+      asyncHandler(async (req, res) => {
+        const { orderNumber } = validatedParams<OrderNumberParams>(req);
+        const body = validatedBody<CreateRefundRequest>(req);
+
+        const result = await refunds.refundForOrder({
           orderNumber,
           storeId: requireUser(req).storeId,
+          amount: body.amount,
+          actor: staffActor(req),
+          requestKey: (req.get('idempotency-key') ?? '').trim(),
         });
 
-        res.status(200).json({ payment: toAdminPaymentDetailResponse(record) });
+        res.status(201).json({
+          refund: toRefundResponse(result.refund),
+          refundBalance: result.balance,
+        });
+      }),
+    );
+
+    /**
+     * `POST /admin/refunds/{refundNumber}/settle`
+     *
+     * 200 with the settled refund. **Manual refunds only.**
+     *
+     * The minimum this backend can honestly say about money it did not move: a named staff
+     * member asserts the offline disbursement happened, and the assertion is attributed and
+     * timestamped. No bank, UPI or payout integration is implied — there is none in this system,
+     * and inventing one would be inventing a business process nobody specified.
+     *
+     * A `provider` refund is a `409`. Its outcome is the gateway's to report, and letting
+     * staff declare one succeeded would make the `processing` state — the entire point of the
+     * three-way provider outcome — pointless.
+     *
+     * Failure modes: `400` for a malformed refund number; `404` for an unknown refund or
+     * another store's; `409` for a provider refund or one that is not `pending`.
+     */
+    router.post(
+      '/admin/refunds/:refundNumber/settle',
+      auth,
+      requireStaff,
+      validate({ params: RefundNumberParamsSchema }),
+      asyncHandler(async (req, res) => {
+        const { refundNumber } = validatedParams<RefundNumberParams>(req);
+
+        const settled = await refunds.settleManualRefund({
+          refundNumber,
+          storeId: requireUser(req).storeId,
+          actor: staffActor(req),
+        });
+
+        res.status(200).json({ refund: toRefundResponse(settled) });
       }),
     );
   }

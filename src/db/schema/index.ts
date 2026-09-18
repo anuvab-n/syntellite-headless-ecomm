@@ -27,3 +27,4 @@ export * from './payments.js';
 export * from './invoicing.js';
 export * from './shipments.js';
 export * from './returns.js';
+export * from './refunds.js';

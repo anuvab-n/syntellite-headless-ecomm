@@ -141,6 +141,24 @@ export type PaymentGateway = {
         readonly providerTransactionId: string | null;
         readonly outcome: 'succeeded' | 'failed';
         readonly failureCode: string | null;
+      }
+    /**
+     * A REFUND reached a terminal state at the provider. Increment 60.
+     *
+     * Still no provider vocabulary here: which notifications mean this is the adapter's
+     * business, and all this service learns is that some refund it raised has an outcome.
+     * `refundReference` is a value this system generated and sent — it is not an identifier
+     * the provider invented, which is what makes it safe to look up.
+     */
+    | {
+        readonly kind: 'refund_event';
+        readonly providerEventId: string;
+        readonly eventType: string;
+        readonly providerRefundId: string;
+        readonly refundReference: string;
+        readonly amountMinor: number | null;
+        readonly outcome: 'succeeded' | 'failed';
+        readonly failureCode: string | null;
       };
 };
 
@@ -252,6 +270,28 @@ export type PaymentsService = ReturnType<typeof createPaymentsService>;
  */
 const PAYABLE_ORDER_STATUSES: readonly string[] = ['placed'];
 
+/**
+ * What this service needs from the refunds service to resolve a provider notification.
+ *
+ * Declared structurally, as a port, even though both live in this module: it keeps the webhook
+ * path depending on one method rather than on the whole refunds surface, and it is what lets
+ * the dependency be late-bound without dragging the service's full type through the container.
+ */
+export type RefundWebhookResolver = {
+  resolveFromWebhook(params: {
+    refundReference: string;
+    providerRefundId: string;
+    provider: string;
+    amountMinor: number | null;
+    outcome: 'succeeded' | 'failed';
+    failureCode: string | null;
+    providerEventId: string;
+  }): Promise<
+    | { readonly outcome: 'applied'; readonly status: string }
+    | { readonly outcome: 'ignored'; readonly reason: string }
+  >;
+};
+
 export function createPaymentsService(deps: {
   repository: PaymentsRepository;
   orders: PaymentOrders;
@@ -266,6 +306,19 @@ export function createPaymentsService(deps: {
    * rather than the whole config. Zod has already proven it a positive integer.
    */
   expiryMinutes: number;
+  /**
+   * Resolving a verified provider REFUND notification. Increment 60.
+   *
+   * A thunk, and the only late-bound dependency in this file. The refunds service is built
+   * after this one — it needs fulfilment, which needs things built later still — so there is no
+   * instance to pass at construction. Deferring the lookup to call time is a smaller and more
+   * honest change than reordering the composition root's middle, and the webhook cannot fire
+   * before the container has finished building.
+   *
+   * Optional, matching every other optional port here: a container that wires no refunds
+   * service answers refund notifications as unsupported rather than crashing.
+   */
+  refunds?: () => RefundWebhookResolver | undefined;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
@@ -277,6 +330,7 @@ export function createPaymentsService(deps: {
     idempotency,
     reservations,
     expiryMinutes,
+    refunds,
     db,
     audit,
     logger,
@@ -816,6 +870,14 @@ export function createPaymentsService(deps: {
       | { readonly outcome: 'malformed' }
       | { readonly outcome: 'ignored'; readonly reason: string }
       | { readonly outcome: 'applied'; readonly status: PaymentStatus }
+      /**
+       * A REFUND was resolved, not a payment. Increment 60.
+       *
+       * A separate arm rather than a wider `status`, so the route cannot report a refund's
+       * state in the `payment` field of its response — which is what a shared arm would have
+       * let it do silently.
+       */
+      | { readonly outcome: 'refund_applied'; readonly status: string }
     > {
       const parsed = gateway.parseVerifiedWebhook({
         rawBody: params.rawBody,
@@ -837,6 +899,43 @@ export function createPaymentsService(deps: {
       if (parsed.kind === 'malformed') {
         logger.warn({ provider: gateway.provider }, 'payment_webhook_malformed');
         return { outcome: 'malformed' };
+      }
+
+      if (parsed.kind === 'refund_event') {
+        /**
+         * A terminal refund notification. Increment 60.
+         *
+         * Handed straight to the refunds service and NOT processed here: a refund is its own
+         * aggregate with its own state machine, and nothing below this branch may run for it.
+         * In particular no payment row is loaded, locked or written on this path —
+         * `payment.status` means "did the original collection succeed", which stays true
+         * however much money later goes back.
+         *
+         * The signature has already been verified by `parseVerifiedWebhook` above; this is the
+         * first line that may act on the body.
+         */
+        const resolver = refunds?.();
+        if (resolver === undefined) {
+          logger.info(
+            { provider: gateway.provider, eventType: parsed.eventType },
+            'payment_webhook_event_unsupported',
+          );
+          return { outcome: 'ignored', reason: 'unsupported_event' };
+        }
+
+        const resolved = await resolver.resolveFromWebhook({
+          refundReference: parsed.refundReference,
+          providerRefundId: parsed.providerRefundId,
+          provider: gateway.provider,
+          amountMinor: parsed.amountMinor,
+          outcome: parsed.outcome,
+          failureCode: parsed.failureCode,
+          providerEventId: parsed.providerEventId,
+        });
+
+        return resolved.outcome === 'applied'
+          ? { outcome: 'refund_applied', status: resolved.status }
+          : resolved;
       }
 
       if (parsed.kind === 'unsupported') {

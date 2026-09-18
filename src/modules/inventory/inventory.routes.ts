@@ -122,6 +122,8 @@ export function createInventoryRoutes(deps: {
 
       const page = await inventory.getStockForStore({
         storeId: store.id,
+        ...(query.q === undefined ? {} : { q: query.q }),
+        ...(query.stockState === undefined ? {} : { stockState: query.stockState }),
         limit: query.limit,
         offset: query.offset,
       });
