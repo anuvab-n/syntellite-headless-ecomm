@@ -231,6 +231,29 @@ export const shipment = pgTable(
      * exactly what this project refuses.
      */
     index('ix_shipment_store_status').on(t.storeId, t.status),
+
+    /**
+     * **The staff shipment list, newest first** — `GET /admin/shipments`, Increment 54.
+     *
+     * The index the note above declined to add speculatively. It is added now because a query
+     * asked for it, and measured rather than assumed. On 80,341 shipments across three stores,
+     * with `ix_shipment_store_status` already in place:
+     *
+     * ```
+     *   without : quicksort of the whole store partition, 2866kB,  11.002 ms
+     *   with    : Index Scan Backward using this index,     31kB,   0.122 ms
+     * ```
+     *
+     * 90x. `ix_shipment_store_status` cannot serve it — that index leads with
+     * `(store_id, status)`, which answers "how many are shipped" but leaves the planner no
+     * ordered path for `ORDER BY created_at DESC`, so an unfiltered page sorted the entire
+     * partition to return 25 rows. `uq_shipment_id_store` leads with `id`.
+     *
+     * NOT partial and not three-column: the status filter is optional on that endpoint, so a
+     * partial index would serve only some requests, and `id` as a third column would widen every
+     * entry to remove a 31kB tiebreak sort the measurement above already includes.
+     */
+    index('ix_shipment_store_created').on(t.storeId, t.createdAt),
   ],
 );
 

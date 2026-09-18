@@ -6,19 +6,29 @@ import { requireStore, type RequestStore } from '../../http/middleware/store.js'
 import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
 import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
-import type { ProductRecord, SkuOptionRecord, SkuRecord } from './catalogue.repository.js';
+import type {
+  MediaRecord,
+  ProductRecord,
+  SkuOptionRecord,
+  SkuRecord,
+} from './catalogue.repository.js';
 import type { CatalogueService } from './catalogue.service.js';
 import {
+  CreateMediaRequestSchema,
   CreateOptionRequestSchema,
   CreateOptionValueRequestSchema,
+  BulkProductActionRequestSchema,
   CreateProductRequestSchema,
   CreateSkuRequestSchema,
-  ListProductsQuerySchema,
+  CreateUploadTargetRequestSchema,
+  MediaIdParamsSchema,
+  AdminListProductsQuerySchema,
   OptionIdParamsSchema,
   ProductSlugParamsSchema,
   PublicListProductsQuerySchema,
   ReplaceSkuOptionsRequestSchema,
   SkuCodeParamsSchema,
+  UpdateMediaRequestSchema,
   UpdateOptionRequestSchema,
   UpdateOptionValueRequestSchema,
   UpdateProductRequestSchema,
@@ -26,16 +36,21 @@ import {
   groupOptionsBySku,
   groupSkusByProduct,
   groupValuesByOption,
+  toMediaResponse,
   toOptionResponse,
   toOptionValueResponse,
   toProductListResponse,
   toProductResponse,
   toSkuResponse,
+  type CreateMediaRequest,
   type CreateOptionRequest,
   type CreateOptionValueRequest,
+  type BulkProductActionRequest,
   type CreateProductRequest,
   type CreateSkuRequest,
-  type ListProductsQuery,
+  type CreateUploadTargetRequest,
+  type MediaIdParams,
+  type AdminListProductsQuery,
   type OptionIdParams,
   type ProductListResponse,
   type ProductResponse,
@@ -43,6 +58,7 @@ import {
   type PublicListProductsQuery,
   type ReplaceSkuOptionsRequest,
   type SkuCodeParams,
+  type UpdateMediaRequest,
   type UpdateOptionRequest,
   type UpdateOptionValueRequest,
   type UpdateProductRequest,
@@ -245,6 +261,58 @@ export function createCatalogueRoutes(deps: {
   );
 
   /**
+   * POST /admin/products/bulk
+   *
+   * 200 with what moved. The list screen's select-all, in one request. Increment 58.
+   *
+   * ### Why one endpoint with an `action` rather than three
+   *
+   * The selection is the payload and the action is a property of the request, which is exactly
+   * what a body is for. Three endpoints would triple the surface to guard and to document while
+   * sharing every line of their validation, their tenancy and their transaction.
+   *
+   * It does NOT widen the lifecycle: `publish`, `archive` and `delete` are the same three the
+   * single-product routes expose, enforced by the same transition table. There is no bulk action
+   * that can do something an individual action cannot.
+   *
+   * ### All or nothing
+   *
+   * An unknown slug, another store's slug, a soft-deleted one, or a product that cannot make the
+   * requested transition refuses the ENTIRE batch — `404` naming the missing slugs, or `409`
+   * naming the ones in the wrong status. Nothing is applied. A partial success would leave an
+   * operator guessing which half of their selection moved.
+   *
+   * ### Route shape
+   *
+   * `/admin/products/bulk` is two segments and `POST /admin/products` is two segments with no
+   * trailing parameter, so Express cannot confuse them; there is no `POST /admin/products/:slug`
+   * for it to shadow either. The lifecycle actions live one segment deeper.
+   *
+   * Failure modes: `400` for an unknown field, an empty or oversized selection, a malformed slug
+   * or an action outside the three; `401` unauthenticated; `403` without the `staff` scope;
+   * `404` for slugs this store does not have; `409` for an illegal transition.
+   */
+  router.post(
+    '/admin/products/bulk',
+    auth,
+    requireStaff,
+    validate({ body: BulkProductActionRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+      const body = validatedBody<BulkProductActionRequest>(req);
+
+      const result = await catalogue.bulkProductAction({
+        storeId: store.id,
+        slugs: body.slugs,
+        action: body.action,
+        actor: staffActor(req),
+      });
+
+      res.status(200).json(result);
+    }),
+  );
+
+  /**
    * GET /products
    *
    * 200 with a page of this store's PUBLISHED products, newest first.
@@ -417,14 +485,26 @@ export function createCatalogueRoutes(deps: {
     '/admin/products',
     auth,
     requireStaff,
-    validate({ query: ListProductsQuerySchema }),
+    validate({ query: AdminListProductsQuerySchema }),
     asyncHandler(async (req, res) => {
       const store = requireStore(req);
-      const { limit, offset } = validatedQuery<ListProductsQuery>(req);
+      const query = validatedQuery<AdminListProductsQuery>(req);
 
-      const page = await catalogue.getProductsForStaff({ storeId: store.id, limit, offset });
+      const page = await catalogue.getProductsForStaff({
+        storeId: store.id,
+        limit: query.limit,
+        offset: query.offset,
+        filters: {
+          ...(query.q === undefined ? {} : { q: query.q }),
+          ...(query.status === undefined ? {} : { status: query.status }),
+          ...(query.stockState === undefined ? {} : { stockState: query.stockState }),
+        },
+      });
 
-      res.status(200).json(await productListPayload(store, page, false));
+      res.status(200).json({
+        ...(await productListPayload(store, page, false)),
+        counts: page.counts,
+      });
     }),
   );
 
@@ -875,6 +955,196 @@ export function createCatalogueRoutes(deps: {
       });
 
       res.status(200).json({ sku: await skuPayload(store, updated) });
+    }),
+  );
+
+  /* ── Product media. Increment 58. ──────────────────────────────────────── */
+
+  /**
+   * One image on the wire, with its variant's CODE rather than its id.
+   *
+   * Goes through the same batch resolver a gallery uses, with a single record, so there is one
+   * code path for turning SKU ids into codes rather than two that could disagree.
+   */
+  async function mediaPayload(store: RequestStore, records: readonly MediaRecord[]) {
+    const skuIds = records.map((record) => record.skuId).filter((id): id is string => id !== null);
+
+    const codes = await catalogue.getSkuCodesByIds({ storeId: store.id, skuIds });
+
+    return records.map((record) =>
+      toMediaResponse(
+        record,
+        (key) => catalogue.mediaPublicUrl(key),
+        record.skuId === null ? null : (codes.get(record.skuId) ?? null),
+      ),
+    );
+  }
+
+  /**
+   * POST /admin/products/:slug/media
+   *
+   * 201 with the registered image.
+   *
+   * **The bytes are already in the bucket.** This records the pointer and the metadata needed to
+   * render the image; the upload itself goes straight from the browser to storage, so a
+   * multi-megabyte binary never travels through this API. `POST .../media/upload-target` below
+   * is how a client learns where to send it.
+   *
+   * Failure modes: `400` for an unknown field, a malformed storage key, a content type outside
+   * the renderable set, or half a dimension pair; `401` unauthenticated; `403` without the
+   * `staff` scope; `404` for an unknown product and for a `skuCode` that is not one of ITS
+   * variants — indistinguishable, because a code belonging to another product is not this
+   * product's variant whatever else is true of it; `409` when the object is already registered.
+   */
+  router.post(
+    '/admin/products/:slug/media',
+    auth,
+    requireStaff,
+    validate({ params: ProductSlugParamsSchema, body: CreateMediaRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+
+      const record = await catalogue.addProductMedia({
+        storeId: store.id,
+        productSlug: validatedParams<ProductSlugParams>(req).slug,
+        actor: staffActor(req),
+        input: validatedBody<CreateMediaRequest>(req),
+      });
+
+      const [payload] = await mediaPayload(store, [record]);
+      res.status(201).json({ media: payload });
+    }),
+  );
+
+  /**
+   * GET /admin/products/:slug/media
+   *
+   * 200 with the product's gallery, in the merchant's order.
+   *
+   * Unpaginated, deliberately: a product's gallery is a handful of images, bounded by what a
+   * merchant will upload for one listing. Paginating it would add a contract for no benefit and
+   * make the ordering harder to reason about. `404` for an unknown product — an empty array
+   * means a product with no images, which is a different fact.
+   */
+  router.get(
+    '/admin/products/:slug/media',
+    auth,
+    requireStaff,
+    validate({ params: ProductSlugParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+
+      const records = await catalogue.getProductMedia({
+        storeId: store.id,
+        productSlug: validatedParams<ProductSlugParams>(req).slug,
+      });
+
+      res.status(200).json({ media: await mediaPayload(store, records) });
+    }),
+  );
+
+  /**
+   * POST /admin/products/:slug/media/upload-target
+   *
+   * 200 with a pre-signed target, or `503` when this deployment has no object storage.
+   *
+   * Registered AFTER `POST /admin/products/:slug/media` for readability only — the paths differ
+   * in depth, so Express cannot confuse them.
+   *
+   * **`503` is the honest answer, not a bug.** This project has no S3 SDK, so nothing can sign a
+   * `PUT`; the composition root wires an adapter that refuses rather than one that invents a URL.
+   * Everything around the upload — registration, the gallery, ordering, the primary flag,
+   * deletion — works without it, and swapping in a real adapter touches no domain module.
+   */
+  router.post(
+    '/admin/products/:slug/media/upload-target',
+    auth,
+    requireStaff,
+    validate({ params: ProductSlugParamsSchema, body: CreateUploadTargetRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+
+      const target = await catalogue.createMediaUploadTarget({
+        storeId: store.id,
+        productSlug: validatedParams<ProductSlugParams>(req).slug,
+        input: validatedBody<CreateUploadTargetRequest>(req),
+      });
+
+      res.status(200).json({
+        upload: {
+          uploadUrl: target.uploadUrl,
+          storageKey: target.storageKey,
+          expiresAt: target.expiresAt.toISOString(),
+          requiredHeaders: target.requiredHeaders,
+        },
+      });
+    }),
+  );
+
+  /**
+   * PATCH /admin/media/:id
+   *
+   * 200 with the updated image. Edits alt text, gallery position, and the primary flag.
+   *
+   * Addressed by media id rather than nested under the product, matching `PATCH /admin/skus/:code`
+   * and `PATCH /admin/options/:id`: the id identifies the row within a store, and requiring the
+   * product too would let a caller pass a mismatched pair whose behaviour would then need
+   * defining.
+   *
+   * Promoting a primary demotes the previous one in the same transaction, so the product is never
+   * left with two or with none. `storageKey`, `productId` and `skuCode` are not editable —
+   * repointing an image is a delete plus a create, not an edit.
+   *
+   * Failure modes: `400` for a malformed id, an unknown field, or an empty body; `401`; `403`;
+   * `404` for an unknown, deleted, or another store's image — all indistinguishable.
+   */
+  router.patch(
+    '/admin/media/:id',
+    auth,
+    requireStaff,
+    validate({ params: MediaIdParamsSchema, body: UpdateMediaRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+
+      const record = await catalogue.updateProductMedia({
+        storeId: store.id,
+        mediaId: validatedParams<MediaIdParams>(req).id,
+        actor: staffActor(req),
+        input: validatedBody<UpdateMediaRequest>(req),
+      });
+
+      const [payload] = await mediaPayload(store, [record]);
+      res.status(200).json({ media: payload });
+    }),
+  );
+
+  /**
+   * DELETE /admin/media/:id
+   *
+   * 204. Soft-deleted, so the storage object keeps a row saying it should be reclaimed.
+   *
+   * Removing a primary leaves the product with no primary rather than promoting a successor:
+   * which image represents a product is a merchandising decision, and choosing one for the
+   * merchant would be inventing a rule the screen does not express.
+   *
+   * `404` for an unknown, already-deleted, or another store's image — so a repeated delete is a
+   * `404` rather than a silent success that contradicts the next read.
+   */
+  router.delete(
+    '/admin/media/:id',
+    auth,
+    requireStaff,
+    validate({ params: MediaIdParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const store = requireStore(req);
+
+      await catalogue.deleteProductMedia({
+        storeId: store.id,
+        mediaId: validatedParams<MediaIdParams>(req).id,
+        actor: staffActor(req),
+      });
+
+      res.status(204).send();
     }),
   );
 

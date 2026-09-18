@@ -12,6 +12,7 @@ import type { Logger } from '../../shared/logger.js';
 import { fromDb, isCurrency, toMinorUnits, type Currency } from '../../shared/money.js';
 import { PAYMENT_AUDIT, PAYMENT_RESOURCE } from './payments.events.js';
 import type {
+  AdminPaymentFilters,
   PaymentEventRecord,
   PaymentMethod,
   PaymentRecord,
@@ -129,6 +130,33 @@ export type PaymentGateway = {
         readonly providerEventId: string;
         readonly eventType: string;
         readonly providerRef: string;
+        /**
+         * The provider's id for the CHARGE, if the notification carried one. Increment 55.
+         *
+         * Distinct from `providerRef` — that is the provider ORDER this event is matched
+         * against — and from `providerEventId`, which identifies the delivery. Nullable: a
+         * notification without one still describes a real transition, and losing the transition
+         * to keep the id would be the wrong trade.
+         */
+        readonly providerTransactionId: string | null;
+        readonly outcome: 'succeeded' | 'failed';
+        readonly failureCode: string | null;
+      }
+    /**
+     * A REFUND reached a terminal state at the provider. Increment 60.
+     *
+     * Still no provider vocabulary here: which notifications mean this is the adapter's
+     * business, and all this service learns is that some refund it raised has an outcome.
+     * `refundReference` is a value this system generated and sent — it is not an identifier
+     * the provider invented, which is what makes it safe to look up.
+     */
+    | {
+        readonly kind: 'refund_event';
+        readonly providerEventId: string;
+        readonly eventType: string;
+        readonly providerRefundId: string;
+        readonly refundReference: string;
+        readonly amountMinor: number | null;
         readonly outcome: 'succeeded' | 'failed';
         readonly failureCode: string | null;
       };
@@ -242,6 +270,28 @@ export type PaymentsService = ReturnType<typeof createPaymentsService>;
  */
 const PAYABLE_ORDER_STATUSES: readonly string[] = ['placed'];
 
+/**
+ * What this service needs from the refunds service to resolve a provider notification.
+ *
+ * Declared structurally, as a port, even though both live in this module: it keeps the webhook
+ * path depending on one method rather than on the whole refunds surface, and it is what lets
+ * the dependency be late-bound without dragging the service's full type through the container.
+ */
+export type RefundWebhookResolver = {
+  resolveFromWebhook(params: {
+    refundReference: string;
+    providerRefundId: string;
+    provider: string;
+    amountMinor: number | null;
+    outcome: 'succeeded' | 'failed';
+    failureCode: string | null;
+    providerEventId: string;
+  }): Promise<
+    | { readonly outcome: 'applied'; readonly status: string }
+    | { readonly outcome: 'ignored'; readonly reason: string }
+  >;
+};
+
 export function createPaymentsService(deps: {
   repository: PaymentsRepository;
   orders: PaymentOrders;
@@ -256,6 +306,19 @@ export function createPaymentsService(deps: {
    * rather than the whole config. Zod has already proven it a positive integer.
    */
   expiryMinutes: number;
+  /**
+   * Resolving a verified provider REFUND notification. Increment 60.
+   *
+   * A thunk, and the only late-bound dependency in this file. The refunds service is built
+   * after this one — it needs fulfilment, which needs things built later still — so there is no
+   * instance to pass at construction. Deferring the lookup to call time is a smaller and more
+   * honest change than reordering the composition root's middle, and the webhook cannot fire
+   * before the container has finished building.
+   *
+   * Optional, matching every other optional port here: a container that wires no refunds
+   * service answers refund notifications as unsupported rather than crashing.
+   */
+  refunds?: () => RefundWebhookResolver | undefined;
   db: Database;
   audit: AuditTrail;
   logger: Logger;
@@ -267,6 +330,7 @@ export function createPaymentsService(deps: {
     idempotency,
     reservations,
     expiryMinutes,
+    refunds,
     db,
     audit,
     logger,
@@ -539,6 +603,36 @@ export function createPaymentsService(deps: {
     },
 
     /**
+     * **A page of the STORE's payments, for staff.** Increment 51. Read-only.
+     *
+     * Named `ForStore` rather than `ForUser` because the access predicate is tenancy alone, and
+     * the name says so. The authorization boundary is entirely in the routes file
+     * (`auth -> requireStaff`); this method assumes it has already been enforced, exactly as
+     * every other admin service method in the project does.
+     *
+     * No transaction, no audit row, no event, no idempotency claim. A read that recorded
+     * something would make "who looked at this" indistinguishable from "who changed this" in
+     * the audit trail, and the trail's value is that every row in it is a change.
+     *
+     * `storeId` is passed through untouched — there is no parameter on this method a client
+     * could use to widen it.
+     */
+    async listForStore(params: {
+      storeId: string;
+      filters: AdminPaymentFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{
+      items: readonly (PaymentRecord & { orderNumber: string })[];
+      total: number;
+      limit: number;
+      offset: number;
+    }> {
+      const page = await repository.listForStore(params);
+      return { ...page, limit: params.limit, offset: params.offset };
+    },
+
+    /**
      * **Expire one abandoned online payment, and give its stock back. Increment 36.**
      *
      * ONE transaction, and the lock order is the whole design:
@@ -710,6 +804,28 @@ export function createPaymentsService(deps: {
     },
 
     /**
+     * **One store's payment, for staff, addressed by order number.** Increment 55. Read-only.
+     *
+     * The read the admin surface was missing: `GET /admin/payments` can page and filter, but
+     * nothing could answer "show me THIS order's payment", and the provider's charge id has
+     * nowhere to be published without it.
+     *
+     * Addressed by order number, not by `payment.id`: that id is published nowhere, so an
+     * id-addressed route would be unreachable by any client. `uq_payment_order` makes the
+     * answer at most one payment.
+     *
+     * No transaction, no audit row, no event, no state change.
+     */
+    async getStorePaymentForOrder(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<PaymentRecord & { orderNumber: string }> {
+      const found = await repository.findByOrderNumberForStore(params);
+      if (found === undefined) throw new NotFound('payment');
+      return found;
+    },
+
+    /**
      * The status and method of an order's payment, for a caller deciding what to say or do
      * about that order.
      *
@@ -754,6 +870,14 @@ export function createPaymentsService(deps: {
       | { readonly outcome: 'malformed' }
       | { readonly outcome: 'ignored'; readonly reason: string }
       | { readonly outcome: 'applied'; readonly status: PaymentStatus }
+      /**
+       * A REFUND was resolved, not a payment. Increment 60.
+       *
+       * A separate arm rather than a wider `status`, so the route cannot report a refund's
+       * state in the `payment` field of its response — which is what a shared arm would have
+       * let it do silently.
+       */
+      | { readonly outcome: 'refund_applied'; readonly status: string }
     > {
       const parsed = gateway.parseVerifiedWebhook({
         rawBody: params.rawBody,
@@ -777,6 +901,43 @@ export function createPaymentsService(deps: {
         return { outcome: 'malformed' };
       }
 
+      if (parsed.kind === 'refund_event') {
+        /**
+         * A terminal refund notification. Increment 60.
+         *
+         * Handed straight to the refunds service and NOT processed here: a refund is its own
+         * aggregate with its own state machine, and nothing below this branch may run for it.
+         * In particular no payment row is loaded, locked or written on this path —
+         * `payment.status` means "did the original collection succeed", which stays true
+         * however much money later goes back.
+         *
+         * The signature has already been verified by `parseVerifiedWebhook` above; this is the
+         * first line that may act on the body.
+         */
+        const resolver = refunds?.();
+        if (resolver === undefined) {
+          logger.info(
+            { provider: gateway.provider, eventType: parsed.eventType },
+            'payment_webhook_event_unsupported',
+          );
+          return { outcome: 'ignored', reason: 'unsupported_event' };
+        }
+
+        const resolved = await resolver.resolveFromWebhook({
+          refundReference: parsed.refundReference,
+          providerRefundId: parsed.providerRefundId,
+          provider: gateway.provider,
+          amountMinor: parsed.amountMinor,
+          outcome: parsed.outcome,
+          failureCode: parsed.failureCode,
+          providerEventId: parsed.providerEventId,
+        });
+
+        return resolved.outcome === 'applied'
+          ? { outcome: 'refund_applied', status: resolved.status }
+          : resolved;
+      }
+
       if (parsed.kind === 'unsupported') {
         /*
          * A real Razorpay event this increment has no rule for — a refund, a settlement, a
@@ -793,8 +954,14 @@ export function createPaymentsService(deps: {
 
       const target: PaymentStatus = parsed.outcome === 'succeeded' ? 'succeeded' : 'failed';
 
-      try {
-        return await withTransaction(db, logger, async () => {
+      /**
+       * One attempt at the transition. Increment 55.
+       *
+       * `recordTransactionId` exists for exactly one reason, stated at the call site below: the
+       * charge id is SUPPLEMENTARY, and it must never be the thing that costs us a transition.
+       */
+      const attempt = async (recordTransactionId: boolean) =>
+        withTransaction(db, logger, async () => {
           /*
            * The store is resolved HERE, and it comes from our own row — see the repository
            * method's comment. The notification body is never consulted for tenancy.
@@ -884,6 +1051,15 @@ export function createPaymentsService(deps: {
             fromStatus: locked.status,
             toStatus: target,
             failureCode: parsed.failureCode,
+            /*
+             * The provider's charge id, recorded on the transition that carried it. Increment 55.
+             *
+             * Written HERE and nowhere else: it is only knowable from a notification whose
+             * signature has already been verified, and `parseVerifiedWebhook` is one call
+             * precisely so that unverified data cannot reach this line. `uq_payment_provider_txn`
+             * is what stops one charge being recorded against two payments.
+             */
+            providerTransactionId: recordTransactionId ? parsed.providerTransactionId : null,
             at: new Date(),
           });
 
@@ -953,6 +1129,36 @@ export function createPaymentsService(deps: {
 
           return { outcome: 'applied', status: target } as const;
         });
+
+      try {
+        try {
+          return await attempt(true);
+        } catch (err) {
+          /**
+           * `uq_payment_provider_txn`: this charge id is already recorded against a DIFFERENT
+           * payment in this store. Increment 55.
+           *
+           * A provider does not reuse a charge id, so reaching here means something is wrong —
+           * a shared provider account, a replayed fixture, a corrupted row. It is logged at
+           * `error` for that reason, exactly as an ambiguous reference is.
+           *
+           * **But the transition is retried without the id rather than abandoned.** The money
+           * moved; the id is how we cross-reference it later. Losing a `succeeded` because we
+           * could not file a reference would leave a paid order unpaid, and refusing would also
+           * answer the provider `500` and invite it to redeliver a notification that can never
+           * succeed — which this module's own rule forbids. Dropping the reference is the
+           * smaller, recoverable harm, and the log is what makes it findable.
+           *
+           * The first attempt's transaction rolled back in full, so the retry starts clean.
+           */
+          if (uniqueViolationConstraint(err) !== 'uq_payment_provider_txn') throw err;
+
+          logger.error(
+            { provider: gateway.provider, eventType: parsed.eventType },
+            'payment_webhook_transaction_id_already_recorded',
+          );
+          return await attempt(false);
+        }
       } catch (err) {
         /*
          * `uq_payment_event_provider`. This exact provider event has already been recorded, so

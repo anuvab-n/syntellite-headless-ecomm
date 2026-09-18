@@ -118,6 +118,20 @@ export const product = pgTable(
     index('ix_product_store_status').on(t.storeId, t.status),
 
     /**
+     * FK TARGET ONLY — `product_media` references `(product_id, store_id)`. Increment 58.
+     *
+     * PostgreSQL requires a unique constraint on exactly the referenced columns of a composite
+     * foreign key; without this the key is rejected with "there is no unique constraint matching
+     * given keys". Trivially unique because `id` is already the primary key, so it adds no new
+     * guarantee about `product` — its entire purpose is to let a child table pin a row's owner
+     * AND that owner's store in one constraint, so a cross-store child row is unrepresentable
+     * rather than merely rejected by application code.
+     *
+     * The same pattern `uq_sku_id_store` and `uq_app_user_id_store` already establish.
+     */
+    uniqueIndex('uq_product_id_store').on(t.id, t.storeId),
+
+    /**
      * Enforced in the database, not only in Zod.
      *
      * The API is not the only writer — a seed script, a bulk import, or an operator running
@@ -275,6 +289,29 @@ export const sku = pgTable(
      */
     hsnCode: varchar('hsn_code', { length: 16 }),
 
+    /**
+     * The reorder point: below this, the dashboard calls the SKU low. Increment 57.
+     *
+     * **NULL means "no threshold configured", and that is not the same as zero.** A SKU with no
+     * threshold is never reported as low, however little of it is left — because nobody has said
+     * what "low" means for it. Treating NULL as a low signal would make every SKU in the
+     * catalogue an alert the day the column shipped, which is how an alert list stops being read.
+     *
+     * Per-SKU rather than per-store: a reorder point is a property of the thing being reordered.
+     * Two variants of one product routinely differ in lead time and shelf space, and a single
+     * store-wide number could only ever be right for one of them.
+     *
+     * **It does not define out-of-stock, which already has a meaning.** `available <= 0` is
+     * unsellable and is a different fact; low stock is `available > 0 AND available <= threshold`
+     * — still sellable, running out. The two must stay distinguishable, so a threshold cannot
+     * turn an out-of-stock SKU into a low-stock one by accident.
+     *
+     * Non-negative, enforced below. Zero is meaningful and permitted: it says "warn me only when
+     * this is gone", which the `available > 0` half of the rule then makes unreachable — a
+     * deliberate way to configure a SKU as never-low without clearing the column.
+     */
+    lowStockThreshold: integer('low_stock_threshold'),
+
     ...timestamps,
     ...softDelete,
   },
@@ -309,6 +346,16 @@ export const sku = pgTable(
      * cart total and then an invoice, where it becomes a credit nobody authorised.
      */
     check('ck_sku_price_non_negative', sql`${t.price} >= 0`),
+
+    /**
+     * A negative reorder point has no meaning, and the rule that reads it — `available <=
+     * threshold` — would silently never fire. Stated in the database for the same reason the
+     * price check is: the API is not the only writer. Increment 57.
+     */
+    check(
+      'ck_sku_low_stock_threshold_non_negative',
+      sql`${t.lowStockThreshold} IS NULL OR ${t.lowStockThreshold} >= 0`,
+    ),
 
     /**
      * Tenancy AND parenthood in one constraint: the SKU's tax class must exist, and its store
@@ -628,5 +675,164 @@ export const skuOptionValue = pgTable(
      * direction is the one that would otherwise be a sequential scan.
      */
     index('ix_sov_option_value').on(t.optionValueId),
+  ],
+);
+
+/**
+ * Product imagery. **Metadata only — the bytes live in object storage.** Increment 58.
+ *
+ * ## Why no binary column
+ *
+ * A `bytea` image is read into the application's heap on every fetch, travels through the
+ * connection pool, bloats every backup and cannot be served by a CDN. The bytes belong in an
+ * S3-compatible bucket; this table holds the pointer and everything needed to render the image
+ * without fetching it — dimensions for layout, a content type, and alt text for accessibility.
+ *
+ * `storage_key` is the object's key in the bucket, not a URL. A URL embeds the bucket, the
+ * region and the delivery host, all of which are deployment configuration and all of which
+ * change without the image changing; storing one would freeze today's infrastructure into every
+ * row. The read path composes the URL from configuration and this key.
+ *
+ * ## Attached to a product, optionally to one of its SKUs
+ *
+ * `sku_id` is nullable and means "this image is of the product in general". A non-null one marks
+ * a variant shot — the red one, the large one — which the Figma variant editor shows beside its
+ * SKU. Both composite FKs carry `store_id`, so an image cannot point at another tenant's product
+ * or at a SKU of a different product's store.
+ *
+ * ## Ordering and the primary image
+ *
+ * `position` is the merchant's chosen order within a product, and `is_primary` marks the one
+ * that represents the product in a list. They are separate because they answer different
+ * questions: reordering a gallery must not silently change which image the catalogue grid shows.
+ * `uq_product_media_primary` makes "at most one primary per product" a database guarantee rather
+ * than an application convention.
+ *
+ * Soft-deleted, matching `product` and `sku`. A hard delete would strand the object in the
+ * bucket with nothing left to say it should be reclaimed; the row survives so a future sweeper
+ * can reconcile storage against the catalogue.
+ */
+export const productMedia = pgTable(
+  'product_media',
+  {
+    id: primaryId(),
+    storeId: storeIdColumn(() => store.id),
+
+    productId: uuid('product_id').notNull(),
+
+    /** NULL means the image is of the product generally rather than of one variant. */
+    skuId: uuid('sku_id'),
+
+    /**
+     * The object's key in the bucket — `stores/<store>/products/<product>/<uuid>.webp`, say.
+     *
+     * Opaque to this schema. It is produced by whatever uploaded the bytes and is the only
+     * durable link between a row here and an object there.
+     */
+    storageKey: varchar('storage_key', { length: 512 }).notNull(),
+
+    /**
+     * The IANA media type, as the storage reported it.
+     *
+     * Stored rather than inferred from the key's extension: an extension is a naming convention
+     * and this is what the object actually is, which is what a browser needs in a `Content-Type`.
+     */
+    contentType: varchar('content_type', { length: 100 }).notNull(),
+
+    /**
+     * Accessibility text. Empty string rather than NULL, matching `product.description`.
+     *
+     * There is no meaningful difference between "no alt text" and "empty alt text" for a
+     * renderer, and a nullable column would make every consumer handle both.
+     */
+    altText: varchar('alt_text', { length: 300 }).notNull().default(''),
+
+    /**
+     * Pixel dimensions and byte size, for layout and for a size budget.
+     *
+     * Nullable as a group: they are known only if whatever uploaded the object measured it, and
+     * a row that carries the pointer but not the dimensions is still a usable image reference.
+     */
+    width: integer('width'),
+    height: integer('height'),
+    byteSize: integer('byte_size'),
+
+    /** The merchant's order within the product's gallery. Ties break on `id`. */
+    position: integer('position').notNull().default(0),
+
+    /** At most one per product — `uq_product_media_primary` below. */
+    isPrimary: boolean('is_primary').notNull().default(false),
+
+    ...timestamps,
+    ...softDelete,
+  },
+  (t) => [
+    /**
+     * Tenancy AND parentage in one constraint, matching every other composite FK here: the
+     * product must exist, and its store must be this row's store. A cross-store image is
+     * unrepresentable rather than merely rejected by application code.
+     */
+    foreignKey({
+      columns: [t.productId, t.storeId],
+      foreignColumns: [product.id, product.storeId],
+      name: 'fk_product_media_product_store',
+    }).onDelete('restrict'),
+
+    /**
+     * The same for the optional variant link. RESTRICT rather than CASCADE: deleting a SKU that
+     * still has imagery should refuse and make the merchant decide, exactly as deleting an
+     * option in use does.
+     */
+    foreignKey({
+      columns: [t.skuId, t.storeId],
+      foreignColumns: [sku.id, sku.storeId],
+      name: 'fk_product_media_sku_store',
+    }).onDelete('restrict'),
+
+    /**
+     * **At most one primary image per product**, among live rows.
+     *
+     * Partial on both predicates: `is_primary` so the many non-primary rows do not collide, and
+     * `deleted_at IS NULL` so removing a primary frees the slot for its replacement.
+     */
+    uniqueIndex('uq_product_media_primary')
+      .on(t.productId)
+      .where(sql`${t.isPrimary} AND ${t.deletedAt} IS NULL`),
+
+    /**
+     * One object belongs to one row. Partial on liveness for the same reason: re-registering a
+     * key whose row was deleted is a legitimate re-attach, not a duplicate.
+     */
+    uniqueIndex('uq_product_media_key')
+      .on(t.storeId, t.storageKey)
+      .where(sql`${t.deletedAt} IS NULL`),
+
+    /**
+     * The gallery read: one product's live images in the merchant's order.
+     *
+     * Leads with `product_id` because every read is scoped to one product, and carries
+     * `position` so the ordering is served by the index rather than by a sort.
+     */
+    index('ix_product_media_product')
+      .on(t.productId, t.position)
+      .where(sql`${t.deletedAt} IS NULL`),
+
+    check('ck_product_media_position_non_negative', sql`${t.position} >= 0`),
+
+    /**
+     * Dimensions are a group: both or neither. A width with no height cannot lay anything out,
+     * and half a measurement is worse than none because it looks usable.
+     *
+     * Written as an equality of two `IS NULL` tests rather than as `(both null) OR (both > 0)`.
+     * The latter reads correctly and is not: with a width and no height the first disjunct is
+     * false and the second is NULL, so the whole expression is NULL, and a CHECK admits NULL.
+     * `IS NULL` never yields NULL, so this form is total.
+     */
+    check(
+      'ck_product_media_dimensions',
+      sql`(${t.width} IS NULL) = (${t.height} IS NULL) AND (${t.width} IS NULL OR ${t.width} > 0) AND (${t.height} IS NULL OR ${t.height} > 0)`,
+    ),
+
+    check('ck_product_media_byte_size', sql`${t.byteSize} IS NULL OR ${t.byteSize} > 0`),
   ],
 );

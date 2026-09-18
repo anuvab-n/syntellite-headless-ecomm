@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
 
-import { STOCK_REASONS } from './inventory.repository.js';
+import { STOCK_STATE_FILTERS, STOCK_REASONS } from './inventory.repository.js';
 import type { StockLedgerRecord, StockRecord } from './inventory.repository.js';
 
 /**
@@ -74,19 +74,49 @@ export const INVENTORY_LIST_MAX_LIMIT = 100;
 /* ── GET /admin/inventory ────────────────────────────────────────────────── */
 
 /**
- * `strictObject`, so `?limitt=50` is a 400 rather than silently returning a default page.
+ * Pagination alone, shared by the two inventory reads that have nothing else to filter by.
  *
+ * `strictObject`, so `?limitt=50` is a 400 rather than silently returning a default page.
  * `storeId` is absent and therefore UNREACHABLE rather than ignored: the store comes from
- * request resolution. So are `skuCode` and any filter — filtering inventory is a later
- * increment, and an unhandled parameter that looks like it worked is the failure this rejects.
+ * request resolution.
  */
-export const ListInventoryQuerySchema = z.strictObject({
+const PaginatedInventoryQuerySchema = z.strictObject({
   limit: boundedIntParam({
     min: 1,
     max: INVENTORY_LIST_MAX_LIMIT,
     default: INVENTORY_LIST_DEFAULT_LIMIT,
   }),
   offset: boundedIntParam({ min: 0, default: 0 }),
+});
+
+/**
+ * The stock LIST's query: pagination plus the two filters the merchant screen needs.
+ *
+ * Extended rather than widened in place, because the ledger history below shares the pagination
+ * and must NOT gain these filters — a history endpoint that accepted `?stockState=low_stock`
+ * and ignored it is precisely the "parameter that looks like it worked" failure `strictObject`
+ * exists to prevent.
+ */
+export const ListInventoryQuerySchema = PaginatedInventoryQuerySchema.extend({
+  /**
+   * The operator's search box: SKU code or SKU name, case-insensitive substring. Increment 63.
+   *
+   * Trimmed before the length check, so `?q=%20%20` is a `400` rather than a search for two
+   * spaces. Wildcards are escaped in the repository, so a typed `%` is a percent sign.
+   */
+  q: z.string().trim().min(1).max(200).optional(),
+
+  /**
+   * Stock state. Increment 63.
+   *
+   * The enum comes from the repository, so the values the API accepts are exactly the ones the
+   * predicates implement — a restated list here would be free to drift from them.
+   *
+   * `low_stock` means "at or below the SKU's CONFIGURED reorder point, and still sellable". A
+   * SKU with no configured threshold is never low: the merchant has not said what low means for
+   * it, and inventing a number would raise an alert nobody asked for.
+   */
+  stockState: z.enum(STOCK_STATE_FILTERS).optional(),
 });
 
 export type ListInventoryQuery = z.infer<typeof ListInventoryQuerySchema>;
@@ -137,7 +167,13 @@ export const SkuCodeParamsSchema = z.object({ skuCode: skuCodeField });
 
 export type SkuCodeParams = z.infer<typeof SkuCodeParamsSchema>;
 
-export const ListHistoryQuerySchema = ListInventoryQuerySchema;
+/**
+ * The ledger history's query: pagination ONLY.
+ *
+ * Deliberately the base schema rather than the stock list's, so `?q=` or `?stockState=` on a
+ * history URL is a 400 naming the field instead of a filter the endpoint silently ignores.
+ */
+export const ListHistoryQuerySchema = PaginatedInventoryQuerySchema;
 
 /* ── Responses ───────────────────────────────────────────────────────────── */
 

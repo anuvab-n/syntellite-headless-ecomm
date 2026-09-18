@@ -2,10 +2,11 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { cart } from '../../src/db/schema/cart.js';
-import { appUser } from '../../src/db/schema/identity.js';
-import { order } from '../../src/db/schema/orders.js';
+import { appUser, auditLog } from '../../src/db/schema/identity.js';
+import { order, orderStatusHistory } from '../../src/db/schema/orders.js';
 import { store } from '../../src/db/schema/store.js';
 import { withTransaction } from '../../src/db/transaction.js';
+import { createIdentityRepository } from '../../src/modules/identity/identity.repository.js';
 import { createOrdersRepository } from '../../src/modules/orders/orders.repository.js';
 import { newId } from '../../src/shared/id.js';
 import {
@@ -175,5 +176,215 @@ describe('tenant isolation — order lookups (audit)', () => {
     // foreign read is scoped by store rather than by order id alone.
     expect(Array.isArray(own)).toBe(true);
     expect(foreign).toEqual([]);
+  });
+
+  /* ══ Increment 62: the new admin reads and the activation write ════════ */
+
+  const identity = () => createIdentityRepository({ db: testDb.handle.db });
+
+  describe('the admin order timeline', () => {
+    it('reads its own store history, and nothing for a different tenant', async () => {
+      const [row] = await testDb.handle.db
+        .select()
+        .from(order)
+        .where(eq(order.orderNumber, orderNumberA));
+
+      await testDb.handle.db.insert(orderStatusHistory).values({
+        id: newId(),
+        orderId: row!.id,
+        storeId: storeA,
+        fromStatus: null,
+        toStatus: 'placed',
+        actorType: 'customer',
+        actorUserId: userA,
+      });
+
+      const own = await repository().listOrderStatusHistory({
+        orderId: row!.id,
+        storeId: storeA,
+      });
+      const foreign = await repository().listOrderStatusHistory({
+        orderId: row!.id,
+        storeId: storeB,
+      });
+
+      /*
+       * The row EXISTS and belongs to storeA, so this is a real predicate test rather than a
+       * vacuous one — an empty table would answer an empty list for both stores either way.
+       */
+      expect(own).toHaveLength(1);
+      expect(own[0]!.toStatus).toBe('placed');
+      expect(foreign).toEqual([]);
+    });
+  });
+
+  describe('the store-scoped order lock used by staff cancellation', () => {
+    it('locks its own store order', async () => {
+      const locked = await withTransaction(testDb.handle.db, silentLogger, async () =>
+        repository().lockStoreOrderByNumber({ orderNumber: orderNumberA, storeId: storeA }),
+      );
+      expect(locked?.orderNumber).toBe(orderNumberA);
+    });
+
+    it('does NOT lock it for a different tenant', async () => {
+      /*
+       * The staff cancellation path's lookup carries no `user_id` — staff act for a tenant, not
+       * for a person — so `store_id` is the ONLY thing standing between one merchant's admin
+       * and another merchant's order. Unlike the owner-scoped lock above, nothing else here
+       * incidentally lands inside one tenant.
+       */
+      const locked = await withTransaction(testDb.handle.db, silentLogger, async () =>
+        repository().lockStoreOrderByNumber({ orderNumber: orderNumberA, storeId: storeB }),
+      );
+      expect(locked).toBeUndefined();
+    });
+  });
+
+  describe('the audit log read', () => {
+    it('returns its own store entries and never another tenant entry', async () => {
+      await testDb.handle.db.insert(auditLog).values([
+        {
+          id: newId(),
+          storeId: storeA,
+          actorUserId: userA,
+          actorType: 'staff',
+          action: 'tenant.probe',
+          resourceType: 'order',
+          resourceId: orderNumberA,
+        },
+        {
+          id: newId(),
+          storeId: storeB,
+          actorUserId: null,
+          actorType: 'staff',
+          action: 'tenant.probe',
+          resourceType: 'order',
+          resourceId: 'ORD-OTHER',
+        },
+        /*
+         * A PLATFORM entry, with no store at all. The predicate is an equality rather than an
+         * `OR IS NULL` precisely so this row reaches neither tenant.
+         */
+        {
+          id: newId(),
+          storeId: null,
+          actorUserId: null,
+          actorType: 'system',
+          action: 'tenant.probe',
+          resourceType: 'platform',
+          resourceId: 'global',
+        },
+      ]);
+
+      const a = await identity().listStoreAuditLog({
+        storeId: storeA,
+        action: 'tenant.probe',
+        limit: 50,
+        offset: 0,
+      });
+      const b = await identity().listStoreAuditLog({
+        storeId: storeB,
+        action: 'tenant.probe',
+        limit: 50,
+        offset: 0,
+      });
+
+      expect(a.total).toBe(1);
+      expect(a.items[0]!.resourceId).toBe(orderNumberA);
+
+      expect(b.total).toBe(1);
+      expect(b.items[0]!.resourceId).toBe('ORD-OTHER');
+
+      /* Neither tenant sees the platform row. */
+      expect(a.items.some((e) => e.resourceType === 'platform')).toBe(false);
+      expect(b.items.some((e) => e.resourceType === 'platform')).toBe(false);
+    });
+
+    it('applies the inclusive-millisecond upper bound', async () => {
+      const marker = newId();
+      const at = new Date('2026-02-02T03:04:05.123Z');
+      await testDb.handle.db.insert(auditLog).values({
+        id: newId(),
+        storeId: storeA,
+        actorUserId: null,
+        actorType: 'system',
+        action: 'tenant.bound',
+        resourceType: 'probe',
+        resourceId: marker,
+        createdAt: at,
+      });
+
+      const included = await identity().listStoreAuditLog({
+        storeId: storeA,
+        action: 'tenant.bound',
+        to: at,
+        limit: 50,
+        offset: 0,
+      });
+      expect(included.items.some((e) => e.resourceId === marker)).toBe(true);
+
+      const excluded = await identity().listStoreAuditLog({
+        storeId: storeA,
+        action: 'tenant.bound',
+        to: new Date(at.getTime() - 1),
+        limit: 50,
+        offset: 0,
+      });
+      expect(excluded.items.some((e) => e.resourceId === marker)).toBe(false);
+    });
+  });
+
+  describe('customer activation', () => {
+    it('flips the flag for its own store only', async () => {
+      const own = await identity().setCustomerActive({
+        storeId: storeA,
+        customerId: userA,
+        isActive: false,
+        at: new Date(),
+      });
+      expect(own?.isActive).toBe(false);
+
+      /* Same customer id, wrong tenant: nothing moves. */
+      const foreign = await identity().setCustomerActive({
+        storeId: storeB,
+        customerId: userA,
+        isActive: true,
+        at: new Date(),
+      });
+      expect(foreign).toBeUndefined();
+
+      const [row] = await testDb.handle.db.select().from(appUser).where(eq(appUser.id, userA));
+      expect(row!.isActive).toBe(false);
+    });
+
+    it('matches no row when the value is already what was asked for', async () => {
+      /* The row is inactive after the previous case. Asking again must change nothing. */
+      const again = await identity().setCustomerActive({
+        storeId: storeA,
+        customerId: userA,
+        isActive: false,
+        at: new Date(),
+      });
+      expect(again).toBeUndefined();
+    });
+
+    it('never touches the privilege flags', async () => {
+      await testDb.handle.db
+        .update(appUser)
+        .set({ isStaff: false, isSuperuser: false, isActive: false })
+        .where(eq(appUser.id, userA));
+
+      await identity().setCustomerActive({
+        storeId: storeA,
+        customerId: userA,
+        isActive: true,
+        at: new Date(),
+      });
+
+      const [row] = await testDb.handle.db.select().from(appUser).where(eq(appUser.id, userA));
+      expect(row!.isStaff).toBe(false);
+      expect(row!.isSuperuser).toBe(false);
+      expect(row!.isActive).toBe(true);
+    });
   });
 });

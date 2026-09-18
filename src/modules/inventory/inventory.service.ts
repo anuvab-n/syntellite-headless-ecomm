@@ -18,7 +18,9 @@ import type {
   InventoryRepository,
   ReservationSettledReason,
   StockLedgerRecord,
+  LowStockRecord,
   StockRecord,
+  StockStateFilter,
 } from './inventory.repository.js';
 import type { CreateAdjustmentRequest } from './dto.js';
 
@@ -131,9 +133,45 @@ export function createInventoryService(deps: {
       return row;
     },
 
+    /**
+     * **How many live SKUs have nothing sellable left.** Increment 53. Read-only.
+     *
+     * A single number, deliberately. The operator question behind it is "is anything unsellable
+     * right now" — the WHICH is what `GET /admin/inventory` already answers, page by page.
+     *
+     * The low-stock counterpart now exists below — Increment 57 added `sku.low_stock_threshold`,
+     * which is what "low" was missing. The two stay separate answers: this one is "unsellable",
+     * that one is "still sellable, running out".
+     *
+     * No transaction, no audit row, no event, no stock movement.
+     */
+    async countOutOfStock(params: { storeId: string }): Promise<number> {
+      return repository.countOutOfStockForStore(params);
+    },
+
+    /**
+     * **SKUs running low against their own reorder point.** Increment 57. Read-only.
+     *
+     * The counterpart the note above said did not exist. `sku.low_stock_threshold` now supplies
+     * the definition, per SKU, and a SKU without one is never reported — "low" is still not
+     * invented for anybody who has not configured it.
+     *
+     * Distinct from out of stock, which keeps its own meaning: this returns SKUs that are still
+     * sellable (`available > 0`) and at or below their threshold. A SKU with nothing left is
+     * unsellable, which is a different alert and a different tile.
+     *
+     * Bounded by `limit`, ordered deterministically by the repository. No transaction, no audit
+     * row, no event, no stock movement.
+     */
+    async listLowStock(params: { storeId: string; limit: number }): Promise<LowStockRecord[]> {
+      return repository.listLowStockForStore(params);
+    },
+
     /** A page of this store's stock. Visibility belongs to the repository query. */
     async getStockForStore(params: {
       storeId: string;
+      q?: string;
+      stockState?: StockStateFilter;
       limit: number;
       offset: number;
     }): Promise<{ items: StockRecord[]; total: number }> {
@@ -783,6 +821,99 @@ export function createInventoryService(deps: {
       );
 
       return { skuCount: fulfilled.length, totalUnits };
+    },
+
+    /**
+     * Put returned units back into sellable stock. Increment 59.
+     *
+     * **Only the units inspection judged good to sell.** The caller passes the per-SKU restock
+     * counts decided at inspection; written-off units are simply absent from that list and never
+     * enter the ledger, because they never re-entered stock. Nothing here decides resaleability
+     * — that is a warehouse judgement made at inspection and recorded on `return_line`.
+     *
+     * **Reservations are untouched**, which is the approved rule and also the only correct
+     * answer: these units shipped, so their reservation was settled at fulfilment. Moving
+     * `reserved` here would hold stock for an order that has already been delivered.
+     *
+     * Must be called inside the caller's transaction, asserted rather than assumed: the stock
+     * movement and the return's transition to `completed` must commit together, or a crash
+     * between them leaves stock that was added for a return that never closed.
+     *
+     * Restocking exactly once is the CALLER's guarantee, not this method's — the return's
+     * `inspected -> completed` CAS is what a second attempt loses. Stated here so nobody adds a
+     * second caller assuming this is idempotent. It is not, and cannot be: it has no idea which
+     * return the units came from.
+     */
+    async restockForReturn(params: {
+      storeId: string;
+      /** One entry per SKU, with the GOOD-TO-SELL quantity only. Zero-quantity entries are ignored. */
+      lines: readonly { skuId: string; quantity: number }[];
+      /** The staff member completing the return. `stock_ledger.actor_user_id` is NOT NULL. */
+      actorUserId: string;
+      note?: string;
+    }): Promise<{ skuCount: number; totalUnits: number }> {
+      if (!isInTransaction()) {
+        throw new InvariantViolation(
+          'restockForReturn must be called inside the caller transaction; the stock movement and ' +
+            'the return completion must commit together or not at all',
+        );
+      }
+
+      const at = new Date();
+      const requestId = getRequestId() ?? null;
+
+      /* Sorted by the LOCK TARGET, sequentially — the same discipline `fulfilForOrder` keeps. */
+      const movable = params.lines
+        .filter((line) => line.quantity > 0)
+        .sort((a, b) => (a.skuId < b.skuId ? -1 : 1));
+
+      let totalUnits = 0;
+
+      for (const line of movable) {
+        const outcome = await repository.restockForSku({
+          skuId: line.skuId,
+          storeId: params.storeId,
+          quantity: line.quantity,
+          at,
+        });
+
+        if (!outcome) {
+          /*
+           * No projection row for a SKU that was sold and shipped. That cannot happen through
+           * any supported path, so it is a loud rollback rather than a silent skip: adding
+           * stock the system cannot account for is worse than refusing to complete the return.
+           */
+          throw new InvariantViolation(
+            `stock_item for sku ${line.skuId} does not exist; cannot restock a returned unit`,
+          );
+        }
+
+        /*
+         * One ledger row per SKU, POSITIVE delta, both sides of the arithmetic from the SAME
+         * statement that moved the counter — so `SUM(delta) = on_hand` still holds.
+         */
+        await repository.insertLedgerEntry({
+          id: newId(),
+          storeId: params.storeId,
+          skuId: line.skuId,
+          delta: line.quantity,
+          onHandBefore: outcome.onHandBefore,
+          onHandAfter: outcome.onHandAfter,
+          reason: 'return_restock',
+          note: params.note ?? '',
+          actorUserId: params.actorUserId,
+          requestId,
+        });
+
+        totalUnits += line.quantity;
+      }
+
+      logger.info(
+        { storeId: params.storeId, skuCount: movable.length, totalUnits },
+        'inventory_restocked_for_return',
+      );
+
+      return { skuCount: movable.length, totalUnits };
     },
 
     /** One order's reservations. Read-only, for tests and support. */

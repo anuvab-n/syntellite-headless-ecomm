@@ -2,6 +2,7 @@ import type { Database } from '../../src/db/client.js';
 import { sku } from '../../src/db/schema/catalogue.js';
 import { stockItem } from '../../src/db/schema/inventory.js';
 import { newId } from '../../src/shared/id.js';
+import { DependencyUnavailable } from '../../src/shared/errors.js';
 
 /**
  * The price `giveSku` uses when a fixture does not name one.
@@ -93,4 +94,35 @@ export async function giveSku(
   }
 
   return { id: values.id, code: values.code, price: values.price };
+}
+
+/**
+ * A media storage double for catalogue suites. Increment 58.
+ *
+ * Deliberately NOT the unconfigured adapter: that one refuses every upload target, which is the
+ * right production default but would make it impossible to test the success path. This one
+ * returns a deterministic target and composes a predictable URL, so an assertion can name the
+ * exact string it expects.
+ *
+ * `failUploads` switches it to the production-default behaviour, so the `503` path is testable
+ * through the same seam rather than by rebuilding the container.
+ */
+export function testMediaStorage(options: { failUploads?: boolean } = {}) {
+  return {
+    async createUploadTarget(params: { storeId: string; productId: string; contentType: string }) {
+      if (options.failUploads === true) {
+        throw new DependencyUnavailable('object storage');
+      }
+      const storageKey = `stores/${params.storeId}/products/${params.productId}/test-object`;
+      return {
+        uploadUrl: `https://storage.test/upload/${storageKey}`,
+        storageKey,
+        expiresAt: new Date(Date.now() + 900_000),
+        requiredHeaders: { 'content-type': params.contentType },
+      };
+    },
+    publicUrl(storageKey: string): string | null {
+      return `https://cdn.test/${storageKey}`;
+    },
+  };
 }

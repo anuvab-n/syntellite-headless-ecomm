@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
 
-import { PAYMENT_METHODS } from './payments.repository.js';
+import { PAYMENT_METHODS, PAYMENT_PROVIDERS, PAYMENT_STATUSES } from './payments.repository.js';
 import type { PaymentEventRecord, PaymentRecord } from './payments.repository.js';
 import type { PaymentHandoff, PaymentView } from './payments.service.js';
 
@@ -184,3 +184,321 @@ export function toHandoffResponse(handoff: PaymentHandoff): PaymentHandoffRespon
     publicKey: handoff.publicKey,
   };
 }
+
+/* ── GET /admin/payments ─────────────────────────────────────────────────── */
+
+/** Page size for the staff payment list. Larger than the customer's, for the same reason. */
+export const ADMIN_PAYMENT_LIST_DEFAULT_LIMIT = 25;
+export const ADMIN_PAYMENT_LIST_MAX_LIMIT = 100;
+
+/**
+ * An ISO-8601 instant WITH an offset, matching the promotions and tax modules' `instantField`
+ * and the admin order list.
+ *
+ * **The client owns the timezone, deliberately.** A bare `YYYY-MM-DD` would force the server to
+ * choose one to widen it into, and every choice is wrong somewhere — UTC misfiles the edges of
+ * an Indian trading day, the store's timezone surprises an operator working from another one,
+ * and neither is visible in the request.
+ *
+ * Both bounds are INCLUSIVE. Stated here, on the endpoint, and asserted by a test that places a
+ * payment exactly on each boundary — a half-open range that silently dropped the last day would
+ * otherwise look like missing data rather than like a contract.
+ */
+const instantField = z.iso.datetime({ offset: true });
+
+/**
+ * The staff payment list's query string.
+ *
+ * `strictObject`, so an unknown parameter is a `400` naming it rather than a filter silently
+ * ignored — the failure mode where an operator trusts a page that was never narrowed.
+ *
+ * **`storeId` is not here and never will be.** Tenancy comes from the verified staff token; a
+ * store parameter on an admin list is a cross-tenant read waiting to be discovered, and because
+ * this object is strict, sending one is a `400` rather than an ignored key.
+ *
+ * The status, method and provider vocabularies are the REAL ones, re-exported by the repository
+ * from the schema — not restatements. A value the database cannot hold is rejected here rather
+ * than returning a confusingly empty page.
+ */
+export const AdminListPaymentsQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_PAYMENT_LIST_MAX_LIMIT,
+    default: ADMIN_PAYMENT_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+
+  status: z.enum(PAYMENT_STATUSES).optional(),
+  method: z.enum(PAYMENT_METHODS).optional(),
+  provider: z.enum(PAYMENT_PROVIDERS).optional(),
+
+  /**
+   * An EXACT order number, not a search.
+   *
+   * The same pattern the orders module validates, so a malformed number is a `400` rather than a
+   * query that can only ever miss. `uq_payment_order` means this selects at most one payment.
+   */
+  orderNumber: z
+    .string()
+    .trim()
+    .max(64)
+    .regex(/^ORD-\d{8}-[A-Z2-9]{6}$/, 'must be an order number of the form ORD-YYYYMMDD-XXXXXX')
+    .optional(),
+
+  /**
+   * An EXACT provider charge id — Razorpay's `pay_…`. Increment 55.
+   *
+   * Validated as a charset and a length, NOT as a `pay_` prefix. `order_number` above is OUR
+   * format, so a shape regex there asserts something this system guarantees; this value is the
+   * provider's, and pinning its shape would turn a provider changing its own identifiers into a
+   * `400` on a lookup that would otherwise have worked. The bound that matters is the column's:
+   * `varchar(255)`.
+   *
+   * Exact, not a search. `uq_payment_provider_txn` makes it at most one row per store.
+   */
+  transactionId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(255)
+    .regex(/^[A-Za-z0-9_-]+$/, 'must be a provider transaction id')
+    .optional(),
+
+  createdFrom: instantField.optional(),
+  createdTo: instantField.optional(),
+});
+
+export type AdminListPaymentsQuery = z.infer<typeof AdminListPaymentsQuerySchema>;
+
+/**
+ * One row of the staff payment list.
+ *
+ * Built field by field from `PaymentRecord`, and the omissions are the contract:
+ *
+ *  - **`providerRef`** — the Razorpay order/payment id. It is the handle used to act on the
+ *    provider side, so it is handed to the paying customer for the checkout handoff and to
+ *    nobody else. An operator list is a read, and a read does not need a capability.
+ *  - **`amountMinor`** — the integer mirror of `amount`, kept for the provider call. Publishing
+ *    both invites a client to pick one, and money leaves this system as a decimal string.
+ *  - **`id`, `userId`, `orderId`, `storeId`** — internal ids. A payment is addressed by its
+ *    order number here; tenancy and ownership are invariants of the query, not fields.
+ *
+ * `failureCode` IS included: it is already on the customer-facing `PaymentResponse`, so it is
+ * established as non-sensitive, and it is the reason a row reads as failed on an operator screen.
+ */
+export type AdminPaymentResponse = {
+  orderNumber: string;
+  status: string;
+  method: string;
+  /** `null` for COD — `ck_payment_provider_matches_method` guarantees the pairing. */
+  provider: string | null;
+  amount: string;
+  currency: string;
+  /** Set only on a failed payment; `ck_payment_failure_code` enforces that. */
+  failureCode: string | null;
+  createdAt: string;
+  /** The last transition's instant — when a payment succeeded, failed or expired. */
+  updatedAt: string;
+};
+
+export type AdminPaymentListResponse = {
+  payments: AdminPaymentResponse[];
+  pagination: PaginationResponse;
+};
+
+export function toAdminPaymentResponse(
+  record: PaymentRecord & { orderNumber: string },
+): AdminPaymentResponse {
+  return {
+    orderNumber: record.orderNumber,
+    status: record.status,
+    method: record.method,
+    provider: record.provider,
+    amount: record.amount,
+    currency: record.currency,
+    failureCode: record.failureCode,
+    createdAt: record.createdAt.toISOString(),
+    updatedAt: record.updatedAt.toISOString(),
+  };
+}
+
+export function toAdminPaymentListResponse(page: {
+  items: readonly (PaymentRecord & { orderNumber: string })[];
+  total: number;
+  limit: number;
+  offset: number;
+}): AdminPaymentListResponse {
+  return {
+    payments: page.items.map(toAdminPaymentResponse),
+    pagination: { limit: page.limit, offset: page.offset, total: page.total },
+  };
+}
+
+/* ── GET /admin/orders/{orderNumber}/payment ─────────────────────────────── */
+
+/**
+ * One payment, for staff, with the provider's identifiers. Increment 55.
+ *
+ * **Extended, not modified.** `AdminPaymentResponse` above is the shipped list contract, shared
+ * with `GET /admin/payments`; changing it would change that endpoint's published shape, so this
+ * composes on top of it instead.
+ *
+ * Three fields more than the list row, and each names exactly one thing:
+ *
+ *  - `provider` — which gateway, already on the list row.
+ *  - `providerRef` — the provider's ORDER (`order_…`), created at initiation. Null for COD.
+ *  - `providerTransactionId` — the provider's CHARGE (`pay_…`), the id a merchant pastes into
+ *    the gateway's dashboard. Null for COD, null until a payment succeeds, and null for every
+ *    payment taken before the column existed.
+ *
+ * Deliberately absent, and each for a stated reason: `payment.id` (published nowhere; a payment
+ * is addressed by its order number), `userId`, `orderId`, `storeId` (internal keys; tenancy is
+ * an invariant of the query), `amountMinor` (money leaves as a decimal string), and
+ * `providerEventId` (the webhook DELIVERY id — deduplication material, not a charge reference,
+ * and it lives on the event row, not here).
+ */
+export type AdminPaymentDetailResponse = AdminPaymentResponse & {
+  readonly providerRef: string | null;
+  readonly providerTransactionId: string | null;
+};
+
+export function toAdminPaymentDetailResponse(
+  record: PaymentRecord & { orderNumber: string },
+): AdminPaymentDetailResponse {
+  return {
+    ...toAdminPaymentResponse(record),
+    providerRef: record.providerRef,
+    providerTransactionId: record.providerTransactionId,
+  };
+}
+
+/* ── Refunds. Increment 59. ──────────────────────────────────────────────── */
+
+/**
+ * A refund amount on the wire.
+ *
+ * A STRING, for the reason every other money field in this API is one: JSON numbers are
+ * IEEE-754 doubles, so `19.99` has already lost precision by the time `JSON.parse` returns it,
+ * and a refund is the last place to accept that. At most 4 decimal places, matching
+ * `NUMERIC(19,4)` — extra precision is rejected rather than silently rounded, because a
+ * merchant who typed one digit too many should be told rather than quietly overruled.
+ *
+ * `\d{1,15}` bounds the integer part to what `money.ts` can carry. Zero passes the pattern and
+ * is refused by the service, which is where "a refund must move a positive amount" belongs: the
+ * regex describes the FORM of a decimal, and a second rule about its value would be a business
+ * rule hidden in a pattern.
+ */
+const refundAmountField = z
+  .string()
+  .trim()
+  .regex(/^\d{1,15}(?:\.\d{1,4})?$/, 'must be a decimal amount with at most 4 decimal places');
+
+/**
+ * The admin refund body.
+ *
+ * `amount` only. `strictObject`, so note what is therefore unreachable rather than ignored:
+ * `paymentId`, `orderId`, `storeId`, `userId`, `provider`, `providerRefundId`, `status`, and
+ * `currency`. Every one of them is server-derived from the order the path names, and accepting
+ * any of them would let a caller aim a refund at a payment that is not the one they addressed.
+ *
+ * The currency in particular is NOT a field: it is copied from the payment. A refund that could
+ * name its own currency would be a refund that could claim ₹100 against a $100 charge.
+ *
+ * Partial refunds are expressed by sending less than the remaining balance — there is no
+ * `partial` flag, because the amount already says everything a flag would.
+ */
+export const CreateRefundRequestSchema = z.strictObject({
+  amount: refundAmountField,
+  reason: z.string().trim().max(500).optional(),
+});
+
+export type CreateRefundRequest = z.infer<typeof CreateRefundRequestSchema>;
+
+/** `RFD-YYYYMMDD-XXXXXX`, validated as a shape so a malformed id is a 400 rather than a 404. */
+const refundNumberField = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(/^RFD-\d{8}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/, 'must be a valid refund number');
+
+export const RefundNumberParamsSchema = z.object({ refundNumber: refundNumberField });
+export type RefundNumberParams = z.infer<typeof RefundNumberParamsSchema>;
+
+/**
+ * One refund on the wire.
+ *
+ * The public **number**, never the row's UUID — the same contract `order_number` and
+ * `return_number` hold. `providerRefundId` is published because a merchant reconciling against
+ * the gateway's dashboard needs it, and it is an opaque identifier the provider displays there
+ * itself; it is not authentication material.
+ *
+ * Deliberately absent: `paymentId`, `orderId`, `returnId`, `storeId`, `initiatedBy` (internal
+ * keys), `amountMinor` (money leaves as a decimal string), and `requestKey` (a reconciliation
+ * correlation, not a client's concern).
+ */
+export type RefundResponse = {
+  refundNumber: string;
+  status: string;
+  mode: string;
+  amount: string;
+  currency: string;
+  provider: string | null;
+  providerRefundId: string | null;
+  failureCode: string | null;
+  createdAt: string;
+  settledAt: string | null;
+};
+
+export function toRefundResponse(record: {
+  readonly refundNumber: string;
+  readonly status: string;
+  readonly mode: string;
+  readonly amount: string;
+  readonly currency: string;
+  readonly provider: string | null;
+  readonly providerRefundId: string | null;
+  readonly failureCode: string | null;
+  readonly createdAt: Date;
+  readonly settledAt: Date | null;
+}): RefundResponse {
+  return {
+    refundNumber: record.refundNumber,
+    status: record.status,
+    mode: record.mode,
+    amount: record.amount,
+    currency: record.currency,
+    provider: record.provider,
+    providerRefundId: record.providerRefundId,
+    failureCode: record.failureCode,
+    createdAt: record.createdAt.toISOString(),
+    settledAt: record.settledAt === null ? null : record.settledAt.toISOString(),
+  };
+}
+
+/**
+ * A payment's refund position.
+ *
+ * `refunded` and `claimed` are different figures and both are published, because an operator
+ * looking at a payment that will not accept another refund is owed the reason. They are equal
+ * in the ordinary case and differ exactly while an attempt is `pending` or `processing` — the
+ * window in which reporting either as the other would be a lie.
+ */
+export type RefundBalanceResponse = {
+  currency: string;
+  captured: string;
+  refunded: string;
+  claimed: string;
+  remaining: string;
+};
+
+/**
+ * The admin payment detail, plus everything about refunds. Increment 59.
+ *
+ * **Extended, not modified.** `AdminPaymentDetailResponse` is the shipped contract; changing it
+ * would change the response of an endpoint clients already parse, so this composes on top of it
+ * exactly as that type composed on top of `AdminPaymentResponse`.
+ */
+export type AdminPaymentRefundsResponse = AdminPaymentDetailResponse & {
+  readonly refunds: RefundResponse[];
+  readonly refundBalance: RefundBalanceResponse;
+};

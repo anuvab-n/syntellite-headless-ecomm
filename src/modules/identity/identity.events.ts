@@ -46,5 +46,21 @@ export const AUTH_AUDIT = {
   passwordReset: 'auth.password_reset',
 } as const;
 
+/**
+ * Staff actions on a CUSTOMER account. Increment 62.
+ *
+ * Separate from `AUTH_AUDIT`, which records what a person did to their own credentials. These
+ * are things done TO someone's account by somebody else, which is the category an investigation
+ * filters for first, and keeping the two vocabularies apart is what makes that filter possible.
+ */
+export const CUSTOMER_AUDIT = {
+  /** A staff member re-enabled an account. */
+  activated: 'customer.activated',
+  /** A staff member disabled an account. The customer can no longer sign in. */
+  deactivated: 'customer.deactivated',
+  /** A staff member cut one of the customer's sessions. Increment 63. */
+  sessionRevoked: 'customer.session_revoked',
+} as const;
+
 /** The `resource_type` for identity audit entries. Matches the table name, as elsewhere. */
 export const USER_RESOURCE = 'app_user';

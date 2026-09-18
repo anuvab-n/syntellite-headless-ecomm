@@ -162,6 +162,55 @@
       "when": 1789024178861,
       "tag": "20260910070938_overconfident_red_skull",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1789468787133,
+      "tag": "20260915103947_next_justice",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1789474114574,
+      "tag": "20260915120834_flawless_boomerang",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1789548133838,
+      "tag": "20260916084213_damp_dust",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1789556391470,
+      "tag": "20260916105951_razorpay_payment_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1789580827867,
+      "tag": "20260916174707_sku_low_stock_threshold",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1789633172246,
+      "tag": "20260917081932_product_media",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1789643436182,
+      "tag": "20260917111036_refunds",
+      "breakpoints": true
     }
   ]
 }

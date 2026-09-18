@@ -98,6 +98,18 @@ export function createPaymentsWebhookRoutes(deps: {
         return;
       }
 
+      if (result.outcome === 'refund_applied') {
+        /*
+         * A refund reached a terminal state. Increment 60.
+         *
+         * Reported under `refund`, never under `payment`: the payment was not read or written
+         * on that path, and echoing a refund's status in the payment field would tell an
+         * operator reading a delivery log that a charge changed when none did.
+         */
+        res.status(200).json({ status: 'applied', refund: { status: result.status } });
+        return;
+      }
+
       /*
        * Acknowledged and not acted on. The reason is returned because the provider's delivery
        * log is the first place an operator looks, and "we received it and chose not to act" is

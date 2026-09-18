@@ -83,6 +83,34 @@ export function createInventoryRoutes(deps: {
    * Deleted SKUs are excluded. INACTIVE SKUs are included, because a merchant managing stock
    * needs to see everything they hold — sellability is a separate question from stock.
    */
+  /**
+   * `GET /admin/inventory/summary` — how many live SKUs are unsellable. Increment 53.
+   *
+   * One number. "Out of stock" means `available <= 0`, i.e. `on_hand - reserved`, so a SKU whose
+   * entire holding is reserved counts — the next customer cannot buy it, which is the fact an
+   * operator acts on. Same visibility predicate as the inventory list, so the tile and the page
+   * it links to agree on which SKUs exist.
+   *
+   * **No low-stock figure.** `stock_item` has no reorder threshold, so "low" has no definition
+   * in this system; supplying one from a dashboard would be a business rule arriving by the back
+   * door.
+   *
+   * Registered BEFORE `/admin/inventory/{skuCode}/history`, and distinct from it by segment
+   * count in any case. Store-scoped from the verified staff token; no query parameters at all.
+   * `401` unauthenticated, `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/inventory/summary',
+    auth,
+    requireStaff,
+    asyncHandler(async (req, res) => {
+      const outOfStockSkus = await inventory.countOutOfStock({
+        storeId: requireUser(req).storeId,
+      });
+      res.status(200).json({ inventory: { outOfStockSkus } });
+    }),
+  );
+
   router.get(
     '/admin/inventory',
     auth,
@@ -94,6 +122,8 @@ export function createInventoryRoutes(deps: {
 
       const page = await inventory.getStockForStore({
         storeId: store.id,
+        ...(query.q === undefined ? {} : { q: query.q }),
+        ...(query.stockState === undefined ? {} : { stockState: query.stockState }),
         limit: query.limit,
         offset: query.offset,
       });

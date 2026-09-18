@@ -22,7 +22,7 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { giveSku, testMediaStorage } from '../../../../tests/helpers/catalogue.ts';
 import { testRecorders } from '../../../../tests/helpers/recording.ts';
 import { newId } from '../../../shared/id.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
@@ -95,6 +95,7 @@ describe('variant options (integration)', () => {
     });
 
     const catalogue = createCatalogueService({
+      storage: testMediaStorage(),
       repository,
       db: db(),
       ...testRecorders(db()),

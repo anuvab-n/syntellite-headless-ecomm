@@ -141,6 +141,31 @@ export const payment = pgTable(
      */
     providerRef: varchar('provider_ref', { length: 255 }),
 
+    /**
+     * The provider's identifier for the CHARGE — for Razorpay, `pay_…`. Increment 55.
+     *
+     * **Not `provider_ref`, and the distinction is the whole reason this column exists.**
+     * `provider_ref` is the Razorpay ORDER (`order_…`): the intent to collect, created before
+     * anybody pays, written by us at initiation. This is the Razorpay PAYMENT (`pay_…`): the
+     * money that actually moved, issued by the provider and known only once it has. They are
+     * different entities in the provider's own model, and the id a merchant pastes into the
+     * Razorpay dashboard to find a charge is this one.
+     *
+     * It is also neither of the other two identifiers nearby: `payment.id` is our row's UUIDv7
+     * and is published nowhere, and `payment_event.provider_event_id` is the webhook DELIVERY
+     * header — a notification id used for deduplication, which a redelivery of the same charge
+     * changes while this stays the same.
+     *
+     * **Nullable, and permanently so.** It is NULL for COD (no gateway, enforced below), NULL
+     * while a payment is still pending, NULL for a failure the provider reported without one,
+     * and NULL for every payment taken before this column existed — those charges are real and
+     * their ids were never captured, so a backfill could only invent them.
+     *
+     * Read from the webhook body at `payload.payment.entity.id` AFTER the signature has been
+     * verified, never from an unverified request, and stored only on the transition it caused.
+     */
+    providerTransactionId: varchar('provider_transaction_id', { length: 255 }),
+
     status: varchar('status', { length: 20 }).notNull().default(INITIAL_PAYMENT_STATUS),
 
     /**
@@ -244,6 +269,39 @@ export const payment = pgTable(
       .where(sql`${t.providerRef} is not null`),
 
     /**
+     * **One charge cannot be recorded against two payments.** Increment 55.
+     *
+     * Partial, because the column is NULL for COD and for everything not yet charged, and those
+     * must not collide with each other; store-leading, because it is the tenant.
+     *
+     * ### The column ORDER differs from `uq_payment_provider_ref` above, and it was measured
+     *
+     * `provider` sits LAST here, not in the middle. The constraint is identical either way — the
+     * same three columns are unique in any order — but the lookup is not, because
+     * `GET /admin/payments?transactionId=…` filters on the charge id WITHOUT naming a provider,
+     * so a middle `provider` leaves the scan skipping every provider value in the store.
+     *
+     * `EXPLAIN (ANALYZE, BUFFERS)` over 170,000 payments across three stores, 102,000 of them
+     * charged, looking up one charge id:
+     *
+     * ```
+     *   no index                       Bitmap Heap Scan, 4006 buffers, 14.789 ms
+     *   (store_id, provider, txn)      Index Scan,        283 buffers,  1.714 ms
+     *   (store_id, txn, provider)      Index Scan,          4 buffers,  0.026 ms
+     * ```
+     *
+     * 66x between the two orders, and the buffer count is the part that matters: the middle
+     * column costs 279 pages on every lookup for a uniqueness guarantee it does not change.
+     *
+     * `uq_payment_provider_ref` keeps its own order because the webhook matches on
+     * `(provider, provider_ref)` together — that query names the provider, so its middle column
+     * is constrained and no skip arises.
+     */
+    uniqueIndex('uq_payment_provider_txn')
+      .on(t.storeId, t.providerTransactionId, t.provider)
+      .where(sql`${t.providerTransactionId} is not null`),
+
+    /**
      * Ownership AND tenancy in one constraint, matching `fk_order_user_store`: the payer must
      * exist, and their store must be the payment's store. A cross-store payment is
      * unrepresentable rather than merely refused by application code.
@@ -266,6 +324,33 @@ export const payment = pgTable(
 
     /** The operator question "what is still pending?", scoped to the tenant. */
     index('ix_payment_store_status').on(t.storeId, t.status),
+
+    /**
+     * **The staff payment list, newest first** — `GET /admin/payments`, Increment 51.
+     *
+     * `ix_payment_store_status` above cannot serve it. That index leads with `(store_id,
+     * status)`, which answers "how many payments are in state X" but leaves the planner with no
+     * ordered path for `ORDER BY created_at DESC` — so an unfiltered page falls back to a
+     * sequential scan of every payment in the table.
+     *
+     * Measured on 170,021 payments across three stores before this index was added, rather than
+     * assumed:
+     *
+     * ```
+     *   without : Seq Scan on payment,                       12.556 ms
+     *   with    : Index Scan Backward using this index,       0.182 ms
+     * ```
+     *
+     * 69x, and the shape matters more than the number: the unindexed plan reads every payment
+     * the store has ever taken to return 25 rows, so its cost grows forever. The indexed plan
+     * reads 25 rows and stops.
+     *
+     * NOT partial and NOT three-column. A status predicate is optional on that endpoint, so a
+     * partial index would serve only some requests; and `id` as a third column would widen every
+     * entry to remove a tiebreak sort over rows that share an instant, which the measurement
+     * above already includes.
+     */
+    index('ix_payment_store_created').on(t.storeId, t.createdAt),
 
     /**
      * The expiry sweeper's ONLY read: due online payments, oldest first.
@@ -316,6 +401,18 @@ export const payment = pgTable(
       'ck_payment_provider_matches_method',
       sql`(${t.method} = 'online' AND ${t.provider} IS NOT NULL)
           OR (${t.method} = 'cod' AND ${t.provider} IS NULL AND ${t.providerRef} IS NULL)`,
+    ),
+
+    /**
+     * **COD never carries a gateway charge id.** Increment 55.
+     *
+     * "COD is always null" is a property of the data, so it is stated where the data lives
+     * rather than left to the one code path that happens to write the column today. A COD
+     * payment has no provider, so a `pay_…` against one would be a charge nobody made.
+     */
+    check(
+      'ck_payment_provider_txn_only_online',
+      sql`${t.providerTransactionId} IS NULL OR ${t.method} = 'online'`,
     ),
 
     /**

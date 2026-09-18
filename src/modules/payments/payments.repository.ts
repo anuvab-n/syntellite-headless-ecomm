@@ -1,9 +1,10 @@
-import { and, asc, count, desc, eq, isNotNull, lte } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gte, isNotNull, lt, lte, type SQL } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { order } from '../../db/schema/orders.js';
 import { payment, paymentEvent } from '../../db/schema/payments.js';
 import { executor } from '../../db/transaction.js';
+import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
 import { newId } from '../../shared/id.js';
 
 /**
@@ -57,6 +58,7 @@ export type PaymentRecord = {
   readonly method: PaymentMethod;
   readonly provider: PaymentProvider | null;
   readonly providerRef: string | null;
+  readonly providerTransactionId: string | null;
   readonly status: PaymentStatus;
   readonly currency: string;
   readonly amount: string;
@@ -93,6 +95,7 @@ const PAYMENT_COLUMNS = {
   method: payment.method,
   provider: payment.provider,
   providerRef: payment.providerRef,
+  providerTransactionId: payment.providerTransactionId,
   status: payment.status,
   currency: payment.currency,
   amount: payment.amount,
@@ -129,6 +132,7 @@ function toPaymentRecord(row: {
   method: string;
   provider: string | null;
   providerRef: string | null;
+  providerTransactionId: string | null;
   status: string;
   currency: string;
   amount: string;
@@ -358,6 +362,15 @@ export function createPaymentsRepository(deps: { db: Database }) {
       fromStatus: PaymentStatus;
       toStatus: PaymentStatus;
       failureCode: string | null;
+      /**
+       * The provider's charge id, when the notification driving this transition carried one.
+       * Increment 55.
+       *
+       * ABSENT means "this caller has nothing to say about it" and leaves the stored value
+       * alone; `null` is not how that is expressed, because a transition with no charge id must
+       * not erase one an earlier delivery recorded. Only the webhook path ever supplies it.
+       */
+      providerTransactionId?: string | null;
       at: Date;
     }): Promise<boolean> {
       const updated = await executor(db)
@@ -365,6 +378,9 @@ export function createPaymentsRepository(deps: { db: Database }) {
         .set({
           status: params.toStatus,
           failureCode: params.failureCode,
+          ...(params.providerTransactionId === undefined || params.providerTransactionId === null
+            ? {}
+            : { providerTransactionId: params.providerTransactionId }),
           updatedAt: params.at,
         })
         .where(
@@ -411,6 +427,63 @@ export function createPaymentsRepository(deps: { db: Database }) {
         .offset(params.offset);
 
       const [counted] = await executor(db).select({ total: count() }).from(payment).where(where);
+
+      return {
+        items: rows.map((row) => ({ ...toPaymentRecord(row), orderNumber: row.orderNumber })),
+        total: counted?.total ?? 0,
+      };
+    },
+
+    /**
+     * **A page of the STORE's payments, whosever they are.** Increment 51.
+     *
+     * The staff counterpart of `listForUser`, and a separate method for the reason
+     * `findStateByOrderId` is separate from the owner-scoped reads: a caller that forgot to pass
+     * a `userId` would otherwise silently get store-wide reach. Two names, two predicates, and
+     * the narrower one stays the default.
+     *
+     * `store_id` is NOT relaxed and never comes from input — the caller takes it from the staff
+     * member's verified token. Only ownership within the store is dropped.
+     *
+     * **One query for the page, one for the total, and no N+1.** `order_number` comes from the
+     * same `INNER JOIN` that `listForUser` already uses rather than a lookup per row, so a page
+     * of 100 payments is one round trip. The join cannot multiply rows: `uq_payment_order` makes
+     * the relationship one-to-one, and the join is additionally pinned on `store_id` so a row
+     * can only ever meet its own tenant's order.
+     *
+     * Page and count share ONE predicate, so a caller on the last page is never told the total
+     * counted rows it cannot see. Ordered by `created_at DESC, id DESC`: `created_at` alone is
+     * not a total order — two payments can share an instant — and a non-total order makes
+     * `offset` pagination silently skip and repeat rows.
+     */
+    async listForStore(params: {
+      storeId: string;
+      filters: AdminPaymentFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: (PaymentRecord & { orderNumber: string })[]; total: number }> {
+      const where = adminPaymentPredicate(params.storeId, params.filters);
+
+      /*
+       * The join is repeated on the count rather than factored away: the `orderNumber` filter is
+       * expressed over the joined table, and a count over `payment` alone would silently ignore
+       * it and report a total for a different query than the page.
+       */
+      const [rows, [counted]] = await Promise.all([
+        executor(db)
+          .select({ ...PAYMENT_COLUMNS, orderNumber: order.orderNumber })
+          .from(payment)
+          .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+          .where(where)
+          .orderBy(desc(payment.createdAt), desc(payment.id))
+          .limit(params.limit)
+          .offset(params.offset),
+        executor(db)
+          .select({ total: count() })
+          .from(payment)
+          .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+          .where(where),
+      ]);
 
       return {
         items: rows.map((row) => ({ ...toPaymentRecord(row), orderNumber: row.orderNumber })),
@@ -506,6 +579,36 @@ export function createPaymentsRepository(deps: { db: Database }) {
         : { status: row.status as PaymentStatus, method: row.method as PaymentMethod };
     },
 
+    /**
+     * **One store's payment, addressed by its ORDER NUMBER.** Increment 55.
+     *
+     * The staff counterpart of `findByOrderId`, and deliberately not user-scoped: staff read a
+     * payment regardless of who placed the order. Store-scoped on the payment AND on the join,
+     * so no combination of rows reaches past one tenant.
+     *
+     * Addressed by order number rather than by `payment.id` because the payment's own id is
+     * published nowhere — the staff list omits it, and inventing an address staff cannot obtain
+     * would make the endpoint unreachable. `uq_payment_order` makes the answer at most one row.
+     *
+     * An unknown number, another store's number, and an order with no payment are all
+     * `undefined`, so the caller answers one `404` and distinguishes nothing.
+     */
+    async findByOrderNumberForStore(params: {
+      orderNumber: string;
+      storeId: string;
+    }): Promise<(PaymentRecord & { orderNumber: string }) | undefined> {
+      const [row] = await executor(db)
+        .select({ ...PAYMENT_COLUMNS, orderNumber: order.orderNumber })
+        .from(payment)
+        .innerJoin(order, and(eq(order.id, payment.orderId), eq(order.storeId, payment.storeId)))
+        .where(and(eq(payment.storeId, params.storeId), eq(order.orderNumber, params.orderNumber)))
+        .limit(1);
+
+      return row === undefined
+        ? undefined
+        : { ...toPaymentRecord(row), orderNumber: row.orderNumber };
+    },
+
     /** The transition timeline for one payment, oldest first. Store-scoped. */
     async listEvents(params: {
       paymentId: string;
@@ -524,4 +627,70 @@ export function createPaymentsRepository(deps: { db: Database }) {
       return rows.map(toEventRecord);
     },
   };
+}
+
+/** The filters the staff payment list accepts. Every one of them is optional. */
+export type AdminPaymentFilters = {
+  readonly status?: string;
+  readonly method?: string;
+  readonly provider?: string;
+  readonly orderNumber?: string;
+  readonly transactionId?: string;
+  readonly createdFrom?: Date;
+  readonly createdTo?: Date;
+};
+
+/**
+ * The staff list's WHERE clause: tenancy, then whichever filters were supplied.
+ *
+ * A free function rather than a closure inside the factory because it takes everything it needs
+ * and captures nothing — which is what makes it readable as the one place tenancy is applied.
+ * `storeId` is the first conjunct and is not optional; every filter below can only narrow, so
+ * there is no combination of query parameters that widens the result past one tenant.
+ */
+function adminPaymentPredicate(storeId: string, filters: AdminPaymentFilters): SQL | undefined {
+  const clauses: SQL[] = [eq(payment.storeId, storeId)];
+
+  if (filters.status !== undefined) clauses.push(eq(payment.status, filters.status));
+  if (filters.method !== undefined) clauses.push(eq(payment.method, filters.method));
+  if (filters.provider !== undefined) clauses.push(eq(payment.provider, filters.provider));
+
+  /*
+   * An exact match on the JOINED order, not a search. `uq_payment_order` means this narrows to
+   * at most one payment, and it is expressed against `order.order_number` rather than resolved
+   * to an id first — one query rather than two, and an unknown number is an empty page rather
+   * than a 404, which is the right answer for a filter.
+   */
+  if (filters.orderNumber !== undefined) {
+    clauses.push(eq(order.orderNumber, filters.orderNumber));
+  }
+
+  /*
+   * An EXACT match on the provider's charge id, not a search. Increment 55.
+   *
+   * `uq_payment_provider_txn` makes it at most one row per store and serves the lookup, so no
+   * index was added for it. A substring search would be the first unbounded scan in this
+   * module, over a column whose contents this system does not choose.
+   */
+  if (filters.transactionId !== undefined) {
+    clauses.push(eq(payment.providerTransactionId, filters.transactionId));
+  }
+
+  /*
+   * The lower bound needs no adjustment: every microsecond inside the named millisecond is
+   * already greater than its start, so `>=` admits them all.
+   */
+  if (filters.createdFrom !== undefined) clauses.push(gte(payment.createdAt, filters.createdFrom));
+  /*
+   * STRICT `<` against the start of the NEXT millisecond, not `<=` against this one.
+   *
+   * `created_at` is microsecond-precise in the database and millisecond-precise everywhere in
+   * this API, so `<=` dropped every row whose stored microseconds were non-zero — including the
+   * row a client had just read the bound from. `exclusiveEndOfMillisecond` carries the reasoning.
+   */
+  if (filters.createdTo !== undefined) {
+    clauses.push(lt(payment.createdAt, exclusiveEndOfMillisecond(filters.createdTo)));
+  }
+
+  return and(...clauses);
 }

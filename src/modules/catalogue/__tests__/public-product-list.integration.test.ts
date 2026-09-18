@@ -13,7 +13,7 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { giveSku } from '../../../../tests/helpers/catalogue.ts';
+import { giveSku, testMediaStorage } from '../../../../tests/helpers/catalogue.ts';
 import { newId } from '../../../shared/id.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
 import { createCatalogueRepository } from '../catalogue.repository.js';
@@ -72,6 +72,7 @@ describe('GET /api/v1/products (integration)', () => {
           repository,
           db: db(),
           ...testRecorders(db()),
+          storage: testMediaStorage(),
           logger: silentLogger,
         }),
         verifyAccessToken: () => {

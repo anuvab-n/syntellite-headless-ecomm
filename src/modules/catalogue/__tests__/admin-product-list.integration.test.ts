@@ -15,7 +15,11 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { DEFAULT_SKU_PRICE, giveSku } from '../../../../tests/helpers/catalogue.ts';
+import {
+  DEFAULT_SKU_PRICE,
+  giveSku,
+  testMediaStorage,
+} from '../../../../tests/helpers/catalogue.ts';
 import { newId } from '../../../shared/id.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
@@ -99,6 +103,7 @@ describe('GET /api/v1/admin/products (integration)', () => {
           repository,
           db: db(),
           ...testRecorders(db()),
+          storage: testMediaStorage(),
           logger: silentLogger,
         }),
         verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
@@ -488,10 +493,13 @@ describe('GET /api/v1/admin/products (integration)', () => {
 
       /**
        * `strictObject` on the query. `?limitt=1` returning a default page of 20 would look like
-       * success while silently ignoring the caller's intent — and `?status=` or `?search=` must
-       * fail loudly rather than appear to work, since neither is implemented.
+       * success while silently ignoring the caller's intent.
+       *
+       * `status` and `q` became REAL parameters in Increment 58 and have their own cases below.
+       * `search` stays unknown deliberately: searching is `q`'s job, and a second spelling of one
+       * intent is a second thing to keep consistent.
        */
-      for (const q of ['?limitt=1', '?status=draft', '?search=shirt', '?sort=name', '?storeId=x']) {
+      for (const q of ['?limitt=1', '?search=shirt', '?sort=name', '?storeId=x', '?status=nope']) {
         const response = await list(app, q, token);
         expect(response.status, q).toBe(400);
       }
@@ -505,8 +513,14 @@ describe('GET /api/v1/admin/products (integration)', () => {
 
       const response = await list(app, '', token);
 
-      expect(Object.keys(response.body).sort()).toEqual(['pagination', 'products']);
+      expect(Object.keys(response.body).sort()).toEqual(['counts', 'pagination', 'products']);
       expect(Object.keys(response.body.pagination).sort()).toEqual(['limit', 'offset', 'total']);
+      expect(Object.keys(response.body.counts).sort()).toEqual([
+        'active',
+        'archived',
+        'draft',
+        'total',
+      ]);
     });
 
     it('gives every item the shared product shape, exactly', async () => {

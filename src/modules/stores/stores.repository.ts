@@ -39,10 +39,77 @@ const RESOLVED_COLUMNS = {
   timezone: store.timezone,
 } as const;
 
+/**
+ * The store's BUSINESS PROFILE, as the admin settings screen sees it. Increment 62.
+ *
+ * Deliberately excludes every GST field — `legal_name`, `gstin`, `pan` and the whole origin
+ * address. Those are owned by `PUT /admin/store/tax-profile`, which validates a GSTIN against
+ * its checksum and a state code against the place-of-supply rules. Two endpoints writing the
+ * same columns with different validation is how one of them ends up being the weak one.
+ *
+ * `slug` and `currency` are published but not editable: the slug is how the store is RESOLVED
+ * on every request, and the currency is denominated into `NUMERIC(19,4)` money on every order,
+ * payment, refund and invoice already written. Changing either is a migration, not a setting.
+ */
+export type StoreBusinessProfile = {
+  readonly slug: string;
+  readonly name: string;
+  readonly domain: string | null;
+  readonly currency: string;
+  readonly defaultLocale: string;
+  readonly timezone: string;
+  readonly isActive: boolean;
+};
+
+const BUSINESS_PROFILE_COLUMNS = {
+  slug: store.slug,
+  name: store.name,
+  domain: store.domain,
+  currency: store.currency,
+  defaultLocale: store.defaultLocale,
+  timezone: store.timezone,
+  isActive: store.isActive,
+} as const;
+
 export function createStoreRepository(deps: { db: Database }) {
   const { db } = deps;
 
   return {
+    /** The store's editable business identity. Increment 62. */
+    async findBusinessProfile(params: {
+      storeId: string;
+    }): Promise<StoreBusinessProfile | undefined> {
+      const [row] = await executor(db)
+        .select(BUSINESS_PROFILE_COLUMNS)
+        .from(store)
+        .where(eq(store.id, params.storeId))
+        .limit(1);
+      return row;
+    },
+
+    /**
+     * Update the business identity. Increment 62.
+     *
+     * The column list is closed and contains no GST field, no `slug`, no `currency` and no
+     * `id`: a caller cannot widen it, because the method accepts only these three values.
+     */
+    async updateBusinessProfile(params: {
+      storeId: string;
+      values: {
+        name?: string | undefined;
+        domain?: string | null | undefined;
+        defaultLocale?: string | undefined;
+        timezone?: string | undefined;
+      };
+      at: Date;
+    }): Promise<StoreBusinessProfile | undefined> {
+      const [row] = await executor(db)
+        .update(store)
+        .set({ ...params.values, updatedAt: params.at })
+        .where(eq(store.id, params.storeId))
+        .returning(BUSINESS_PROFILE_COLUMNS);
+      return row;
+    },
     /**
      * Look up an ACTIVE store by slug.
      *

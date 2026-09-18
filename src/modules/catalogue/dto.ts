@@ -5,8 +5,10 @@ import { boundedIntParam, type PaginationResponse } from '../../shared/paginatio
 import { STORAGE_SCALE } from '../../shared/money.js';
 import {
   PRODUCT_STATUSES,
+  PRODUCT_STOCK_STATE_FILTERS,
   type OptionRecord,
   type OptionValueRecord,
+  type MediaRecord,
   type ProductRecord,
   type SkuOptionRecord,
   type SkuRecord,
@@ -272,6 +274,88 @@ export const ListProductsQuerySchema = z.strictObject({
 });
 
 export type ListProductsQuery = z.infer<typeof ListProductsQuerySchema>;
+
+/* ── POST /admin/products/bulk ──────────────────────────────────── */
+
+/**
+ * The most products one bulk action may touch. Increment 58.
+ *
+ * A ceiling rather than no limit: the action runs in ONE transaction, and an unbounded selection
+ * would hold row locks across the whole catalogue for as long as it took.
+ *
+ * Set to the list's own maximum page rather than to an invented number, so "select all on this
+ * page" always fits exactly. The two moving together is the point — a bulk cap smaller than a
+ * page would make the screen's own select-all fail.
+ */
+export const PRODUCT_BULK_MAX_ITEMS = PRODUCT_LIST_MAX_LIMIT;
+
+/**
+ * The lifecycle actions a bulk request may ask for.
+ *
+ * Exactly the three the single-product routes already expose. A bulk action able to do
+ * something no individual action can would be a second, less-guarded lifecycle — and the
+ * transitions are enforced by the same table either way.
+ */
+export const PRODUCT_BULK_ACTIONS = ['publish', 'archive', 'delete'] as const;
+
+export const BulkProductActionRequestSchema = z.strictObject({
+  action: z.enum(PRODUCT_BULK_ACTIONS),
+
+  /**
+   * The products to act on, by slug.
+   *
+   * Slugs rather than ids, matching every other product route: a merchant addresses a product
+   * by its slug, and internal ids are published nowhere in this API.
+   *
+   * Non-empty, because an empty selection is a client bug rather than a no-op worth a 200 —
+   * the same judgement §28 makes about an over-maximum page being rejected rather than clamped.
+   * Bounded, because the whole batch commits in one transaction.
+   *
+   * Duplicates are ACCEPTED here and collapsed by the service: a slug named twice is one
+   * product, and rejecting the request would be pedantry rather than protection.
+   */
+  slugs: z.array(slugField).min(1, 'must not be empty').max(PRODUCT_BULK_MAX_ITEMS),
+});
+
+export type BulkProductActionRequest = z.infer<typeof BulkProductActionRequestSchema>;
+
+/**
+ * What a bulk action did.
+ *
+ * `affected` and `slugs` both, because they answer different questions: a count for the
+ * toast, the list for an operator reconciling what they selected against what moved. Sorted,
+ * so two identical requests produce identical responses.
+ *
+ * There is no partial-failure shape, deliberately. The action is all-or-nothing: an unknown
+ * slug or an illegal transition refuses the WHOLE batch, so a 200 means every product named
+ * moved.
+ */
+export type BulkProductActionResponse = {
+  action: string;
+  affected: number;
+  slugs: string[];
+};
+
+/**
+ * How many products the store has in each lifecycle status. Increment 58.
+ *
+ * The list screen’s tabs. Store-scoped and soft-delete aware, and deliberately NOT narrowed
+ * by the request’s own `q` or `status`: a tab count exists to say how many rows
+ * switching to that tab would show, and a count that moved as the operator typed could not
+ * answer that question.
+ *
+ * So `counts.total` and `pagination.total` differ whenever a filter is applied, and
+ * that is correct — one counts the store, the other counts the query.
+ *
+ * Every status is present including at zero, so the shape does not change with the data, and
+ * `draft + active + archived === total` always holds.
+ */
+export type ProductCountsResponse = {
+  total: number;
+  draft: number;
+  active: number;
+  archived: number;
+};
 /**
  * A storefront search term.
  *
@@ -362,9 +446,62 @@ export const PublicListProductsQuerySchema = ListProductsQuerySchema.extend({
 
 export type PublicListProductsQuery = z.infer<typeof PublicListProductsQuerySchema>;
 
+/**
+ * The STAFF product list’s query. Increment 58.
+ *
+ * `ListProductsQuerySchema` plus the two things the merchant list screen needs and the
+ * storefront does not: a free-text lookup and a lifecycle filter. Kept as an extension rather
+ * than a widening of the shared schema, because the public list must NOT gain a `status`
+ * parameter — a storefront that could ask for drafts would publish unfinished work.
+ *
+ * Still `strictObject` by inheritance, so an unknown key — `storeId` included — is a 400.
+ */
+export const AdminListProductsQuerySchema = ListProductsQuerySchema.extend({
+  /**
+   * A case-insensitive SUBSTRING over the product’s name and slug.
+   *
+   * Trimmed before the length checks, so `?q=%20%20` is an empty search and a 400 rather
+   * than a query for two spaces — the same rule the storefront’s `q` follows, through the
+   * same field. Description is deliberately not searched: it is long-form prose, and matching
+   * it would turn a lookup into a full-text search this system has no index for.
+   */
+  q: searchTermField.optional(),
+
+  /**
+   * Exactly one lifecycle status, from the real vocabulary.
+   *
+   * `z.enum` over `PRODUCT_STATUSES`, so an invented status is a 400 naming the field
+   * rather than a filter that silently matches nothing and reads as an empty catalogue.
+   */
+  status: z.enum(PRODUCT_STATUSES).optional(),
+
+  /**
+   * Aggregate stock state across the product's live SKUs. Increment 63.
+   *
+   * The enum comes from the repository, so the API accepts exactly what the predicate
+   * implements. `out_of_stock` means NO live SKU has stock — a product with one sold-out
+   * variant and one in stock is in stock, and a product with no SKUs at all is out of stock.
+   * `in_stock` and `low_stock` deliberately OVERLAP: a low SKU is still sellable, so a merchant
+   * filtering for what they can sell must see it.
+   *
+   * **There is no `category` filter, and this increment does not add one.** The system has no
+   * category model — no table, no relation, nothing to derive one from — and inventing a
+   * merchandising taxonomy to satisfy a query parameter would be a subsystem smuggled in
+   * through a filter. Recorded as a structural gap instead.
+   */
+  stockState: z.enum(PRODUCT_STOCK_STATE_FILTERS).optional(),
+});
+
+export type AdminListProductsQuery = z.infer<typeof AdminListProductsQuerySchema>;
+
 export type ProductListResponse = {
   products: ProductResponse[];
   pagination: PaginationResponse;
+};
+
+/** The staff list: the public shape plus the tab counts. Increment 58. */
+export type AdminProductListResponse = ProductListResponse & {
+  counts: ProductCountsResponse;
 };
 
 export function toProductListResponse(
@@ -430,11 +567,42 @@ const skuNameField = z.string().trim().max(300);
  * sending any of them gets a validation error naming the field — the right answer to what is
  * either a probe for a tenancy hole or a badly confused integration.
  */
+/**
+ * The reorder point, in whole units. Increment 57's `sku.low_stock_threshold`.
+ *
+ * Bounded above for the same reason `sortOrderField` is: the column is a 32-bit integer, and a
+ * threshold in the billions is a typo rather than a merchandising decision. `0` is permitted and
+ * meaningful — paired with the `available > 0` half of the low-stock rule it says "warn me only
+ * when this is gone", which is how a SKU is configured as never-low without clearing the column.
+ */
+const lowStockThresholdField = z.int().min(0).max(1_000_000);
+
 export const CreateSkuRequestSchema = z.strictObject({
-  code: skuCodeField,
+  /**
+   * OPTIONAL since Increment 58. Absent means the server generates one.
+   *
+   * The Figma variant editor lets a merchant name the code or let the system pick, and this is
+   * that choice on the wire. A generated code is `PREFIX-XXXXXX`, derived from the product slug
+   * — see `generateSkuCode` — and is drawn again if it collides, with the unique index as the
+   * arbiter rather than a preceding read.
+   *
+   * Supplying one keeps the old behaviour exactly: a duplicate is a conflict naming the code,
+   * never a silent substitution of a different one.
+   */
+  code: skuCodeField.optional(),
   /** Optional. Absent becomes the column default of an empty string, never NULL. */
   name: skuNameField.optional(),
   price: priceField,
+  /**
+   * Optional, and absent means NULL rather than zero.
+   *
+   * NULL is "nobody has said what low means for this SKU", and such a SKU is never reported as
+   * low however little of it is left — the column's own note in `db/schema/catalogue.ts` explains
+   * why that is not the same as a threshold of zero. Defaulting a create to `0` here would make
+   * every new SKU a never-low SKU by accident; defaulting it to any positive number would invent
+   * a merchandising policy this endpoint has no basis for.
+   */
+  lowStockThreshold: lowStockThresholdField.optional(),
   /**
    * Optional, defaulting to sellable.
    *
@@ -478,9 +646,19 @@ export const UpdateSkuRequestSchema = z
     name: skuNameField.optional(),
     price: priceField.optional(),
     isActive: z.boolean().optional(),
+    /**
+     * **Nullable here, unlike on creation** — the same shape `PATCH /admin/shipments/{id}` uses
+     * for its tracking fields, and for the same reason.
+     *
+     * On a create, absent is the only way to say "no threshold". On an edit the two must be told
+     * apart: omitting the key leaves whatever is configured alone, and an explicit `null` clears
+     * it back to never-warn. Without the null arm a merchant could set a threshold and never
+     * remove it except by deleting the SKU.
+     */
+    lowStockThreshold: lowStockThresholdField.nullable().optional(),
   })
   .refine((body) => Object.keys(body).length > 0, {
-    message: 'at least one of name, price, or isActive must be provided',
+    message: 'at least one of name, price, isActive, or lowStockThreshold must be provided',
   });
 
 export type UpdateSkuRequest = z.infer<typeof UpdateSkuRequestSchema>;
@@ -517,6 +695,14 @@ export type SkuResponse = {
   /** Decimal string at the storage scale. Never a JSON number — see `priceField`. */
   price: string;
   isActive: boolean;
+  /**
+   * The reorder point, or `null` when none is configured.
+   *
+   * `null` is published rather than hidden or coerced to `0`: the merchant screen that sets this
+   * has to be able to show an empty field as empty, and the two values mean different things to
+   * the low-stock query.
+   */
+  lowStockThreshold: number | null;
   /**
    * The SKU's variant combination — one entry per option, empty for an option-less SKU.
    *
@@ -565,6 +751,7 @@ export function toSkuResponse(
     name: record.name,
     price: record.price,
     isActive: record.isActive,
+    lowStockThreshold: record.lowStockThreshold,
     options: options.map(toSkuOptionResponse),
     createdAt: record.createdAt.toISOString(),
     updatedAt: record.updatedAt.toISOString(),
@@ -819,3 +1006,186 @@ export function groupValuesByOption(
 
   return byOption;
 }
+
+/* ── Product media. Increment 58. ────────────────────────────────────────── */
+
+/**
+ * The object's key in the bucket, as whatever uploaded it reported.
+ *
+ * Bounded at the column's width and restricted to characters that are safe in a key and in a
+ * URL path. Leading slashes and `..` are refused: a key is a location inside this store's
+ * prefix, and one that could climb out of it would be a path-traversal in the storage layer.
+ */
+const storageKeyField = z
+  .string()
+  .trim()
+  .min(1)
+  .max(512)
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9._/-]*$/,
+    'must start with a letter or digit and contain only letters, digits, dots, underscores, slashes, or hyphens',
+  )
+  .refine((key) => !key.includes('..'), { message: 'must not contain a parent-directory segment' });
+
+/**
+ * The image formats a storefront can actually render.
+ *
+ * A closed list rather than "any `image/*`": an SVG is a script container, and a TIFF is not
+ * displayable in a browser. Accepting a type nothing can show would let a merchant upload an
+ * image that silently never appears.
+ */
+export const MEDIA_CONTENT_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/avif',
+  'image/gif',
+] as const;
+
+/** The largest object this API will hand out an upload target for. */
+export const MEDIA_MAX_BYTES = 10 * 1024 * 1024;
+
+const positionField = z.int().min(0).max(1000);
+
+const CreateMediaRequestBodySchema = z.strictObject({
+  storageKey: storageKeyField,
+  contentType: z.enum(MEDIA_CONTENT_TYPES),
+
+  /**
+   * Which variant this image is of. Absent means the product generally.
+   *
+   * A SKU CODE rather than an id, matching every other product route: internal ids are published
+   * nowhere in this API. A code belonging to a different product is a `404`, indistinguishable
+   * from one that does not exist.
+   */
+  skuCode: z.string().trim().min(1).max(64).optional(),
+
+  /** Accessibility text. Absent becomes the column default of an empty string, never NULL. */
+  altText: z.string().trim().max(300).optional(),
+
+  /**
+   * Pixel dimensions, as a PAIR.
+   *
+   * Both or neither — `ck_product_media_dimensions` enforces the same thing in the database.
+   * Half a measurement cannot lay anything out and is worse than none, because it looks usable.
+   */
+  width: z.int().min(1).max(20000).optional(),
+  height: z.int().min(1).max(20000).optional(),
+
+  byteSize: z.int().min(1).max(MEDIA_MAX_BYTES).optional(),
+
+  /** Absent appends to the end of the gallery rather than jumping to the front. */
+  position: positionField.optional(),
+});
+
+/**
+ * Both dimensions or neither, rejected at the edge rather than only by the database.
+ *
+ * `ck_product_media_dimensions` is the backstop, but a constraint violation surfaces as a
+ * `500`; a caller that sent half a pair made a request error and is owed a `400` naming it.
+ */
+export const CreateMediaRequestSchema = CreateMediaRequestBodySchema.refine(
+  (body) => (body.width === undefined) === (body.height === undefined),
+  { message: 'width and height must be provided together', path: ['height'] },
+);
+
+export type CreateMediaRequest = z.infer<typeof CreateMediaRequestSchema>;
+
+/**
+ * The editable image fields. Every one optional, but **at least one required**.
+ *
+ * An empty body would bump `updated_at`, return 200, and leave a caller believing something
+ * changed — the same reasoning `UpdateProductRequestSchema` applies.
+ *
+ * `storageKey`, `productId` and `skuCode` are absent and therefore unreachable rather than
+ * ignored: repointing an image at a different object or a different product is not an edit, it
+ * is a delete plus a create, and allowing it here would let one row's history describe two
+ * different images.
+ */
+export const UpdateMediaRequestSchema = z
+  .strictObject({
+    altText: z.string().trim().max(300).optional(),
+    position: positionField.optional(),
+    isPrimary: z.boolean().optional(),
+  })
+  .refine((body) => Object.keys(body).length > 0, {
+    message: 'at least one of altText, position or isPrimary must be provided',
+  });
+
+export type UpdateMediaRequest = z.infer<typeof UpdateMediaRequestSchema>;
+
+/**
+ * What a client must say before it can be told where to upload.
+ *
+ * The content type and the size are both required because the storage adapter signs them into
+ * the target: a pre-signed URL that accepted any bytes of any size would be an open upload
+ * endpoint for anyone who obtained it.
+ */
+export const CreateUploadTargetRequestSchema = z.strictObject({
+  contentType: z.enum(MEDIA_CONTENT_TYPES),
+  byteSize: z.int().min(1).max(MEDIA_MAX_BYTES),
+});
+
+export type CreateUploadTargetRequest = z.infer<typeof CreateUploadTargetRequestSchema>;
+
+/** The media id in a path. A malformed one is a 400, matching every other id parameter here. */
+export const MediaIdParamsSchema = z.object({ id: z.uuid() });
+export type MediaIdParams = z.infer<typeof MediaIdParamsSchema>;
+
+/**
+ * One image on the wire.
+ *
+ * `url` is COMPOSED from the storage key and the deployment's delivery host, and is `null` when
+ * no host is configured — the row is still a valid reference, it simply cannot be displayed from
+ * this deployment yet. `storageKey` travels beside it because a client that just uploaded an
+ * object needs to correlate the two, and because a merchant moving buckets needs to see it.
+ *
+ * `skuCode` rather than `skuId`: internal ids are published nowhere in this API.
+ */
+export type MediaResponse = {
+  id: string;
+  url: string | null;
+  storageKey: string;
+  contentType: string;
+  altText: string;
+  skuCode: string | null;
+  width: number | null;
+  height: number | null;
+  byteSize: number | null;
+  position: number;
+  isPrimary: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export function toMediaResponse(
+  record: MediaRecord,
+  /** Composes a delivery URL from the key, or returns `null` when none is configured. */
+  publicUrl: (storageKey: string) => string | null,
+  /** The SKU code this image is of, when it is of one. Resolved by the caller in one batch. */
+  skuCode: string | null,
+): MediaResponse {
+  return {
+    id: record.id,
+    url: publicUrl(record.storageKey),
+    storageKey: record.storageKey,
+    contentType: record.contentType,
+    altText: record.altText,
+    skuCode,
+    width: record.width,
+    height: record.height,
+    byteSize: record.byteSize,
+    position: record.position,
+    isPrimary: record.isPrimary,
+    createdAt: record.createdAt.toISOString(),
+    updatedAt: record.updatedAt.toISOString(),
+  };
+}
+
+/** Where to send an object's bytes. Mirrors `MediaUploadTarget` in the service. */
+export type MediaUploadTargetResponse = {
+  uploadUrl: string;
+  storageKey: string;
+  expiresAt: string;
+  requiredHeaders: Record<string, string>;
+};

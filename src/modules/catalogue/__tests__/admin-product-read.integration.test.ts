@@ -15,7 +15,11 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import { DEFAULT_SKU_PRICE, giveSku } from '../../../../tests/helpers/catalogue.ts';
+import {
+  DEFAULT_SKU_PRICE,
+  giveSku,
+  testMediaStorage,
+} from '../../../../tests/helpers/catalogue.ts';
 import { newId } from '../../../shared/id.js';
 import { createIdentityRepository } from '../../identity/identity.repository.js';
 import { createIdentityRoutes } from '../../identity/identity.routes.js';
@@ -79,6 +83,7 @@ describe('GET /api/v1/admin/products/:slug (integration)', () => {
     });
 
     const catalogue = createCatalogueService({
+      storage: testMediaStorage(),
       repository: createCatalogueRepository({ db: db() }),
       db: db(),
       ...testRecorders(db()),

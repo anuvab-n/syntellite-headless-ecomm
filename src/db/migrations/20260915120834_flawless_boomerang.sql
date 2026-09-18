@@ -1,0 +1,2 @@
+CREATE INDEX "ix_app_user_store_created" ON "app_user" USING btree ("store_id","created_at") WHERE "app_user"."deleted_at" IS NULL;--> statement-breakpoint
+CREATE INDEX "ix_payment_store_created" ON "payment" USING btree ("store_id","created_at");

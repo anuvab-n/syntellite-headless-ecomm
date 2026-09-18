@@ -58,8 +58,14 @@ import {
   createOrdersRepository,
   createOrdersRoutes,
   createOrdersService,
+  toAdminOrderListResponse,
   type OrdersService,
 } from './modules/orders/index.js';
+import {
+  createDashboardRoutes,
+  createDashboardService,
+  type DashboardService,
+} from './modules/dashboard/index.js';
 import {
   createAddressesRepository,
   createAddressesRoutes,
@@ -90,6 +96,8 @@ import {
   createPaymentsService,
   createPaymentsWebhookRoutes,
   createPaymentExpirySweeper,
+  createRefundsRepository,
+  createRefundsService,
   type PaymentExpirySweeper,
   type PaymentsService,
 } from './modules/payments/index.js';
@@ -104,8 +112,14 @@ import {
   createInvoicingService,
   type InvoicingService,
 } from './modules/invoicing/index.js';
-import { createDefaultStoreResolver, createStoreRepository } from './modules/stores/index.js';
+import {
+  createDefaultStoreResolver,
+  createStoreRepository,
+  createStoresRoutes,
+  createStoresService,
+} from './modules/stores/index.js';
 import { createRazorpayGateway, createUnconfiguredGateway } from './razorpay/gateway.js';
+import { createUnconfiguredMediaStorage } from './storage/media-storage.js';
 import type { HandlerRegistry } from './db/outbox/publisher.js';
 import { NotFound } from './shared/errors.js';
 import type { IdempotencyStore } from './shared/idempotency.js';
@@ -292,6 +306,14 @@ export type AppContainer = {
    * The fourth state space. It never writes `order.status` and never writes a payment row.
    */
   fulfilment: FulfilmentService;
+  /**
+   * The admin dashboard's composition layer. Increment 57.
+   *
+   * Exposed like every other service so a test can exercise the ports directly — which is the
+   * only level at which the aggregates' own tenancy predicates are observable, since the route
+   * only ever hands them a store id the token already fixed.
+   */
+  dashboard: DashboardService;
   /**
    * GST: tax classes, effective-dated rates, seller and customer tax identity, and the
    * checkout determination.
@@ -570,6 +592,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    */
   const stores = createStoreRepository({ db: db.db });
   const identityRepository = createIdentityRepository({ db: db.db });
+  /* Built beside the repository it wraps; `audit` is constructed above both. Increment 62. */
   const refreshSessions = createRefreshSessionRepository({ db: db.db });
 
   /**
@@ -652,6 +675,23 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      */
     events: outbox.events,
     audit,
+    /**
+     * Order aggregates for the staff customer surface, adapted to the port identity declares.
+     * Increment 56.
+     *
+     * A LATE binding, for the same reason the orders/payments pair above is one: `orders` is
+     * constructed below, because its router needs the token verifier identity builds. The arrow
+     * defers the lookup to call time, which is what lets both modules stay ignorant of each
+     * other — an eager reference here would be a `TypeError` at construction, and a direct
+     * import would be the cross-module dependency `dependency-cruiser` rejects.
+     *
+     * The direction matters: orders has joined `app_user` since Increment 50, so identity
+     * reading the order table would invert an existing dependency. Identity says which
+     * customers; orders says what they ordered. Neither names the other.
+     */
+    customerOrderStats: {
+      forCustomers: (input) => orders.orderStatsForCustomers(input),
+    },
     loginAttempts: {
       async recordFailure({ storeId, email }) {
         await rateLimiter.record(
@@ -683,6 +723,22 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     db: db.db,
     events: outbox.events,
     audit,
+    /**
+     * Object storage for product imagery, adapted to the port the catalogue declares.
+     * Increment 58.
+     *
+     * The unconfigured adapter, and deliberately so: this project has no S3 SDK, so nothing here
+     * can sign a pre-signed `PUT`. It refuses the upload target with `503` — the same posture
+     * `createUnconfiguredGateway` takes for payments — while `publicUrl` keeps working, because
+     * SERVING an existing image needs a host, not a signer.
+     *
+     * Swapping in a real adapter is a one-line change here and touches no domain module, which
+     * is the whole reason the catalogue declared a port instead of importing a vendor SDK.
+     */
+    storage: createUnconfiguredMediaStorage({
+      logger,
+      ...(config.s3EndpointUrl === undefined ? {} : { publicBaseUrl: config.s3EndpointUrl }),
+    }),
     logger,
   });
 
@@ -736,6 +792,19 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * benefit of a manual composition root: the dependency is a value, so a cycle would be a
    * compile error here rather than a runtime `forwardRef()` workaround (§3 #12).
    */
+  /**
+   * The store's own admin service. Increment 62.
+   *
+   * Built here — after `audit`, which it writes through — rather than beside the repository at
+   * the top of this block, because that block runs before the audit trail exists.
+   */
+  const storesService = createStoresService({
+    repository: stores,
+    db: db.db,
+    audit,
+    logger,
+  });
+
   const promotions = createPromotionsService({
     repository: createPromotionsRepository({ db: db.db }),
     db: db.db,
@@ -973,6 +1042,16 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
   const payments = createPaymentsService({
     repository: createPaymentsRepository({ db: db.db }),
     /**
+     * Refund resolution, late-bound. Increment 60.
+     *
+     * A thunk because `refunds` is constructed further down this function — it needs
+     * `fulfilment`, which is itself built after this line. The closure is only ever called when
+     * a provider webhook arrives, which is long after `buildContainer` has returned, so the
+     * temporal dead zone below is never reached. Reordering the composition root to avoid this
+     * would move fulfilment and everything it depends on for one arrow.
+     */
+    refunds: () => refunds,
+    /**
      * The orders module, adapted to the port payments declared.
      *
      * Payments cannot import `OrdersService` — `no-cross-module-imports` forbids it — so it
@@ -1161,6 +1240,49 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * the return lock alone. Nothing takes them in the opposite order, so the two paths cannot
    * deadlock against each other.
    */
+  /**
+   * Refunds. Increment 59.
+   *
+   * Built here rather than inside the payments service for the reason every adapter in this
+   * file is built here: the executor is a PORT the refunds service declares, and `paymentGateway` is
+   * the Razorpay adapter. Wiring one onto the other is the composition root's job, and it is
+   * what keeps `refunds.service.ts` free of any mention of a provider.
+   */
+  const refunds = createRefundsService({
+    repository: createRefundsRepository({ db: db.db }),
+    /**
+     * The provider, adapted to the executor port.
+     *
+     * A thin pass-through, deliberately: the three-way outcome — succeeded, failed, unknown —
+     * is decided by the adapter, which is the only code that can tell a provider's refusal from
+     * a provider's silence. Collapsing any two of them here would throw away the distinction the
+     * whole increment is built on.
+     */
+    executor: {
+      provider: paymentGateway.provider,
+      execute: (input) =>
+        paymentGateway.refund({
+          providerTransactionId: input.providerTransactionId,
+          amountMinor: input.amountMinor,
+          reference: input.reference,
+        }),
+    },
+    /**
+     * Delivery, adapted from fulfilment. Increment 59.
+     *
+     * The ONLY reason refunds needs it: a COD payment never leaves `pending`, so its refundable
+     * base cannot be read from `payment.status`. Delivery is when COD cash changes hands, and
+     * this is the module that knows when that happened. Read-only — nothing here writes a
+     * payment or a shipment.
+     */
+    delivery: {
+      deliveredAtForOrder: (input) => fulfilment.deliveredAtForOrder(input),
+    },
+    db: db.db,
+    audit,
+    logger,
+  });
+
   const returns = createReturnsService({
     repository: createReturnsRepository({ db: db.db }),
     /**
@@ -1193,6 +1315,38 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
           ...(input.body === undefined ? {} : { body: input.body as never }),
         }),
     },
+    /**
+     * Refunds, adapted. Increment 59.
+     *
+     * Returns declares what it needs — raise a refund for this return, tell me what happened —
+     * and never learns that the implementation lives in the payments module or that a gateway
+     * exists. Only the six fields the port asks for cross the boundary; the refund record's
+     * internal ids, its payment link and its provider reference stay on the other side.
+     */
+    refunds: {
+      refundForReturn: async (input) => {
+        const record = await refunds.refundForReturn(input);
+        return {
+          refundNumber: record.refundNumber,
+          status: record.status,
+          mode: record.mode,
+          amount: record.amount,
+          currency: record.currency,
+          failureCode: record.failureCode,
+        };
+      },
+      listForReturn: (input) => refunds.listForReturn(input),
+    },
+    /**
+     * Inventory, adapted. Increment 59.
+     *
+     * The good-to-sell units only — the caller has already applied the inspection split, and
+     * this adapter deliberately does no filtering of its own so there is exactly one place that
+     * decides which units go back.
+     */
+    inventory: {
+      restockForReturn: (input) => inventory.restockForReturn(input),
+    },
     db: db.db,
     audit,
     logger,
@@ -1207,6 +1361,11 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       tokens,
       logger,
       rateLimit: { limiter: rateLimiter, ipPolicy, emailPolicy, refreshPolicy, logger },
+      // For the ONE staff route in this module: the store-wide customer list, added in
+      // Increment 51. Built here rather than inside the module even though identity owns
+      // authorization, because the guard is constructed against the scope loader and that
+      // wiring is the composition root's job.
+      requireStaff: scopeGuards.requireScope('staff'),
     }),
   );
   apiRouter.use(
@@ -1237,6 +1396,22 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       logger,
     }),
   );
+  /**
+   * The store's own admin surface. Increment 62.
+   *
+   * Mounted here rather than beside the tax router that also writes `store`, because the two
+   * validate different things: the tax profile owns the GST identity and its checksum rules,
+   * this owns the presentational identity. Neither can write the other's columns.
+   */
+  apiRouter.use(
+    createStoresRoutes({
+      stores: storesService,
+      verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
+      requireStaff: scopeGuards.requireScope('staff'),
+      logger,
+    }),
+  );
+
   apiRouter.use(
     createReturnsRoutes({
       returns,
@@ -1293,7 +1468,15 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       // The same capability the catalogue and inventory routers receive, adapted here for the
       // same reason: addresses must not know which module mints tokens.
       verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
-      // No `requireStaff`: these are customer-owned resources and there is no admin surface.
+      /*
+       * The staff guard, added in Increment 63 for `GET /admin/customers/:id/addresses`.
+       *
+       * The comment this replaces said there was no admin surface because nothing fulfilled
+       * orders. Fulfilment, returns and refunds all exist now, and an operator handling a
+       * parcel needs to see where it was going — so the surface has a purchaser and the
+       * privacy cost is paid for. The route reads; nothing staff-facing here writes.
+       */
+      requireStaff: scopeGuards.requireScope('staff'),
       logger,
     }),
   );
@@ -1332,15 +1515,77 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     }),
   );
 
+  /**
+   * The admin dashboard. Increment 57.
+   *
+   * **Composition only — it has no repository and touches no table.** Every figure is computed
+   * by the module that owns the rows, and the four ports below are where that ownership is
+   * stated. This is the one module in the system whose entire job is to ask four other modules
+   * a question each and put the answers in one envelope.
+   *
+   * Increment 53 declined a single dashboard endpoint because it would have needed a new module,
+   * a new port, or a cross-module import. Its actual principle — each module aggregates only its
+   * own tables — is preserved here; what changed is the payload, from three counts to seven
+   * widgets across four modules, which made seven round trips the worse trade.
+   *
+   * Constructed AFTER all four, so every reference below is eager rather than late-bound: there
+   * is no cycle, because nothing any of them owns depends on the dashboard.
+   */
+  const dashboard = createDashboardService({
+    orders: {
+      revenue: (input) => orders.dashboardRevenue(input),
+      series: (input) => orders.dashboardSeries(input),
+      topSkus: (input) => orders.dashboardTopSkus(input),
+      statusCounts: async (input) => (await orders.summaryForStore(input)).displayStatus,
+      /*
+       * The admin order list's own read, limited to a page of one. The dashboard publishes the
+       * rows through `toAdminOrderSummaryResponse` — the SAME mapper `GET /admin/orders` uses —
+       * so the recent-orders table and the orders screen can never disagree about an order.
+       */
+      recent: async (input) =>
+        toAdminOrderListResponse(
+          await orders.listStoreOrders({
+            storeId: input.storeId,
+            limit: input.limit,
+            offset: 0,
+            filters: {},
+          }),
+        ).orders,
+    },
+    catalogue: { countActiveProducts: (input) => catalogue.countActiveProducts(input) },
+    customers: {
+      countLiveCustomers: async (input) => {
+        const counts = await identity.countStoreCustomers(input);
+        return counts.total;
+      },
+    },
+    inventory: { lowStock: (input) => inventory.listLowStock(input) },
+    logger,
+  });
+
+  apiRouter.use(
+    createDashboardRoutes({
+      dashboard,
+      // The same two capabilities every other admin router receives, and for the same reason.
+      verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
+      requireStaff: scopeGuards.requireScope('staff'),
+      logger,
+    }),
+  );
+
   apiRouter.use(
     createPaymentsRoutes({
       payments,
       // The same capability every other domain router receives, adapted here for the same
       // reason: payments must not know which module mints tokens.
       verifyAccessToken: async (token) => tokens.verifyAccessToken(token),
-      // No `requireStaff`: initiation is authenticated-customer only and there is no admin
-      // surface in the approved scope.
+      // For the ONE staff route in this module: the store-wide payment list, added in
+      // Increment 51. Built against identity's authorization loader, which payments must not
+      // import, so it arrives pre-built exactly as the catalogue's and orders' do.
+      requireStaff: scopeGuards.requireScope('staff'),
       requireIdempotency: requireIdempotency({ store: idempotency, logger }),
+      /* The refund surface. Increment 59. Mounted only alongside the staff guard above. */
+      refunds,
       logger,
     }),
   );
@@ -1424,6 +1669,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     idempotency,
     identity,
     catalogue,
+    dashboard,
     inventory,
     addresses,
     cart,

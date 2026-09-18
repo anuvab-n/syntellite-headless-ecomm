@@ -2,8 +2,13 @@ import { z } from 'zod';
 
 import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
 
-import type { OrderLineRecord } from './orders.repository.js';
-import type { OrderView } from './orders.service.js';
+import {
+  ORDER_DISPLAY_STATUSES,
+  deriveOrderDisplayStatus,
+  type OrderDisplayStatus,
+} from './order-display-status.js';
+import type { AdminOrderRecord, OrderLineRecord } from './orders.repository.js';
+import type { AdminOrderView, OrderView } from './orders.service.js';
 
 /**
  * Re-exported, so a caller of this module needs one import rather than two.
@@ -332,5 +337,324 @@ export function toOrderListResponse(page: {
   return {
     orders: page.items.map(toOrderResponse),
     pagination: { limit: page.limit, offset: page.offset, total: page.total },
+  };
+}
+
+/* ── GET /admin/orders ───────────────────────────────────────────────────── */
+
+/**
+ * Page size for the admin order list. Larger than the customer's, because an operator paging
+ * through a store's orders is a different activity from a customer reviewing their own six.
+ */
+export const ADMIN_ORDER_LIST_DEFAULT_LIMIT = 25;
+export const ADMIN_ORDER_LIST_MAX_LIMIT = 100;
+
+/**
+ * The payment and shipment vocabularies, restated here.
+ *
+ * **Restated, not imported.** `no-cross-module-imports` forbids `modules/orders` from importing
+ * `modules/payments` or `modules/fulfilment`, and these are query-parameter validation rather
+ * than domain logic — the point is that `?paymentStatus=suceeded` is a `400` naming the field
+ * instead of a silently empty page that reads as "no such orders".
+ *
+ * The duplication is real and is bounded: if either module's vocabulary grows, a valid status
+ * rejected here is a `400` a test will catch, not a wrong answer. `admin-orders.integration.test`
+ * drives one order into each state through the real services and asserts each value filters it
+ * back, so a rename upstream fails loudly here.
+ */
+const ADMIN_FILTER_PAYMENT_STATUSES = ['pending', 'succeeded', 'failed', 'expired'] as const;
+const ADMIN_FILTER_SHIPMENT_STATUSES = ['pending', 'shipped', 'delivered'] as const;
+
+/**
+ * An ISO-8601 instant with an offset, matching the promotions and tax modules' `instantField`.
+ *
+ * **The client owns the timezone.** A bare `YYYY-MM-DD` was the alternative and was rejected: the
+ * server would have had to pick a timezone to widen it into, and every choice is wrong somewhere
+ * — UTC misfiles the edges of an Indian trading day, the store's timezone surprises an operator
+ * working from another one, and neither is visible in the request. An explicit instant makes the
+ * decision the caller's, where the calendar the operator is looking at actually lives.
+ */
+const instantField = z.iso.datetime({ offset: true });
+
+/**
+ * The admin list's query string. `strictObject`, so an unknown parameter is a `400` naming it
+ * rather than a filter silently ignored — the failure mode where an operator trusts a page that
+ * was never narrowed.
+ *
+ * **`storeId` is not here and never will be.** Tenancy comes from the verified staff token; a
+ * store parameter on an admin list is a cross-tenant read waiting to be discovered.
+ */
+export const AdminListOrdersQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_ORDER_LIST_MAX_LIMIT,
+    default: ADMIN_ORDER_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+
+  /** The dashboard's tabs. Composed per §49 and filtered in the database, never in JavaScript. */
+  displayStatus: z.enum(ORDER_DISPLAY_STATUSES).optional(),
+
+  paymentStatus: z.enum(ADMIN_FILTER_PAYMENT_STATUSES).optional(),
+  shipmentStatus: z.enum(ADMIN_FILTER_SHIPMENT_STATUSES).optional(),
+
+  placedFrom: instantField.optional(),
+  placedTo: instantField.optional(),
+
+  /**
+   * The operator's search box: an order number or a customer email, case-insensitive substring.
+   *
+   * Trimmed and bounded. Deliberately NOT a search across names or addresses — a wider search is
+   * a wider disclosure, and these two are what an operator already has from the customer.
+   */
+  q: z.string().trim().min(1).max(320).optional(),
+});
+
+export type AdminListOrdersQuery = z.infer<typeof AdminListOrdersQuerySchema>;
+
+/* ── GET /admin/customers/{customerId}/orders ────────────────────────────── */
+
+/**
+ * The customer whose history is being read. A UUID by SHAPE only.
+ *
+ * Whether that customer exists, belongs to this store, or has been erased is decided by the
+ * query — so a malformed id is a `400` and every other miss is a `404`.
+ */
+export const AdminCustomerOrdersParamsSchema = z.object({ customerId: z.uuid() });
+
+export type AdminCustomerOrdersParams = z.infer<typeof AdminCustomerOrdersParamsSchema>;
+
+/**
+ * Paging only.
+ *
+ * Deliberately NOT the full `AdminListOrdersQuerySchema`: the store-wide list's filters —
+ * status, dates, the search box — are a different feature, and offering half of them here would
+ * invite a client to discover which half. A customer's history is a chronological list; the
+ * store-wide list is where filtering lives. `strictObject`, so a filter sent here is a `400`
+ * naming it rather than one silently ignored.
+ */
+export const AdminCustomerOrdersQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_ORDER_LIST_MAX_LIMIT,
+    default: ADMIN_ORDER_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+});
+
+export type AdminCustomerOrdersQuery = z.infer<typeof AdminCustomerOrdersQuerySchema>;
+
+/* ── GET /admin/orders/summary ───────────────────────────────────────────── */
+
+/**
+ * The operational summary: three tallies, whole-store, all-time.
+ *
+ * **Counts only.** No money and no period — these are queue depths, the answer to "what needs
+ * attention now", not a report. Keeping money out also keeps this endpoint clear of the one
+ * question the codebase has no answer to: whether an unpaid or cancelled order contributes to a
+ * total.
+ *
+ * **Every status appears, including at zero.** A response whose keys vary with the data forces
+ * a client to distinguish "absent" from "none", and to defend against both. The service
+ * zero-fills from the published vocabularies, so this shape is fixed.
+ *
+ * `displayStatus` is §49's composed set — the same one `GET /admin/orders` validates its filter
+ * against, so a tile and the list it links to can never offer different statuses.
+ */
+export type AdminOrderStatusSummaryResponse = {
+  /** §49's composed status. `ready_to_ship` and `returned` are not derivable and never appear. */
+  byDisplayStatus: Record<string, number>;
+  /** Raw `payment.status`. Orders with no payment row are counted in no bucket here. */
+  byPaymentStatus: Record<string, number>;
+  /** Raw `shipment.status`. Orders with no shipment are counted in no bucket here. */
+  byShipmentStatus: Record<string, number>;
+};
+
+export function toAdminOrderStatusSummaryResponse(summary: {
+  displayStatus: Record<string, number>;
+  paymentStatus: Record<string, number>;
+  shipmentStatus: Record<string, number>;
+}): AdminOrderStatusSummaryResponse {
+  return {
+    byDisplayStatus: summary.displayStatus,
+    byPaymentStatus: summary.paymentStatus,
+    byShipmentStatus: summary.shipmentStatus,
+  };
+}
+
+/**
+ * The customer, as an operator sees them on an order.
+ *
+ * `passwordHash`, `isStaff` and `isSuperuser` are absent here, absent from the repository
+ * projection that feeds this, and absent from the record type in between — three layers, so
+ * adding one back takes three deliberate edits rather than one forgotten `...spread`.
+ */
+export type AdminOrderCustomerResponse = {
+  id: string;
+  email: string;
+  firstName: string;
+  lastName: string;
+};
+
+/** The payment's state, or `null` when the order has none. Never an amount, never a provider. */
+export type AdminOrderPaymentResponse = {
+  status: string;
+  method: string;
+};
+
+/** The shipment's state, or `null` when none exists. */
+export type AdminOrderShipmentResponse = {
+  status: string;
+};
+
+/**
+ * One row of the admin order list.
+ *
+ * **Not `OrderResponse`.** A list row carries no items and no shipping address: a page of 100
+ * orders would otherwise ship a hundred delivery addresses to render a table that shows none of
+ * them, and the detail endpoint is one click away. Money, status and identity only.
+ *
+ * `itemCount` is absent too, and deliberately: counting lines per order means a second query or
+ * a GROUP BY that complicates the count half of the page, and §49's scope is the statuses. The
+ * detail response carries the items.
+ */
+export type AdminOrderSummaryResponse = {
+  orderNumber: string;
+  /** §49 — composed on read from the three lifecycles, stored nowhere. */
+  displayStatus: OrderDisplayStatus;
+  /** The underlying `order.status`, unchanged: `placed` or `cancelled`. */
+  status: string;
+  currency: string;
+  total: string;
+  taxTotal: string;
+  grandTotal: string;
+  placedAt: string;
+  customer: AdminOrderCustomerResponse;
+  payment: AdminOrderPaymentResponse | null;
+  shipment: AdminOrderShipmentResponse | null;
+};
+
+/**
+ * The admin order detail: **the customer's own order response, plus who and where it stands.**
+ *
+ * Built by spreading `toOrderResponse` rather than by restating its fields, so the money, the
+ * tax snapshot, the promotion and the line items cannot drift between the two audiences. What
+ * admin adds is exactly the four keys below.
+ */
+export type AdminOrderDetailResponse = OrderResponse & {
+  displayStatus: OrderDisplayStatus;
+  customer: AdminOrderCustomerResponse;
+  payment: AdminOrderPaymentResponse | null;
+  shipment: AdminOrderShipmentResponse | null;
+};
+
+/** The customer block, from the allowlisted columns the repository selected. */
+function toAdminOrderCustomer(record: AdminOrderRecord): AdminOrderCustomerResponse {
+  return {
+    id: record.customerId,
+    email: record.customerEmail,
+    firstName: record.customerFirstName,
+    lastName: record.customerLastName,
+  };
+}
+
+/**
+ * The payment block. All-or-nothing: `status` and `method` are `NULL` together, because they come
+ * from the same `LEFT JOIN`ed row. Testing both is what convinces TypeScript the object has no
+ * nulls, rather than asserting it.
+ */
+function toAdminOrderPayment(record: AdminOrderRecord): AdminOrderPaymentResponse | null {
+  return record.paymentStatus === null || record.paymentMethod === null
+    ? null
+    : { status: record.paymentStatus, method: record.paymentMethod };
+}
+
+function toAdminOrderShipment(record: AdminOrderRecord): AdminOrderShipmentResponse | null {
+  return record.shipmentStatus === null ? null : { status: record.shipmentStatus };
+}
+
+/**
+ * The display status for one record.
+ *
+ * Computed here, from the same three fields for both the list row and the detail, so one order
+ * cannot report two different statuses depending on which endpoint asked.
+ */
+function displayStatusOf(record: AdminOrderRecord): OrderDisplayStatus {
+  return deriveOrderDisplayStatus({
+    orderStatus: record.status,
+    payment: toAdminOrderPayment(record),
+    shipmentStatus: record.shipmentStatus,
+  });
+}
+
+export function toAdminOrderSummaryResponse(record: AdminOrderRecord): AdminOrderSummaryResponse {
+  return {
+    orderNumber: record.orderNumber,
+    displayStatus: displayStatusOf(record),
+    status: record.status,
+    currency: record.currency,
+    total: record.total,
+    taxTotal: record.taxTotal,
+    grandTotal: record.grandTotal,
+    placedAt: record.placedAt.toISOString(),
+    customer: toAdminOrderCustomer(record),
+    payment: toAdminOrderPayment(record),
+    shipment: toAdminOrderShipment(record),
+  };
+}
+
+export function toAdminOrderDetailResponse(view: AdminOrderView): AdminOrderDetailResponse {
+  return {
+    ...toOrderResponse({ order: view.order, lines: view.lines }),
+    displayStatus: displayStatusOf(view.order),
+    customer: toAdminOrderCustomer(view.order),
+    payment: toAdminOrderPayment(view.order),
+    shipment: toAdminOrderShipment(view.order),
+  };
+}
+
+export function toAdminOrderListResponse(page: {
+  items: readonly AdminOrderRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}): { orders: AdminOrderSummaryResponse[]; pagination: PaginationResponse } {
+  return {
+    orders: page.items.map(toAdminOrderSummaryResponse),
+    pagination: { limit: page.limit, offset: page.offset, total: page.total },
+  };
+}
+
+/* ── The admin order timeline. Increment 62. ─────────────────────────────── */
+
+/**
+ * One entry of an order's append-only status history.
+ *
+ * `actorType` says what KIND of actor caused the transition — `customer`, `staff`, `system`,
+ * `job`. The actor's user id is deliberately absent: attributing a transition to a named
+ * colleague is an `audit_log` question, answered where the access controls for it already are,
+ * and this read is visible to every staff member in the store.
+ */
+export type OrderTimelineResponse = {
+  fromStatus: string | null;
+  toStatus: string;
+  actorType: string;
+  note: string | null;
+  at: string;
+};
+
+export function toOrderTimelineResponse(event: {
+  readonly fromStatus: string | null;
+  readonly toStatus: string;
+  readonly actorType: string;
+  readonly note: string | null;
+  readonly createdAt: Date;
+}): OrderTimelineResponse {
+  return {
+    fromStatus: event.fromStatus,
+    toStatus: event.toStatus,
+    actorType: event.actorType,
+    note: event.note,
+    at: event.createdAt.toISOString(),
   };
 }

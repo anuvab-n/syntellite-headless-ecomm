@@ -1,0 +1,2 @@
+ALTER TABLE "sku" ADD COLUMN "low_stock_threshold" integer;--> statement-breakpoint
+ALTER TABLE "sku" ADD CONSTRAINT "ck_sku_low_stock_threshold_non_negative" CHECK ("sku"."low_stock_threshold" IS NULL OR "sku"."low_stock_threshold" >= 0);

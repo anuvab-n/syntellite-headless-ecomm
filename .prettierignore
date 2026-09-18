@@ -2,3 +2,4 @@ dist
 coverage
 src/db/migrations
 pnpm-lock.yaml
+verify-order-admin-flow.ts

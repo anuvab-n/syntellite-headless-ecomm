@@ -1,4 +1,4 @@
-import { and, asc, count, eq, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, asc, count, eq, gt, ilike, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
 import { promotion } from '../../db/schema/promotions.js';
@@ -89,6 +89,54 @@ export function createPromotionsRepository(deps: { db: Database }) {
   /** Live-in-this-store, for the ADMIN surface: not deleted. Inactive rows are still visible. */
   const adminScope = (storeId: string) =>
     and(eq(promotion.storeId, storeId), isNull(promotion.deletedAt));
+
+  /**
+   * The operator's search box on the promotions list. Increment 63.
+   *
+   * Case-insensitive SUBSTRING over the code and the name — the two ways a merchant refers to a
+   * campaign. Wildcards escaped, so a typed `%` is a percent sign rather than a pattern that
+   * matches everything.
+   */
+  const promotionSearch = (q?: string) => {
+    if (q === undefined || q.length === 0) return undefined;
+    const term = `%${q.replace(/([\\%_])/gu, '\\$1')}%`;
+    return or(ilike(promotion.code, term), ilike(promotion.name, term));
+  };
+
+  /**
+   * Lifecycle state, DERIVED — there is no status column. Increment 63.
+   *
+   * Composed from exactly the three fields that exist, so the filter cannot disagree with what
+   * `isUsable` decides on the customer path:
+   *
+   *  - `disabled` — `is_active = false`, whatever the dates say. A merchant who switched a
+   *    campaign off has said the loudest thing available, so it outranks the window.
+   *  - `scheduled` — active, and `starts_at` is in the FUTURE. A NULL `starts_at` means "no
+   *    start bound", which is already running and therefore never scheduled.
+   *  - `expired` — active, and `ends_at` is in the PAST. A NULL `ends_at` never expires.
+   *  - `active` — active, started (or unbounded), and not yet ended (or unbounded).
+   *
+   * The four arms are mutually exclusive and cover every row, which matters because the screen
+   * shows them as tabs whose counts must sum to the unfiltered total.
+   *
+   * `now` is a PARAMETER rather than `now()` in SQL, so a test can place a promotion either side
+   * of a boundary without sleeping, and so the page and any count computed beside it use the
+   * same instant.
+   */
+  const promotionStatus = (status: PromotionStatusFilter | undefined, now: Date) => {
+    if (status === undefined) return undefined;
+    if (status === 'disabled') return eq(promotion.isActive, false);
+
+    const enabled = eq(promotion.isActive, true);
+    const started = or(isNull(promotion.startsAt), lte(promotion.startsAt, now));
+    const notEnded = or(isNull(promotion.endsAt), gt(promotion.endsAt, now));
+
+    if (status === 'scheduled')
+      return and(enabled, isNotNull(promotion.startsAt), gt(promotion.startsAt, now));
+    if (status === 'expired')
+      return and(enabled, isNotNull(promotion.endsAt), lte(promotion.endsAt, now));
+    return and(enabled, started, notEnded);
+  };
 
   /**
    * **The authoritative "can a customer use this right now" predicate.**
@@ -247,10 +295,17 @@ export function createPromotionsRepository(deps: { db: Database }) {
      */
     async listPromotions(params: {
       storeId: string;
+      q?: string;
+      status?: PromotionStatusFilter;
+      now?: Date;
       limit: number;
       offset: number;
     }): Promise<{ items: PromotionRecord[]; total: number }> {
-      const scope = adminScope(params.storeId);
+      const scope = and(
+        adminScope(params.storeId),
+        promotionSearch(params.q),
+        promotionStatus(params.status, params.now ?? new Date()),
+      );
 
       const [items, [totals]] = await Promise.all([
         executor(db)
@@ -267,3 +322,14 @@ export function createPromotionsRepository(deps: { db: Database }) {
     },
   };
 }
+
+/**
+ * The lifecycle states the admin list may filter by. Increment 63.
+ *
+ * DERIVED from `is_active`, `starts_at` and `ends_at` — there is no status column, and adding
+ * one would be a second source of truth that the customer-facing `isUsable` predicate could
+ * disagree with. Exported so the DTO enumerates exactly what the repository implements.
+ */
+export const PROMOTION_STATUS_FILTERS = ['active', 'scheduled', 'expired', 'disabled'] as const;
+
+export type PromotionStatusFilter = (typeof PROMOTION_STATUS_FILTERS)[number];

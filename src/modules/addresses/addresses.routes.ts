@@ -8,10 +8,12 @@ import type { Logger } from '../../shared/logger.js';
 import type { AddressesService } from './addresses.service.js';
 import {
   AddressIdParamsSchema,
+  AdminCustomerAddressesParamsSchema,
   CreateAddressRequestSchema,
   UpdateAddressRequestSchema,
   toAddressResponse,
   type AddressIdParams,
+  type AdminCustomerAddressesParams,
   type CreateAddressRequest,
   type UpdateAddressRequest,
 } from './dto.js';
@@ -41,11 +43,20 @@ export function createAddressesRoutes(deps: {
   addresses: AddressesService;
   /** The identity module's verifier, adapted to the HTTP port by the composition root. */
   verifyAccessToken: AccessTokenVerifier;
+  /**
+   * The staff scope guard, pre-built by the composition root.
+   *
+   * Optional, and when absent the ADMIN route below is NOT MOUNTED — the same shape identity
+   * uses, and for the same reason: several suites mount this router directly to assert customer
+   * behaviour and have no scope loader. A disappearing route is a safe default in a way that
+   * mounting an unguarded customer address book could never be.
+   */
+  requireStaff?: RequestHandler;
   logger: Logger;
   // Annotated rather than inferred: without it `tsc` cannot name the router type portably
   // under pnpm's nested `node_modules`. Every other routes file does the same.
 }): Router {
-  const { addresses, verifyAccessToken, logger } = deps;
+  const { addresses, verifyAccessToken, requireStaff, logger } = deps;
 
   const router = Router();
   const auth: RequestHandler = requireAuth({ verifyAccessToken, logger });
@@ -197,6 +208,55 @@ export function createAddressesRoutes(deps: {
       res.status(204).send();
     }),
   );
+
+  /**
+   * `GET /admin/customers/{customerId}/addresses` — one customer's address book. Increment 63.
+   *
+   * ### Why this route lives in the ADDRESSES module
+   *
+   * The path reads like identity's, and the customer DETAIL endpoint is indeed there. This one
+   * is not, because it returns ADDRESSES. Putting it in identity would mean identity reading
+   * the `address` table, which `schema-only-in-repositories` confines to this module's
+   * repository — so it would need a port, a container adapter, and a second place that knows
+   * what a live address is.
+   *
+   * `orders.routes.ts` made exactly this call for `/admin/customers/{customerId}/orders` and
+   * states the same reason: split by the data returned, not by the shape of the path. The two
+   * routers cannot collide, because identity's `/admin/customers/{customerId}` is three
+   * segments and this is four.
+   *
+   * ### Tenancy and ownership
+   *
+   * The store comes from the verified STAFF token; `customerId` names which customer, never
+   * which store. The repository predicate is `(user_id, store_id, deleted_at IS NULL)`, so a
+   * customer in another tenant simply matches nothing — there is no ownership comparison done
+   * after the fact for a bug to skip.
+   *
+   * **An unknown customer and a customer with no addresses are both `200` with an empty list**,
+   * deliberately. This endpoint answers "what addresses may I see for this id", and a `404`
+   * would turn it into an oracle telling an operator which customer ids exist in other stores.
+   * The customer DETAIL endpoint is where existence is established, and it answers `404` there.
+   *
+   * Ordered `(label, id)` by the repository — stable across reads, and `id` is UUIDv7 so equal
+   * labels order by creation rather than arbitrarily.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/customers/:customerId/addresses',
+      auth,
+      requireStaff,
+      validate({ params: AdminCustomerAddressesParamsSchema }),
+      asyncHandler(async (req, res) => {
+        const records = await addresses.getAddressesForUser({
+          userId: validatedParams<AdminCustomerAddressesParams>(req).customerId,
+          /* The tenant, from the staff member's own verified token. */
+          storeId: requireUser(req).storeId,
+        });
+
+        res.status(200).json({ addresses: records.map(toAddressResponse) });
+      }),
+    );
+  }
 
   return router;
 }

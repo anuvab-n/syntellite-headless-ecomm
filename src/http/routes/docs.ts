@@ -76,6 +76,12 @@ const PRICE_PATTERN = '^\\d{1,15}(?:\\.\\d{1,4})?$';
  * updated deliberately. The drift risk is bounded: the DTO's own tests reject a limit the spec
  * advertises as valid, and vice versa.
  */
+/**
+ * The refund number's shape, duplicated from `modules/payments/dto.ts` for the reason the
+ * pagination limits below are: `no-http-to-modules` forbids the import.
+ */
+const REFUND_NUMBER_PATTERN = '^RFD-\\d{8}-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$';
+
 const PRODUCT_LIST_DEFAULT_LIMIT_DOC = 20;
 const PRODUCT_LIST_MAX_LIMIT_DOC = 100;
 
@@ -112,6 +118,7 @@ const SKU = {
     'name',
     'price',
     'isActive',
+    'lowStockThreshold',
     'options',
     'createdAt',
     'updatedAt',
@@ -143,6 +150,21 @@ const SKU = {
       description:
         'Whether this SKU is currently sellable. A product with no active SKU is not publicly visible at all.',
       example: true,
+    },
+    lowStockThreshold: {
+      description: [
+        'The reorder point: at or below this, the dashboard reports the SKU as low.',
+        '',
+        '**`null` means no threshold is configured, which is NOT the same as `0`.** A SKU with no',
+        'threshold is never reported as low, however little of it is left — nobody has said what',
+        '"low" means for it. `0` is a configured value that says "warn me only when this is gone",',
+        'which the `available > 0` half of the low-stock rule then makes unreachable.',
+        '',
+        'Low stock and out of stock stay distinguishable: `available <= 0` is unsellable and is a',
+        'different fact from `available > 0 AND available <= lowStockThreshold`.',
+      ].join('\n'),
+      oneOf: [{ type: 'integer', minimum: 0, maximum: 1000000 }, { type: 'null' }],
+      example: 5,
     },
     options: {
       type: 'array',
@@ -501,6 +523,102 @@ const ORDER_PROMOTION = {
   },
   description:
     'Snapshotted, so a historical order can still name the offer after the merchant renames or deletes it. Never the promotion id or its terms.',
+} as const;
+
+/**
+ * A money KPI and the equal-length window before it. Increment 57.
+ *
+ * Both values are decimal strings at `NUMERIC(19,4)` scale, never JSON numbers: money never
+ * becomes binary floating point anywhere in this API.
+ */
+const DASHBOARD_KPI_MONEY = {
+  type: 'object',
+  required: ['value', 'currency', 'previous'],
+  properties: {
+    value: { type: 'string', example: '482300.0000' },
+    currency: { type: 'string', example: 'INR' },
+    previous: {
+      type: 'string',
+      example: '410150.0000',
+      description:
+        'The same figure over the equal-DURATION window immediately before this one, ending one millisecond before `from`. No overlap and no gap.',
+    },
+  },
+} as const;
+
+/** A counted KPI. `previous` is null where no comparison exists. */
+const DASHBOARD_KPI_COUNT = {
+  type: 'object',
+  required: ['value', 'previous'],
+  properties: {
+    value: { type: 'integer', minimum: 0 },
+    previous: {
+      description:
+        'Null for products and customers, which are cumulative as-of-now facts with no recorded history — there is no product status history and no customer count snapshot, so a previous value could only be invented. Null says "no comparison exists", which a client can render differently from a zero delta.',
+      oneOf: [{ type: 'integer', minimum: 0 }, { type: 'null' }],
+    },
+  },
+} as const;
+
+/** One point on the sales chart. Every bucket in the window is present, including empty ones. */
+const DASHBOARD_SERIES_POINT = {
+  type: 'object',
+  required: ['bucket', 'revenue', 'orders'],
+  properties: {
+    bucket: {
+      type: 'string',
+      format: 'date',
+      example: '2026-09-01',
+      description:
+        'The first local date of the bucket, truncated in the STORE’s timezone — not UTC. Bucketing a month in UTC misfiles every order placed after 18:30 IST on the last day of it.',
+    },
+    revenue: { type: 'string', example: '0.0000' },
+    orders: { type: 'integer', minimum: 0 },
+  },
+} as const;
+
+/** One row of the top-selling list, by SNAPSHOTTED product identity. */
+const DASHBOARD_TOP_PRODUCT = {
+  type: 'object',
+  required: ['skuCode', 'productName', 'skuName', 'quantitySold', 'revenue'],
+  description:
+    'Grouped by the product and SKU names SNAPSHOTTED onto the order line at checkout, never by joining today’s catalogue. Renaming a product does not rewrite what it was called when it sold.',
+  properties: {
+    skuCode: { type: 'string', example: 'PUMP-2HP-BLK' },
+    productName: { type: 'string', example: 'Duroflo 2HP Pump' },
+    skuName: { type: 'string', example: '2 HP / Black' },
+    quantitySold: { type: 'integer', minimum: 0 },
+    revenue: {
+      type: 'string',
+      example: '168000.0000',
+      description:
+        'The lines’ contribution to the orders’ payable totals: `taxableValue + taxTotal`, where `taxableValue` is already `lineTotal - discountAmount`. Discounts deducted, tax included, cancelled orders excluded.',
+    },
+  },
+} as const;
+
+/** One SKU running low against its own configured reorder point. */
+const DASHBOARD_LOW_STOCK = {
+  type: 'object',
+  required: ['skuCode', 'productName', 'skuName', 'onHand', 'reserved', 'available', 'threshold'],
+  description:
+    'Still sellable, but at or below its threshold: `available > 0 AND available <= lowStockThreshold`. A SKU with NO threshold configured never appears — "low" is not invented for anybody who has not defined it. Out of stock (`available <= 0`) keeps its own separate meaning and its own tile.',
+  properties: {
+    skuCode: { type: 'string', example: 'PUMP-1HP-RED' },
+    productName: { type: 'string', example: 'Duroflo 1HP Pump' },
+    skuName: { type: 'string', example: '1 HP / Red' },
+    onHand: { type: 'integer', minimum: 0 },
+    reserved: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Units committed to open orders and not yet despatched.',
+    },
+    available: {
+      type: 'integer',
+      description: 'PostgreSQL-generated `onHand - reserved`. Never computed by the application.',
+    },
+    threshold: { type: 'integer', minimum: 0, example: 10 },
+  },
 } as const;
 
 /** One payment transition. Mirrors `PaymentEventResponse` in `modules/payments/dto.ts`. */
@@ -986,6 +1104,295 @@ const ORDER = {
   },
 } as const;
 
+/**
+ * The composed order status the admin dashboard shows. §49 in `docs/DECISIONS.md`.
+ *
+ * Derived on read from `order.status`, the payment state and the shipment state. Stored nowhere,
+ * and absent from every customer-facing response.
+ */
+const ORDER_DISPLAY_STATUS = {
+  type: 'string',
+  enum: ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled', 'failed'],
+  description:
+    'Composed on read from the three lifecycles, first match wins: `cancelled` when the order ' +
+    'is cancelled; else `delivered`/`shipped`/`processing` from the shipment; else `failed` for ' +
+    'a failed or expired payment, `confirmed` for a succeeded one or a pending COD one, and ' +
+    '`pending` otherwise. **`ready_to_ship` and `returned` are NOT produced** — the first needs ' +
+    'an AWB this version has no column for, the second needs a return lifecycle whose routes do ' +
+    'not exist yet. Neither is emitted as an empty bucket, because a status that never appears ' +
+    'is indistinguishable from a broken one.',
+} as const;
+
+/**
+ * One row of the staff payment list. Mirrors `AdminPaymentResponse` in `modules/payments/dto.ts`.
+ *
+ * The omissions are the contract. `providerRef` — the Razorpay handle — is absent because it is
+ * a capability to act on the provider side, and it goes to the paying customer for the checkout
+ * handoff and to nobody else. `amountMinor` is absent because money leaves this system as a
+ * decimal string and publishing both invites a client to pick one. Internal ids are absent
+ * because a payment is addressed here by its order number.
+ */
+const ADMIN_PAYMENT = {
+  type: 'object',
+  required: [
+    'orderNumber',
+    'status',
+    'method',
+    'provider',
+    'amount',
+    'currency',
+    'failureCode',
+    'createdAt',
+    'updatedAt',
+  ],
+  properties: {
+    orderNumber: { type: 'string', example: 'ORD-20260904-7QK4M2' },
+    status: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+    method: { type: 'string', enum: ['online', 'cod'] },
+    provider: {
+      description:
+        'The gateway that handled it, or null for `cod` — `ck_payment_provider_matches_method` guarantees the pairing.',
+      oneOf: [{ type: 'string', enum: ['razorpay'] }, { type: 'null' }],
+    },
+    amount: {
+      type: 'string',
+      description: 'A decimal string, always exactly the order’s payable total.',
+      example: '2268.0000',
+    },
+    currency: { type: 'string', example: 'INR' },
+    failureCode: {
+      description:
+        'Set only on a failed payment; `ck_payment_failure_code` makes any other combination unrepresentable.',
+      oneOf: [{ type: 'string' }, { type: 'null' }],
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: {
+      type: 'string',
+      format: 'date-time',
+      description: 'The last transition’s instant — when the payment succeeded, failed or expired.',
+    },
+  },
+} as const;
+
+/**
+ * One row of the staff customer list. Mirrors `AdminCustomerResponse` in `modules/identity/dto.ts`.
+ *
+ * `passwordHash`, `isStaff` and `isSuperuser` are absent from the SQL projection, from the record
+ * type, and from the response mapper — three deliberate edits would be needed to publish one.
+ * Password-reset tokens and refresh sessions live in other tables this query never touches.
+ */
+const ADMIN_CUSTOMER = {
+  type: 'object',
+  required: [
+    'id',
+    'email',
+    'phone',
+    'firstName',
+    'lastName',
+    'isActive',
+    'createdAt',
+    'updatedAt',
+    'orderCount',
+    'totalSpent',
+    'lastOrderAt',
+  ],
+  properties: {
+    id: {
+      type: 'string',
+      format: 'uuid',
+      description:
+        'The one internal identifier published here: unlike an order, a customer has no business-facing number to be addressed by.',
+    },
+    email: { type: 'string', format: 'email' },
+    phone: {
+      description:
+        'The mobile number. Null whenever the account was created without one — `phone` has never been required at registration, so this is a permanent shape rather than missing data.',
+      oneOf: [{ type: 'string', maxLength: 20 }, { type: 'null' }],
+    },
+    firstName: { type: 'string', description: 'Empty string when never supplied, never null.' },
+    lastName: { type: 'string', description: 'Empty string when never supplied, never null.' },
+    isActive: {
+      type: 'boolean',
+      description:
+        'False once an account is deactivated. Scopes and liveness are read from the database on every request, so a deactivated account’s existing tokens fail on their next call.',
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+    orderCount: {
+      type: 'integer',
+      minimum: 0,
+      description: [
+        'Orders this customer placed that were **not cancelled**.',
+        '',
+        '`0` both for a customer who has never ordered and for one whose every order was',
+        'cancelled — neither is a sale, so neither is counted.',
+      ].join('\n'),
+    },
+    totalSpent: {
+      type: 'string',
+      example: '24680.0000',
+      description: [
+        '**The sum of `grandTotal` over this customer’s non-cancelled orders.** A decimal string',
+        'at `NUMERIC(19,4)` scale, never a number — money never becomes binary floating point in',
+        'this API. `"0.0000"` when there is nothing to total.',
+        '',
+        'The definition, stated precisely because the phrase is ambiguous:',
+        '',
+        '| Included | Excluded |',
+        '| --- | --- |',
+        '| GST — `grandTotal` is tax-inclusive | cancelled orders |',
+        '| cash-on-delivery orders | returns and refunds |',
+        '| orders whose online payment later failed | |',
+        '',
+        'It is **billed value, not cash received.** A cash-on-delivery payment never reaches',
+        '`succeeded` in this system, so a definition based on captured money would report zero',
+        'for every COD sale; this one does not have that defect, and pays for it by counting an',
+        'order whose online payment failed.',
+        '',
+        'Returns are **not** deducted. There is no refund execution here, so no money has ever',
+        'moved back, and subtracting a requested refund would report a reversal that never',
+        'happened.',
+      ].join('\n'),
+    },
+    lastOrderAt: {
+      description:
+        'When this customer last placed a non-cancelled order, or null if they never have. A cancelled order never sets it.',
+      oneOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }],
+    },
+  },
+} as const;
+
+/**
+ * The Customers screen's tabs. Increment 56.
+ *
+ * Tenant- and liveness-scoped and NOTHING else — not the list's filters, and not the search
+ * term. A tab count that moved as you typed could not tell you how many rows switching to that
+ * tab would show, which is the only question a tab count answers.
+ */
+const ADMIN_CUSTOMER_COUNTS = {
+  type: 'object',
+  required: ['total', 'active', 'inactive'],
+  description:
+    'Counts for the whole store, independent of every filter on this request — so `counts.total` and `pagination.total` differ whenever a filter is applied, and that is correct: one counts the store, the other counts the query. Soft-deleted accounts are excluded from both. `active + inactive === total` always, and both keys are present at zero.',
+  properties: {
+    total: { type: 'integer', minimum: 0 },
+    active: { type: 'integer', minimum: 0 },
+    inactive: { type: 'integer', minimum: 0 },
+  },
+} as const;
+
+/** The customer on an admin order row. An allowlist — never a credential or a privilege flag. */
+const ADMIN_ORDER_CUSTOMER = {
+  type: 'object',
+  description:
+    'Who placed the order. Four fields, chosen deliberately: `passwordHash`, `isStaff` and ' +
+    '`isSuperuser` are never selected from the database, never carried on the record type, and ' +
+    'never mapped onto a response.',
+  required: ['id', 'email', 'firstName', 'lastName'],
+  properties: {
+    id: { type: 'string', format: 'uuid' },
+    email: { type: 'string', format: 'email' },
+    firstName: { type: 'string' },
+    lastName: { type: 'string' },
+  },
+} as const;
+
+/** The payment state on an admin order. A status and a method — never an amount or a provider. */
+const ADMIN_ORDER_PAYMENT = {
+  type: 'object',
+  required: ['status', 'method'],
+  properties: {
+    status: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+    method: { type: 'string', enum: ['online', 'cod'] },
+  },
+} as const;
+
+/** The shipment state on an admin order. */
+const ADMIN_ORDER_SHIPMENT = {
+  type: 'object',
+  required: ['status'],
+  properties: {
+    status: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+  },
+} as const;
+
+/**
+ * One row of the admin order list. Mirrors `AdminOrderSummaryResponse` in `modules/orders/dto.ts`.
+ *
+ * Deliberately NOT the full `Order`: a list row carries no items and no delivery address, so a
+ * page of a hundred orders does not ship a hundred addresses to render a table that shows none
+ * of them. The detail endpoint carries both.
+ */
+const ADMIN_ORDER_SUMMARY = {
+  type: 'object',
+  required: [
+    'orderNumber',
+    'displayStatus',
+    'status',
+    'currency',
+    'total',
+    'taxTotal',
+    'grandTotal',
+    'placedAt',
+    'customer',
+    'payment',
+    'shipment',
+  ],
+  properties: {
+    orderNumber: { type: 'string', example: 'ORD-20260904-7QK4M2' },
+    displayStatus: ORDER_DISPLAY_STATUS,
+    status: {
+      type: 'string',
+      enum: ['placed', 'cancelled'],
+      description:
+        'The underlying `order.status`, unchanged. The order lifecycle has exactly these two ' +
+        'values; payment and fulfilment live in their own tables. See `displayStatus` for the ' +
+        'composed view, and §43 for why the three are not merged.',
+    },
+    currency: { type: 'string', example: 'INR' },
+    total: { type: 'string', description: 'The goods total, after the merchandise discount.' },
+    taxTotal: { type: 'string' },
+    grandTotal: { type: 'string', description: 'total + taxTotal — the payable amount.' },
+    placedAt: { type: 'string', format: 'date-time' },
+    customer: { $ref: '#/components/schemas/AdminOrderCustomer' },
+    payment: {
+      description: 'The payment state, or null when the order has no payment row at all.',
+      oneOf: [{ $ref: '#/components/schemas/AdminOrderPayment' }, { type: 'null' }],
+    },
+    shipment: {
+      description: 'The shipment state, or null when no shipment has been created.',
+      oneOf: [{ $ref: '#/components/schemas/AdminOrderShipment' }, { type: 'null' }],
+    },
+  },
+} as const;
+
+/**
+ * The admin order detail: the customer's own `Order` document, plus the four operator fields.
+ *
+ * Composed with `allOf` rather than restated, mirroring how `AdminOrderDetailResponse` spreads
+ * `toOrderResponse` — so the money, the tax snapshot, the promotion and the line items cannot
+ * drift between the customer and admin audiences.
+ */
+const ADMIN_ORDER_DETAIL = {
+  allOf: [
+    { $ref: '#/components/schemas/Order' },
+    {
+      type: 'object',
+      required: ['displayStatus', 'customer', 'payment', 'shipment'],
+      properties: {
+        displayStatus: ORDER_DISPLAY_STATUS,
+        customer: { $ref: '#/components/schemas/AdminOrderCustomer' },
+        payment: {
+          oneOf: [{ $ref: '#/components/schemas/AdminOrderPayment' }, { type: 'null' }],
+        },
+        shipment: {
+          oneOf: [{ $ref: '#/components/schemas/AdminOrderShipment' }, { type: 'null' }],
+        },
+      },
+    },
+  ],
+} as const;
+
 /** One line of the cart. Mirrors `CartItemResponse` in `modules/cart/dto.ts`. */
 const CART_ITEM = {
   type: 'object',
@@ -1179,6 +1586,236 @@ const PROMOTION = {
 } as const;
 
 /** The public shape of a product. Mirrors `ProductResponse` in `modules/catalogue/dto.ts`. */
+/**
+ * The image formats a storefront can render, and the largest object this API will sign for.
+ *
+ * Duplicated from `modules/catalogue/dto.ts` for the same reason as the pagination limits
+ * above: `no-http-to-modules` forbids the import, and a published contract that silently
+ * followed an internal change would be worse than one updated deliberately.
+ */
+const MEDIA_CONTENT_TYPES_DOC = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/avif',
+  'image/gif',
+] as const;
+
+const MEDIA_MAX_BYTES_DOC = 10 * 1024 * 1024;
+
+/**
+ * The list screen's tab badges. Mirrors `ProductCountsResponse` in `modules/catalogue/dto.ts`.
+ *
+ * Store-wide, not query-wide: these say how many rows switching to a tab would show, so they
+ * are unaffected by `q`, `status`, `limit` and `offset`. `counts.total` and
+ * `pagination.total` therefore differ whenever a filter is applied, and that is correct —
+ * one counts the store, the other counts the query. `draft + active + archived === total`.
+ */
+/**
+ * One refund. Mirrors `RefundResponse` in `modules/payments/dto.ts`.
+ *
+ * Addressed by its public NUMBER; the row's UUID is published nowhere, exactly as with orders
+ * and returns. `providerRefundId` IS published — a merchant reconciling against the gateway
+ * dashboard needs it, and it is an opaque identifier the provider displays there itself.
+ */
+const REFUND = {
+  type: 'object',
+  required: [
+    'refundNumber',
+    'status',
+    'mode',
+    'amount',
+    'currency',
+    'provider',
+    'providerRefundId',
+    'failureCode',
+    'createdAt',
+    'settledAt',
+  ],
+  properties: {
+    refundNumber: { type: 'string', example: 'RFD-20260917-K7M2QP' },
+    status: {
+      type: 'string',
+      enum: ['pending', 'processing', 'succeeded', 'failed'],
+      description:
+        '`processing` means the provider was ASKED and the answer is not known — a timeout, an aborted connection or a 5xx. It is neither success nor failure, it still consumes refundable balance, and it must be reconciled rather than retried.',
+      example: 'succeeded',
+    },
+    mode: {
+      type: 'string',
+      enum: ['provider', 'manual'],
+      description:
+        '`provider` is a gateway refund against the original charge. `manual` is a recorded obligation settled outside this system — the COD case, and an online payment whose charge id was never captured.',
+      example: 'provider',
+    },
+    amount: { type: 'string', example: '1499.0000' },
+    currency: { type: 'string', example: 'INR' },
+    provider: { type: 'string', nullable: true, example: 'razorpay' },
+    providerRefundId: {
+      type: 'string',
+      nullable: true,
+      description:
+        'The provider’s id for the REFUND object (`rfnd_…`). Distinct from the provider order (`order_…`), the provider charge (`pay_…`) and the webhook delivery id. Null for a manual refund and until the provider answers.',
+      example: 'rfnd_QX1a2b3c4d5e6f',
+    },
+    failureCode: { type: 'string', nullable: true, example: 'http_400' },
+    createdAt: { type: 'string', format: 'date-time' },
+    settledAt: {
+      type: 'string',
+      format: 'date-time',
+      nullable: true,
+      description: 'Set exactly when the refund reaches `succeeded` or `failed`.',
+    },
+  },
+} as const;
+
+/**
+ * A payment's refund position. Mirrors `RefundBalanceResponse`.
+ *
+ * `refunded` and `claimed` are DIFFERENT figures and both are published. They are equal in the
+ * ordinary case and differ exactly while an attempt is `pending` or `processing` — the window
+ * in which reporting either one as the other would be a lie, and the reason a payment can
+ * refuse a further refund while showing nothing refunded.
+ */
+const REFUND_BALANCE = {
+  type: 'object',
+  required: ['currency', 'captured', 'refunded', 'claimed', 'remaining'],
+  properties: {
+    currency: { type: 'string', example: 'INR' },
+    captured: {
+      type: 'string',
+      description:
+        'What the payment collected. `0` unless it succeeded — or, for COD, unless the order was delivered, which is when the cash changes hands.',
+      example: '1499.0000',
+    },
+    refunded: { type: 'string', description: 'Succeeded refunds only.', example: '100.0000' },
+    claimed: {
+      type: 'string',
+      description:
+        'Succeeded refunds PLUS everything still in flight. What blocks a further refund.',
+      example: '100.0000',
+    },
+    remaining: {
+      type: 'string',
+      description: '`captured - claimed`. What a further refund may be raised for.',
+      example: '1399.0000',
+    },
+  },
+} as const;
+
+const PRODUCT_COUNTS = {
+  type: 'object',
+  required: ['total', 'draft', 'active', 'archived'],
+  description:
+    'Products per lifecycle status across the whole store, soft-deleted rows excluded. Every status is present even at zero, so a tab never disappears when it empties.',
+  properties: {
+    total: { type: 'integer', minimum: 0, example: 42 },
+    draft: { type: 'integer', minimum: 0, example: 7 },
+    active: { type: 'integer', minimum: 0, example: 31 },
+    archived: { type: 'integer', minimum: 0, example: 4 },
+  },
+} as const;
+
+/**
+ * One product image. Mirrors `MediaResponse` in `modules/catalogue/dto.ts`.
+ *
+ * The BYTES are not here and never travel through this API — the row is a pointer into object
+ * storage plus the metadata needed to render it. `url` is composed from `storageKey` and the
+ * configured delivery base, and is `null` when this deployment has none, so a client can tell
+ * "no image" apart from "no CDN configured".
+ */
+const PRODUCT_MEDIA = {
+  type: 'object',
+  required: [
+    'id',
+    'url',
+    'storageKey',
+    'contentType',
+    'altText',
+    'skuCode',
+    'width',
+    'height',
+    'byteSize',
+    'position',
+    'isPrimary',
+    'createdAt',
+    'updatedAt',
+  ],
+  properties: {
+    id: { type: 'string', format: 'uuid', example: '01a04310-0f2c-7b31-8c4d-9e2a5f7b1c33' },
+    url: {
+      type: 'string',
+      nullable: true,
+      description:
+        'Delivery URL, composed from the storage key. `null` when no delivery base is configured — the image is registered, but this deployment cannot address it.',
+      example: 'https://cdn.example.com/stores/s1/products/p1/front.webp',
+    },
+    storageKey: {
+      type: 'string',
+      description:
+        'The object key in the bucket. Returned so a client can correlate an upload target with the row it became.',
+      example: 'stores/s1/products/p1/front.webp',
+    },
+    contentType: { type: 'string', enum: MEDIA_CONTENT_TYPES_DOC, example: 'image/webp' },
+    altText: {
+      type: 'string',
+      description: 'Accessibility text. An empty string when unset, never null.',
+      example: 'Blue cotton shirt, front view',
+    },
+    skuCode: {
+      type: 'string',
+      nullable: true,
+      description:
+        'The variant this image is of. `null` means the product generally. A CODE rather than an id, like every other product route.',
+      example: 'SHIRT-BLUE-M',
+    },
+    width: { type: 'integer', nullable: true, example: 1200 },
+    height: { type: 'integer', nullable: true, example: 1600 },
+    byteSize: { type: 'integer', nullable: true, example: 184320 },
+    position: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Gallery order, ascending. Ties break by creation time, so the order is stable.',
+      example: 0,
+    },
+    isPrimary: {
+      type: 'boolean',
+      description:
+        'The image that represents the product. At most one per product, enforced by a partial unique index rather than by application code.',
+      example: true,
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+    updatedAt: { type: 'string', format: 'date-time' },
+  },
+} as const;
+
+/** Where to PUT an object's bytes. Mirrors `MediaUploadTargetResponse`. */
+const MEDIA_UPLOAD_TARGET = {
+  type: 'object',
+  required: ['uploadUrl', 'storageKey', 'expiresAt', 'requiredHeaders'],
+  properties: {
+    uploadUrl: {
+      type: 'string',
+      description:
+        'Pre-signed URL. `PUT` the bytes here directly; they never pass through this API.',
+      example: 'https://bucket.s3.amazonaws.com/stores/s1/...?X-Amz-Signature=...',
+    },
+    storageKey: {
+      type: 'string',
+      description:
+        'The key to send back to `POST /admin/products/{slug}/media` once the PUT succeeds.',
+      example: 'stores/s1/products/p1/01a04310-0f2c-7b31-8c4d-9e2a5f7b1c33.webp',
+    },
+    expiresAt: { type: 'string', format: 'date-time' },
+    requiredHeaders: {
+      type: 'object',
+      additionalProperties: { type: 'string' },
+      description: 'Headers the PUT must carry verbatim, or storage rejects it.',
+      example: { 'Content-Type': 'image/webp' },
+    },
+  },
+} as const;
+
 const PRODUCT = {
   type: 'object',
   required: [
@@ -1320,6 +1957,20 @@ const RATE_LIMIT_ERROR = {
 } as const;
 
 /** The `{slug}` path parameter, shared by every product endpoint that takes one. */
+/**
+ * The media routes address an image by id.
+ *
+ * An image has no merchant-facing code the way a SKU does, so its UUID is the only key.
+ */
+const MEDIA_ID_PARAMETER = {
+  name: 'id',
+  in: 'path',
+  required: true,
+  description: 'The image id, as returned when it was registered.',
+  schema: { type: 'string', format: 'uuid' },
+  example: '01a04310-0f2c-7b31-8c4d-9e2a5f7b1c33',
+} as const;
+
 const PRODUCT_SLUG_PARAMETER = {
   name: 'slug',
   in: 'path',
@@ -1448,16 +2099,25 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
     ],
     tags: [
       { name: 'Authentication', description: 'Registration and session establishment.' },
-      { name: 'Users', description: 'The authenticated user own account.' },
+      {
+        name: 'Dashboard',
+        description:
+          'The admin overview screen, in one read. Composition only — every figure is computed by the module that owns the rows, and this endpoint assembles them. The date range is an ANALYTICS window: it governs revenue, order count, the sales series and the top products, and deliberately nothing else. Product and customer counts, order status, low stock and recent orders are as-of-now operational facts, because a customer total silently narrowed to a month would be read as a lifetime figure.',
+      },
+      {
+        name: 'Users',
+        description:
+          'The authenticated user’s own account, and the staff customer directory. `/users/me` is self-scoped for everyone including staff — privilege does not widen it, so there is no impersonation path. `GET /admin/customers` is the separate, store-scoped staff surface: a read-only list, with no detail, order history, search, activation or deactivation.',
+      },
       {
         name: 'Orders',
         description:
-          "Checkout, and the customer's own order history. Orders are immutable records: every product, price and address value is copied at checkout, so later catalogue or address edits never change a past order. There is no staff or admin order surface in this version.",
+          "Checkout, the customer's own order history, and the staff order surface. Orders are immutable records: every product, price and address value is copied at checkout, so later catalogue or address edits never change a past order. The `/admin` routes are store-scoped rather than owner-scoped — staff read any order in their own store, and none from another. `/users/me` stays self-scoped for everyone, staff included, so there is no impersonation path.",
       },
       {
         name: 'Payments',
         description:
-          'Paying for an order. One payment per order, and **payment state is a separate lifecycle from order state** — `order.status` stays `placed` whatever happens to the payment. Two methods: `online` through the configured gateway, and `cod` (cash on delivery), which never touches one. The amount is always exactly `order.total`; a client cannot supply it. There is no staff or admin payment surface in this version, and no refund, retry, reconciliation or settlement surface. Instrument data — card, UPI, bank, token — never reaches this system.',
+          'Paying for an order. One payment per order, and **payment state is a separate lifecycle from order state** — `order.status` stays `placed` whatever happens to the payment. Two methods: `online` through the configured gateway, and `cod` (cash on delivery), which never touches one. The amount is always exactly `order.total`; a client cannot supply it. The staff surface is exactly one route and it is a READ — `GET /admin/payments`, store-scoped. There is still no refund, retry, reconciliation or settlement surface, and no staff mutation of any kind. Instrument data — card, UPI, bank, token — never reaches this system.',
       },
       {
         name: 'Webhooks',
@@ -1575,6 +2235,261 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             },
           ],
         },
+        AdminSession: {
+          type: 'object',
+          description:
+            'One refresh session. Carries NO token material: `token_hash` is never selected ' +
+            'by the query behind this shape, so it cannot be published even by accident. ' +
+            '`userId` is absent because the caller named the customer in the path.',
+          required: [
+            'id',
+            'familyId',
+            'active',
+            'expiresAt',
+            'consumedAt',
+            'revokedAt',
+            'revokedReason',
+            'userAgent',
+            'ipAddress',
+            'createdAt',
+            'updatedAt',
+          ],
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            familyId: {
+              type: 'string',
+              format: 'uuid',
+              description:
+                'The rotation chain this session belongs to. Revoking cuts the whole family.',
+            },
+            active: {
+              type: 'boolean',
+              description: 'Derived: not revoked, and not yet expired.',
+            },
+            expiresAt: { type: 'string', format: 'date-time' },
+            consumedAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'When this row was rotated away. Null while it is the live link.',
+            },
+            revokedAt: { type: 'string', format: 'date-time', nullable: true },
+            revokedReason: {
+              type: 'string',
+              nullable: true,
+              example: 'staff_revoked',
+              description:
+                'Distinct values per cause — `logout`, `password_change`, `password_reset`, `staff_revoked` — so an investigation can tell them apart.',
+            },
+            userAgent: { type: 'string', nullable: true, maxLength: 512 },
+            ipAddress: { type: 'string', nullable: true, maxLength: 45 },
+            createdAt: { type: 'string', format: 'date-time' },
+            updatedAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        OrderTimelineEntry: {
+          type: 'object',
+          description:
+            'One entry of an order’s append-only status history. The actor’s user id is ' +
+            'deliberately absent — see GET /admin/audit-logs for attribution to a person.',
+          required: ['fromStatus', 'toStatus', 'actorType', 'note', 'at'],
+          properties: {
+            fromStatus: {
+              type: 'string',
+              nullable: true,
+              enum: ['placed', 'cancelled', null],
+              description: 'Null on the entry that created the order.',
+            },
+            toStatus: { type: 'string', enum: ['placed', 'cancelled'] },
+            actorType: { type: 'string', enum: ['customer', 'staff', 'system', 'job'] },
+            note: { type: 'string', nullable: true, maxLength: 500 },
+            at: { type: 'string', format: 'date-time' },
+          },
+        },
+        AuditLogEntry: {
+          type: 'object',
+          description:
+            'One audit entry. `metadata` is deliberately not published: each module writes ' +
+            'its own per-action context, and exposing the union of all of it through one ' +
+            'endpoint would make every future audit call a disclosure decision on this route.',
+          required: ['action', 'actorType', 'actorUserId', 'resourceType', 'resourceId', 'at'],
+          properties: {
+            action: { type: 'string', example: 'order.cancelled' },
+            actorType: { type: 'string', enum: ['staff', 'customer', 'system', 'job'] },
+            actorUserId: {
+              type: 'string',
+              format: 'uuid',
+              nullable: true,
+              description:
+                'Published HERE, unlike on the order and return timelines: this endpoint is the accountability surface, reached deliberately.',
+            },
+            resourceType: { type: 'string', nullable: true, example: 'order' },
+            resourceId: { type: 'string', nullable: true },
+            at: { type: 'string', format: 'date-time' },
+          },
+        },
+        BusinessProfile: {
+          type: 'object',
+          description:
+            'The store’s presentational identity. The GST identity — legalName, gstin, pan ' +
+            'and the origin address — belongs to /admin/store/tax-profile and is not here.',
+          required: ['slug', 'name', 'domain', 'currency', 'defaultLocale', 'timezone', 'isActive'],
+          properties: {
+            slug: { type: 'string', description: 'Read-only: how the store is resolved.' },
+            name: { type: 'string', maxLength: 200 },
+            domain: { type: 'string', nullable: true, maxLength: 255 },
+            currency: {
+              type: 'string',
+              description: 'Read-only: it denominates money already written.',
+            },
+            defaultLocale: { type: 'string', example: 'en-IN' },
+            timezone: { type: 'string', example: 'Asia/Kolkata' },
+            isActive: { type: 'boolean' },
+          },
+        },
+        ReturnCustomer: {
+          type: 'object',
+          description:
+            'The customer who raised the return. Email and name only, and no identifier: no ' +
+            'internal UUID appears in any response in this API.',
+          required: ['email', 'firstName', 'lastName'],
+          properties: {
+            email: { type: 'string', format: 'email' },
+            firstName: { type: 'string' },
+            lastName: { type: 'string' },
+          },
+        },
+        ReturnAddress: {
+          type: 'object',
+          description:
+            'The address the parcel is coming back from — the ORDER’S SNAPSHOT, never the ' +
+            'live address row. A customer fixing a typo today must not rewrite where a past ' +
+            'parcel was actually sent.',
+          required: [
+            'recipientName',
+            'phone',
+            'line1',
+            'line2',
+            'landmark',
+            'city',
+            'state',
+            'postalCode',
+            'countryCode',
+          ],
+          properties: {
+            recipientName: { type: 'string' },
+            phone: { type: 'string' },
+            line1: { type: 'string' },
+            line2: { type: 'string' },
+            landmark: { type: 'string' },
+            city: { type: 'string' },
+            state: { type: 'string' },
+            postalCode: { type: 'string' },
+            countryCode: { type: 'string', minLength: 2, maxLength: 2 },
+          },
+        },
+        ReturnEvent: {
+          type: 'object',
+          description:
+            'One entry of the append-only return lifecycle history. Rows are never rewritten ' +
+            'and never deleted. `actorType` says what KIND of actor made the transition; the ' +
+            'actor’s user id is deliberately absent — attribution to a person is an audit-log ' +
+            'question, not something to publish on a read many staff can see.',
+          required: ['fromStatus', 'toStatus', 'actorType', 'note', 'at'],
+          properties: {
+            fromStatus: {
+              type: 'string',
+              nullable: true,
+              description: 'Null on the entry that created the return.',
+            },
+            toStatus: { type: 'string' },
+            actorType: { type: 'string', enum: ['customer', 'staff', 'system', 'job'] },
+            note: { type: 'string', maxLength: 500 },
+            at: { type: 'string', format: 'date-time' },
+          },
+        },
+        StaffReturnListItem: {
+          allOf: [
+            { $ref: '#/components/schemas/StaffReturn' },
+            {
+              type: 'object',
+              description: 'A queue row: the staff return plus who raised it.',
+              required: ['customer'],
+              properties: { customer: { $ref: '#/components/schemas/ReturnCustomer' } },
+            },
+          ],
+        },
+        StaffReturnDetail: {
+          allOf: [
+            { $ref: '#/components/schemas/StaffReturn' },
+            {
+              type: 'object',
+              description:
+                'Everything the admin detail page shows. The refunds are the attempts raised ' +
+                'for this return by the refunds aggregate; the timeline is the append-only ' +
+                'lifecycle history.',
+              required: [
+                'customer',
+                'shippingAddress',
+                'deliveredAt',
+                'timeline',
+                'refunds',
+                'lines',
+              ],
+              properties: {
+                customer: { $ref: '#/components/schemas/ReturnCustomer' },
+                shippingAddress: { $ref: '#/components/schemas/ReturnAddress' },
+                deliveredAt: {
+                  type: 'string',
+                  format: 'date-time',
+                  description:
+                    'When the order was delivered — the instant the return window was measured from.',
+                },
+                timeline: {
+                  type: 'array',
+                  description: 'Oldest first, totally ordered by (createdAt, id).',
+                  items: { $ref: '#/components/schemas/ReturnEvent' },
+                },
+                refunds: {
+                  type: 'array',
+                  items: { $ref: '#/components/schemas/Refund' },
+                },
+                lines: {
+                  type: 'array',
+                  items: {
+                    allOf: [
+                      { $ref: '#/components/schemas/ReturnLine' },
+                      {
+                        type: 'object',
+                        required: [
+                          'restockQuantity',
+                          'writeOffQuantity',
+                          'productName',
+                          'remainingReturnable',
+                        ],
+                        properties: {
+                          restockQuantity: { type: 'integer', minimum: 0 },
+                          writeOffQuantity: { type: 'integer', minimum: 0 },
+                          productName: {
+                            type: 'string',
+                            description:
+                              'The product’s CURRENT name, read live — staff handling a parcel need the name on the shelf today. Every monetary field beside it remains the frozen snapshot.',
+                          },
+                          remainingReturnable: {
+                            type: 'integer',
+                            minimum: 0,
+                            description:
+                              'How many units of this SKU on the order are still returnable, after every quantity-consuming return against it. A read: the create path recomputes this under the order lock before writing.',
+                          },
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          ],
+        },
         Return: {
           type: 'object',
           description:
@@ -1646,15 +2561,127 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         OrderLine: ORDER_LINE,
         OrderAddress: ORDER_ADDRESS,
         OrderPromotion: ORDER_PROMOTION,
+        DashboardKpiMoney: DASHBOARD_KPI_MONEY,
+        DashboardKpiCount: DASHBOARD_KPI_COUNT,
+        DashboardSeriesPoint: DASHBOARD_SERIES_POINT,
+        DashboardTopProduct: DASHBOARD_TOP_PRODUCT,
+        DashboardLowStock: DASHBOARD_LOW_STOCK,
+        AdminPayment: ADMIN_PAYMENT,
+        AdminPaymentDetail: {
+          allOf: [
+            { $ref: '#/components/schemas/AdminPayment' },
+            {
+              type: 'object',
+              required: ['providerRef', 'providerTransactionId', 'refunds', 'refundBalance'],
+              properties: {
+                providerRef: {
+                  description: [
+                    'The provider’s **order** handle — Razorpay’s `order_…`, created at initiation,',
+                    'before anybody paid. Null for `cod`.',
+                  ].join(' '),
+                  oneOf: [{ type: 'string', maxLength: 255 }, { type: 'null' }],
+                },
+                providerTransactionId: {
+                  description: [
+                    'The provider’s **charge** id — Razorpay’s `pay_…`. This is the “Transaction ID”',
+                    'a merchant looks up in the gateway’s dashboard, and it is a different entity',
+                    'from `providerRef` above.',
+                    '',
+                    'Null in four ordinary cases, all of them permanent for the row concerned: a',
+                    '`cod` payment (no gateway), a payment still `pending` (no charge yet), a',
+                    'failure the provider reported without one, and any payment taken before this',
+                    'field existed — those charges are real and their ids were never captured, so',
+                    'nothing could be backfilled that would not be invented.',
+                  ].join('\n'),
+                  oneOf: [{ type: 'string', maxLength: 255 }, { type: 'null' }],
+                },
+                refunds: {
+                  type: 'array',
+                  description:
+                    'Every refund raised against this payment, newest first — including failed and unresolved attempts, because an operator chasing money needs to see the ones that did not work.',
+                  items: { $ref: '#/components/schemas/Refund' },
+                },
+                refundBalance: { $ref: '#/components/schemas/RefundBalance' },
+              },
+            },
+          ],
+        },
+        AdminCustomer: ADMIN_CUSTOMER,
+        AdminCustomerCounts: ADMIN_CUSTOMER_COUNTS,
+        AdminOrderCustomer: ADMIN_ORDER_CUSTOMER,
+        AdminOrderPayment: ADMIN_ORDER_PAYMENT,
+        AdminOrderShipment: ADMIN_ORDER_SHIPMENT,
+        AdminOrderSummary: ADMIN_ORDER_SUMMARY,
+        AdminOrderDetail: ADMIN_ORDER_DETAIL,
         Payment: PAYMENT,
         PaymentEvent: PAYMENT_EVENT,
         PaymentHandoff: PAYMENT_HANDOFF,
         Product: PRODUCT,
+        Refund: REFUND,
+        RefundBalance: REFUND_BALANCE,
+        ProductCounts: PRODUCT_COUNTS,
+        ProductMedia: PRODUCT_MEDIA,
+        MediaUploadTarget: MEDIA_UPLOAD_TARGET,
         Sku: SKU,
         SkuOption: SKU_OPTION,
         Option: OPTION,
         OptionValue: OPTION_VALUE,
         StaffShipment: STAFF_SHIPMENT,
+        AdminShipment: {
+          allOf: [
+            { $ref: '#/components/schemas/StaffShipment' },
+            {
+              type: 'object',
+              required: ['orderNumber'],
+              properties: {
+                orderNumber: {
+                  type: 'string',
+                  description:
+                    'How staff address the order everywhere else. A shipment list that could only name internal ids would be unusable.',
+                  example: 'ORD-20260904-7QK4M2',
+                },
+              },
+            },
+          ],
+        },
+        ShipmentEvent: {
+          type: 'object',
+          description:
+            'One transition. `actorType` rather than an actor id: the timeline says a STAFF member acted, without naming a colleague on a screen that exists to explain a parcel.',
+          required: ['fromStatus', 'toStatus', 'actorType', 'note', 'occurredAt'],
+          properties: {
+            fromStatus: {
+              description: 'Null for the creation row, which has no previous state.',
+              oneOf: [
+                { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+                { type: 'null' },
+              ],
+            },
+            toStatus: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+            actorType: { type: 'string', example: 'staff' },
+            note: {
+              description: 'Free text a staff member typed at the transition. Staff-only.',
+              oneOf: [{ type: 'string', maxLength: 500 }, { type: 'null' }],
+            },
+            occurredAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        AdminShipmentDetail: {
+          allOf: [
+            { $ref: '#/components/schemas/AdminShipment' },
+            {
+              type: 'object',
+              required: ['history'],
+              properties: {
+                history: {
+                  type: 'array',
+                  description: 'Every transition this shipment has made, OLDEST first.',
+                  items: { $ref: '#/components/schemas/ShipmentEvent' },
+                },
+              },
+            },
+          ],
+        },
         StaffShipmentList: {
           type: 'object',
           required: ['shipments'],
@@ -2934,6 +3961,96 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/shipments': {
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'List the store’s shipments (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every shipment in the store**, newest first. Requires the `staff` scope.',
+            '',
+            'The read this module never had. `PATCH /admin/shipments/{id}` and both transition',
+            'routes have always addressed a shipment by id, so staff could change a shipment they',
+            'had no way to look at — and the only listing was `GET /admin/orders/fulfilment`,',
+            'which is a worklist of orders AWAITING shipment and therefore excludes every',
+            'shipment that already exists.',
+            '',
+            '### Filters are exact, not searches',
+            '',
+            '`status` must be one of the real vocabulary. `orderNumber` must match the generated',
+            'shape; because `uq_shipment_order` allows one shipment per order it selects at most',
+            'one row, and an unknown number is an **empty page, not a `404`** — it is a filter,',
+            'not a lookup.',
+            '',
+            '**No date filters.** None was asked for, and adding one would pull in the',
+            'millisecond-versus-microsecond bound question the order and payment lists answer.',
+            '',
+            'Ordered by `createdAt` descending, then `id` descending — a total order, so `offset`',
+            'paging cannot skip or repeat rows when two shipments share an instant.',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400`.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+            },
+            {
+              name: 'orderNumber',
+              in: 'query',
+              required: false,
+              description:
+                'An EXACT order number, not a search. An unknown number is an empty page, not a 404.',
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s shipments, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['shipments', 'pagination'],
+                    properties: {
+                      shipments: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminShipment' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
       '/api/v1/admin/orders/{orderNumber}/shipments': {
         post: {
           tags: ['Fulfilment'],
@@ -3188,6 +4305,66 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       },
 
       '/api/v1/admin/shipments/{id}': {
+        get: {
+          tags: ['Fulfilment'],
+          summary: 'Read one shipment with its history (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'One shipment and every transition it has made. Requires the `staff` scope.',
+            '',
+            'The same fields as a list row, plus `history` — the transitions in order, oldest',
+            'first, each with the note a staff member typed at the time. The history is here and',
+            'not on the list because a page of 100 shipments would otherwise carry every',
+            'transition any of them ever made to render a table that shows none of them.',
+            '',
+            'The creation row has `fromStatus: null`; a shipment is created IN `pending` rather',
+            'than transitioning into it.',
+            '',
+            'Store-scoped from the verified staff token. An unknown id and a shipment belonging',
+            'to ANOTHER store are both `404` and deliberately indistinguishable — the query',
+            'returns nothing for either, so the endpoint cannot confirm that a shipment exists',
+            'elsewhere.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'id',
+              in: 'path',
+              required: true,
+              description:
+                'A UUID by shape only. Existence and tenancy are decided by the query, so a malformed id is a 400 and every other miss is a 404.',
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The shipment and its transition history.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['shipment'],
+                    properties: {
+                      shipment: { $ref: '#/components/schemas/AdminShipmentDetail' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such shipment in this store. An unknown id and another store’s shipment are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
         patch: {
           tags: ['Fulfilment'],
           summary: 'Correct tracking details (staff)',
@@ -3326,6 +4503,1427 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '409': errorResponse(
               'The order cannot be cancelled. `details.reason` is `status` (already cancelled), `payment_in_progress` (a payment is pending), or `paid` (money was taken and refunds are not supported).',
               'ORDER_NOT_CANCELLABLE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}/payment': {
+        get: {
+          tags: ['Payments'],
+          summary: 'Read an order’s payment (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The order’s payment, with the provider’s identifiers. Requires the `staff` scope.',
+            '',
+            'The list above pages and filters; this answers “show me THIS order’s payment”, and it',
+            'is where the provider’s charge id is published.',
+            '',
+            '### Why the order number addresses it',
+            '',
+            'The payment’s own id is published nowhere in this API — the staff list omits it',
+            'because a payment is addressed by the order it pays for — so a `/admin/payments/{id}`',
+            'route would be unreachable by any client that had not first been handed an id no',
+            'endpoint returns. `uq_payment_order` makes one order exactly one payment, so the order',
+            'number is an exact address rather than a filter.',
+            '',
+            '### Three fields the list row does not carry',
+            '',
+            '| Field | What it is |',
+            '| --- | --- |',
+            '| `provider` | Which gateway handled it. Null for `cod`. |',
+            '| `providerRef` | The provider’s **order** — Razorpay `order_…`, written by us at initiation, before anybody paid. |',
+            '| `providerTransactionId` | The provider’s **charge** — Razorpay `pay_…`, the “Transaction ID” its dashboard shows. |',
+            '',
+            'Those last two are routinely confused and are different entities. Neither is a',
+            'credential: acting on the provider requires the API secret, which never leaves the',
+            'server. A third identifier, the webhook **delivery** id, is deduplication material and',
+            'is not published here or anywhere else.',
+            '',
+            '### Still absent',
+            '',
+            '`amountMinor`, the internal payment id, `userId`, `orderId`, `storeId`, and the',
+            'transition timeline — the last is a separate surface that this route does not open.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. An unknown order, another store’s order,',
+            'and an order with no payment are all `404` and indistinguishable.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The order’s payment.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['payment'],
+                    properties: {
+                      payment: { $ref: '#/components/schemas/AdminPaymentDetail' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such order in this store, or the order has no payment. The two are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/payments': {
+        get: {
+          tags: ['Payments'],
+          summary: 'List the store’s payments (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every payment in the store**, whosever it is. Requires the `staff` scope.',
+            '',
+            'The module’s first staff route, and it is a **read**. The two questions the payments',
+            'module previously recorded as undecided now have answers: a support agent may see',
+            'every payment in their OWN store and none from another, and a provider reference is',
+            'NOT among the fields.',
+            '',
+            '### What is deliberately absent',
+            '',
+            '| Field | Why |',
+            '| --- | --- |',
+            '| `providerRef` | The gateway handle — a capability to act provider-side. It goes to the paying customer for the checkout handoff and nobody else. |',
+            '| `amountMinor` | The integer mirror kept for the provider call. Money leaves this system as a decimal string; publishing both invites a client to pick one. |',
+            '| internal ids | A payment is addressed here by its order number. |',
+            '',
+            'The provider’s identifiers live on the DETAIL route, `GET',
+            '/api/v1/admin/orders/{orderNumber}/payment` — one payment read deliberately, rather',
+            'than a page of handles. There is still **no refund, no reconciliation and no staff',
+            'mutation of any kind**. Staff may see that a payment exists and what state it reached.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400` rather than something ignored.',
+            '',
+            'Ordered by `createdAt` descending, then `id` descending. The tiebreaker matters:',
+            '`createdAt` alone is not a total order, and a non-total order makes `offset` paging',
+            'silently skip and repeat rows between pages.',
+            '',
+            '**Both date bounds are inclusive, at millisecond granularity.** A bound NAMES A',
+            'MILLISECOND — that is the finest instant this API can express, because a query',
+            'parameter becomes a JavaScript `Date` and `createdAt` is published with three',
+            'fractional digits — and an inclusive bound includes the whole of the millisecond',
+            'named. So a row stored at `10:00:00.123456Z`, published as `10:00:00.123Z`, is',
+            'returned by `createdTo=2026-09-15T10:00:00.123Z`: **a row’s own timestamp always',
+            'round-trips as a bound.** `…122Z` excludes it and `…124Z` as a lower bound excludes',
+            'it, so no adjacent millisecond is swept in.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+            },
+            {
+              name: 'method',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['online', 'cod'] },
+            },
+            {
+              name: 'provider',
+              in: 'query',
+              required: false,
+              description: 'Matches no `cod` payment — those have a null provider by construction.',
+              schema: { type: 'string', enum: ['razorpay'] },
+            },
+            {
+              name: 'orderNumber',
+              in: 'query',
+              required: false,
+              description:
+                'An EXACT order number, not a search. `uq_payment_order` means this narrows to at most one payment. An unknown number is an empty page, not a `404` — it is a filter, not a lookup.',
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+            {
+              name: 'transactionId',
+              in: 'query',
+              required: false,
+              description: [
+                'An EXACT provider **charge** id — Razorpay’s `pay_…`, the id its dashboard shows',
+                'against a payment. `uq_payment_provider_txn` makes this at most one row per store.',
+                '',
+                'Not `providerRef`, which is the provider **order** (`order_…`) created before',
+                'anybody paid, and not the webhook delivery id. Matches no `cod` payment and no',
+                'payment that has not been charged — both have none.',
+                '',
+                'Validated as a charset and a length, not as a `pay_` prefix: the value belongs to',
+                'the provider, and pinning its shape would turn the provider changing its own',
+                'identifiers into a `400` on a lookup that would otherwise have worked.',
+              ].join('\n'),
+              schema: { type: 'string', minLength: 1, maxLength: 255, pattern: '^[A-Za-z0-9_-]+$' },
+              example: 'pay_MgkB2Xq7RtLmNp',
+            },
+            {
+              name: 'createdFrom',
+              in: 'query',
+              required: false,
+              description:
+                'INCLUSIVE lower bound on `createdAt`. A full ISO-8601 instant WITH an offset — the client owns the timezone, deliberately: a bare date would force the server to pick one, and every choice is wrong for somebody.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-01T00:00:00+05:30',
+            },
+            {
+              name: 'createdTo',
+              in: 'query',
+              required: false,
+              description: 'INCLUSIVE upper bound on `createdAt`. Same format as `createdFrom`.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-30T23:59:59+05:30',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s payments, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['payments', 'pagination'],
+                    properties: {
+                      payments: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminPayment' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/dashboard': {
+        get: {
+          tags: ['Dashboard'],
+          summary: 'The admin overview screen (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Every figure the dashboard renders, in one read. Requires the `staff` scope.',
+            '',
+            'One endpoint rather than seven, because it is one screen and the widgets share a date',
+            'range that would otherwise have to be re-derived — and re-agreed — by each of them.',
+            'Internally it is composition only: each figure is computed by the module that owns the',
+            'rows, and nothing here reads a table it does not own.',
+            '',
+            '### What the date range governs',
+            '',
+            '| Affected by `from`/`to` | Always as-of-now |',
+            '| --- | --- |',
+            '| `kpis.revenue` | `kpis.products` |',
+            '| `kpis.orders` | `kpis.customers` |',
+            '| `salesSeries` | `orderStatusCounts` |',
+            '| `topProducts` | `lowStock`, `recentOrders` |',
+            '',
+            'The right-hand column is deliberate. A customer total silently narrowed to the selected',
+            'month would be read as a lifetime figure, and a low-stock alert scoped to last quarter',
+            'would describe stock nobody holds any more.',
+            '',
+            '### Revenue is BILLED value, not cash received',
+            '',
+            'Revenue is `SUM(order.grandTotal)` over NON-CANCELLED orders placed inside the window.',
+            '',
+            '| Included | Excluded |',
+            '| --- | --- |',
+            '| GST — `grandTotal` is tax-inclusive | cancelled orders |',
+            '| cash-on-delivery orders | returns and refunds |',
+            '| orders whose online payment later failed | |',
+            '',
+            'A cash-on-delivery payment never reaches `succeeded` in this system, so a definition',
+            'based on captured money would report zero for every COD sale. This one does not have',
+            'that defect, and pays for it by counting an order whose online payment failed. Returns',
+            'are not deducted because no refund has ever been executed here — subtracting a',
+            'requested refund would report a reversal that never happened.',
+            '',
+            'It is the SAME definition `totalSpent` uses on the customer surface, so the two screens',
+            'cannot disagree about what a sale was worth.',
+            '',
+            '### Dates, and the previous period',
+            '',
+            'Both bounds are INCLUSIVE at millisecond granularity, the convention every admin list',
+            'here follows: the upper bound names a millisecond and includes the whole of it, so an',
+            'order’s own published `placedAt` always round-trips as a bound even though PostgreSQL',
+            'stores microseconds underneath.',
+            '',
+            'The previous period is the equal-DURATION window immediately before this one, ending',
+            'one millisecond before `from`. No overlap, no gap. Equal duration rather than equal',
+            'calendar shape, so a 28-day February is never compared against a 31-day January and the',
+            'difference called growth.',
+            '',
+            'Omitted, the window is the last twelve calendar months through now — the chart is',
+            'monthly, and a 30-day default would render one or two bars.',
+            '',
+            '### Buckets',
+            '',
+            'Truncated in the STORE’s configured timezone, not UTC. Every bucket the window spans is',
+            'present, zero-filled where there were no orders — a month with no sales is a fact, and',
+            'omitting it would draw a line straight from March to May.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400`.',
+            '',
+            'No internal identifiers appear anywhere in the response: SKUs are addressed by their',
+            'merchant code and orders by their order number.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'from',
+              in: 'query',
+              required: false,
+              description:
+                'INCLUSIVE lower bound on `placedAt`. A full ISO-8601 instant WITH an offset — the client owns the timezone, deliberately: a bare date would force the server to pick one, and every choice is wrong for somebody. Defaults to twelve calendar months before `to`.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-01-01T00:00:00+05:30',
+            },
+            {
+              name: 'to',
+              in: 'query',
+              required: false,
+              description:
+                'INCLUSIVE upper bound on `placedAt`. Same format as `from`. Defaults to now.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-12-31T23:59:59+05:30',
+            },
+            {
+              name: 'interval',
+              in: 'query',
+              required: false,
+              description: 'Calendar bucket for `salesSeries`, truncated in the store’s timezone.',
+              schema: { type: 'string', enum: ['day', 'week', 'month'], default: 'month' },
+            },
+            {
+              name: 'topProductsLimit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 20, default: 5 },
+            },
+            {
+              name: 'lowStockLimit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 50, default: 10 },
+            },
+            {
+              name: 'recentOrdersLimit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 20, default: 10 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'Every dashboard figure.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: [
+                      'range',
+                      'kpis',
+                      'salesSeries',
+                      'orderStatusCounts',
+                      'topProducts',
+                      'lowStock',
+                      'recentOrders',
+                    ],
+                    properties: {
+                      range: {
+                        type: 'object',
+                        required: [
+                          'from',
+                          'to',
+                          'previousFrom',
+                          'previousTo',
+                          'timezone',
+                          'interval',
+                        ],
+                        description:
+                          'The window actually used, echoed back so a client never has to re-derive it — including the defaults it did not supply.',
+                        properties: {
+                          from: { type: 'string', format: 'date-time' },
+                          to: { type: 'string', format: 'date-time' },
+                          previousFrom: { type: 'string', format: 'date-time' },
+                          previousTo: { type: 'string', format: 'date-time' },
+                          timezone: { type: 'string', example: 'Asia/Kolkata' },
+                          interval: { type: 'string', enum: ['day', 'week', 'month'] },
+                        },
+                      },
+                      kpis: {
+                        type: 'object',
+                        required: ['revenue', 'orders', 'products', 'customers'],
+                        properties: {
+                          revenue: { $ref: '#/components/schemas/DashboardKpiMoney' },
+                          orders: { $ref: '#/components/schemas/DashboardKpiCount' },
+                          products: {
+                            allOf: [{ $ref: '#/components/schemas/DashboardKpiCount' }],
+                            description:
+                              'Products this store can currently sell: `status = active` and not soft-deleted. Draft and archived products are excluded, so the tile agrees with what a shopper can actually buy.',
+                          },
+                          customers: {
+                            allOf: [{ $ref: '#/components/schemas/DashboardKpiCount' }],
+                            description:
+                              'Live customer accounts in this store. Soft-deleted accounts are excluded, matching every other customer read.',
+                          },
+                        },
+                      },
+                      salesSeries: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/DashboardSeriesPoint' },
+                      },
+                      orderStatusCounts: {
+                        type: 'object',
+                        description:
+                          'Orders by composed display status. Reuses the SAME derivation the admin order list filters by, so a tile and the page it links to can never disagree. All seven keys are always present, including at zero.',
+                        required: [
+                          'pending',
+                          'confirmed',
+                          'processing',
+                          'shipped',
+                          'delivered',
+                          'cancelled',
+                          'failed',
+                        ],
+                        additionalProperties: { type: 'integer', minimum: 0 },
+                        properties: {
+                          pending: { type: 'integer', minimum: 0 },
+                          confirmed: { type: 'integer', minimum: 0 },
+                          processing: { type: 'integer', minimum: 0 },
+                          shipped: { type: 'integer', minimum: 0 },
+                          delivered: { type: 'integer', minimum: 0 },
+                          cancelled: { type: 'integer', minimum: 0 },
+                          failed: { type: 'integer', minimum: 0 },
+                        },
+                      },
+                      topProducts: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/DashboardTopProduct' },
+                      },
+                      lowStock: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/DashboardLowStock' },
+                      },
+                      recentOrders: {
+                        type: 'array',
+                        description:
+                          'The newest orders in the store, newest first. The SAME row shape `GET /admin/orders` publishes, through the same mapper — not a second definition of an order summary.',
+                        items: { $ref: '#/components/schemas/AdminOrderSummary' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/customers': {
+        get: {
+          tags: ['Users'],
+          summary: 'List the store’s customers (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every account in the store**. Requires the `staff` scope.',
+            '',
+            'The identity module’s first staff route, and its first read that returns many',
+            'subjects — every other authenticated endpoint there is about the caller’s own',
+            'account. `/users/me` stays self-scoped for everyone including staff, so this is a',
+            'separate surface rather than a relaxation of that one.',
+            '',
+            '### What is deliberately absent',
+            '',
+            '`passwordHash`, `isStaff` and `isSuperuser` are absent from the SQL projection, from',
+            'the record type, and from the response mapper — three deliberate edits would be',
+            'needed to publish one. Password-reset tokens and refresh sessions live in other',
+            'tables this query never touches.',
+            '',
+            'There is also **no activation, deactivation or deletion**. Staff may see who exists,',
+            'whether the account is live, and what it has ordered.',
+            '',
+            '### Order aggregates',
+            '',
+            'Each row carries `orderCount`, `totalSpent` and `lastOrderAt`, all three counting',
+            'only NON-CANCELLED orders. They are fetched in ONE additional statement for the whole',
+            'page, never one per row.',
+            '',
+            '### What is included, and what is filtered',
+            '',
+            'Soft-deleted accounts are excluded — an erased customer is invisible to staff for the',
+            'same reason they are invisible to authentication. Staff accounts are NOT excluded:',
+            'they are rows in the same table, and hiding them would make the list disagree with',
+            'the database for no stated reason.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, and the',
+            'query object is strict, so supplying one is a `400`.',
+            '',
+            'Ordered by `createdAt` descending, then `id` descending — a total order, so `offset`',
+            'paging cannot skip or repeat rows.',
+            '',
+            '**Both date bounds are inclusive, at millisecond granularity**, exactly as',
+            '`GET /admin/payments` documents: a bound names a millisecond and includes the whole',
+            'of it, so an account’s own published `createdAt` always round-trips as a bound even',
+            'though PostgreSQL stores microseconds underneath.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'isActive',
+              in: 'query',
+              required: false,
+              description:
+                'Exactly `true` or `false`. Parsed from those two strings rather than coerced — a boolean coercion treats every non-empty string as true, so `?isActive=false` would have filtered to ACTIVE accounts with no error to notice.',
+              schema: { type: 'string', enum: ['true', 'false'] },
+            },
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description: [
+                'The operator’s search box. One term, matched case-insensitively as a SUBSTRING',
+                'across `email`, `firstName`, `lastName` and `phone`.',
+                '',
+                'Wider than `GET /admin/orders?q=`, which searches an order number or an email.',
+                'That one narrows a list an operator is already looking at; this is the customer',
+                'directory, whose purpose is finding a person from a partial name or number.',
+                '',
+                'The phone arm compares DIGITS only, so `98765`, `+91 98765` and `+919876543210`',
+                'all find the same customer. The other three arms take the term verbatim, and `%`',
+                'and `_` are escaped — a typed `%` matches a literal percent sign, not everything.',
+                '',
+                'Combines with every other filter rather than replacing them.',
+              ].join('\n'),
+              schema: { type: 'string', minLength: 1, maxLength: 320 },
+              example: 'meera',
+            },
+            {
+              name: 'createdFrom',
+              in: 'query',
+              required: false,
+              description:
+                'INCLUSIVE lower bound on `createdAt`. A full ISO-8601 instant WITH an offset; the client owns the timezone.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-01T00:00:00+05:30',
+            },
+            {
+              name: 'createdTo',
+              in: 'query',
+              required: false,
+              description: 'INCLUSIVE upper bound on `createdAt`. Same format as `createdFrom`.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-30T23:59:59+05:30',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s customers, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['customers', 'counts', 'pagination'],
+                    properties: {
+                      counts: { $ref: '#/components/schemas/AdminCustomerCounts' },
+                      customers: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminCustomer' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. A customer receives this even when asking about themselves — `GET /users/me` is the route they should use.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/summary': {
+        get: {
+          tags: ['Orders'],
+          summary: 'Operational order counts (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Three tallies for the whole store. Requires the `staff` scope.',
+            '',
+            '**Queue depths, not a report.** No money, no period, no filters — the question is',
+            '"what needs attention now". Keeping money out also keeps this endpoint clear of the',
+            'one thing the system has no answer for: whether an unpaid or cancelled order should',
+            'contribute to a total.',
+            '',
+            '`byDisplayStatus` uses the SAME composed expression `GET /admin/orders` filters by',
+            '(§49), so a tile and the list it links to can never offer different statuses.',
+            '`byPaymentStatus` and `byShipmentStatus` are the raw underlying statuses; an order',
+            'with no payment or no shipment is counted in neither of those two.',
+            '',
+            '**Every status appears, including at zero**, so the response shape is fixed and a',
+            'client never has to tell "absent" from "none".',
+            '',
+            'Store-scoped from the verified staff token. There is no query object at all.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'Operational counts.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders'],
+                    properties: {
+                      orders: {
+                        type: 'object',
+                        required: ['byDisplayStatus', 'byPaymentStatus', 'byShipmentStatus'],
+                        properties: {
+                          byDisplayStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                            description:
+                              'One key per §49 display status. `ready_to_ship` and `returned` are not derivable and never appear.',
+                          },
+                          byPaymentStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                          },
+                          byShipmentStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/summary': {
+        get: {
+          tags: ['Returns'],
+          summary: 'Operational return counts (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Return counts by status for the whole store. Requires the `staff` scope.',
+            '',
+            'Queue depth, not a report: no money, no period, no filters. Every status in the',
+            'return vocabulary appears, including the ones at zero, so the shape does not change',
+            'with the data.',
+            '',
+            'Store-scoped from the verified staff token; no query object.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'Return counts by status.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['returns'],
+                    properties: {
+                      returns: {
+                        type: 'object',
+                        required: ['byStatus'],
+                        properties: {
+                          byStatus: {
+                            type: 'object',
+                            additionalProperties: { type: 'integer', minimum: 0 },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/inventory/summary': {
+        get: {
+          tags: ['Inventory'],
+          summary: 'Operational inventory counts (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'How many live SKUs have nothing sellable left. Requires the `staff` scope.',
+            '',
+            '"Out of stock" means `available <= 0`, where `available` is the stored',
+            '`on_hand - reserved`. A SKU whose entire holding is reserved therefore counts: the',
+            'next customer cannot buy it, which is the fact an operator acts on.',
+            '',
+            'Uses the same visibility rule as `GET /admin/inventory`, so this number and that',
+            'list agree on which SKUs exist — soft-deleted SKUs are excluded from both.',
+            '',
+            '**There is no low-stock figure and cannot be one in this version.** `stock_item` has',
+            'no reorder threshold, so "low" has no definition here; supplying one from a dashboard',
+            'would be a business rule arriving by the back door.',
+            '',
+            'Store-scoped from the verified staff token; no query object.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'Inventory counts.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['inventory'],
+                    properties: {
+                      inventory: {
+                        type: 'object',
+                        required: ['outOfStockSkus'],
+                        properties: {
+                          outOfStockSkus: { type: 'integer', minimum: 0 },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}': {
+        get: {
+          tags: ['Users'],
+          summary: 'Read one customer (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'One customer in the store. Requires the `staff` scope.',
+            '',
+            'Publishes the SAME seven fields as `GET /admin/customers`, through the same mapper,',
+            'so the list and the detail cannot drift into describing a customer differently.',
+            '',
+            '`passwordHash`, `isStaff` and `isSuperuser` are absent from the SQL projection, the',
+            'record type and the response mapper alike. Password-reset tokens and refresh sessions',
+            'live in other tables this query never touches.',
+            '',
+            '### Deliberately absent',
+            '',
+            'No order history here — that is `GET /admin/customers/{customerId}/orders`. No',
+            'activity totals, no activation or deactivation, no editing. This is a read.',
+            '',
+            '### Tenancy and not-found',
+            '',
+            'Store-scoped from the verified staff token; `customerId` names which customer, never',
+            'which store. An unknown id, a customer belonging to ANOTHER store, and a soft-deleted',
+            'customer are all `404` and deliberately indistinguishable — the query returns nothing',
+            'for each, so the endpoint cannot confirm that an account exists elsewhere.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              description:
+                'A UUID by shape only. Existence, tenancy and liveness are decided by the query, so a malformed id is a 400 and every other miss is a 404.',
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The customer.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['customer'],
+                    properties: { customer: { $ref: '#/components/schemas/AdminCustomer' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such customer in this store. An unknown id, another store’s customer and a soft-deleted customer are deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}/activation': {
+        post: {
+          tags: ['Users'],
+          summary: 'Activate or deactivate a customer (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Enables or disables one customer account. Requires the `staff` scope.',
+            '',
+            'A deactivated customer cannot sign in. Login already refuses an inactive account —',
+            'and refuses it AFTER verifying the password, so the endpoint cannot be used as an',
+            'account-state oracle — this route only flips the flag that check reads.',
+            '',
+            '### Not a privilege operation',
+            '',
+            '`isStaff` and `isSuperuser` cannot be reached from the body: the schema is strict,',
+            'so naming either is a `400`, and the repository method behind this route selects',
+            'neither column and can write neither.',
+            '',
+            '### A redundant change is a conflict, not a no-op',
+            '',
+            'Deactivating an already deactivated account answers `409`. The update carries a',
+            'compare-and-swap on the current value, so no audit entry is written for a decision',
+            'nobody made — a trail of repeated clicks is a trail that cannot be read.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['isActive'],
+                  additionalProperties: false,
+                  properties: { isActive: { type: 'boolean' } },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The customer, in its new state.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['customer'],
+                    properties: { customer: { $ref: '#/components/schemas/AdminCustomer' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse(
+              'A malformed UUID, a missing `isActive`, or an unknown field — including `isStaff` and `isSuperuser`.',
+              'VALIDATION_ERROR',
+            ),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse(
+              'Unknown, another store’s, or soft-deleted — all indistinguishable.',
+              'NOT_FOUND',
+            ),
+            '409': errorResponse('The account is already in the requested state.', 'CONFLICT'),
+          },
+        },
+      },
+
+      '/api/v1/admin/audit-logs': {
+        get: {
+          tags: ['Audit'],
+          summary: 'The store audit trail (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of the store’s audit log, newest first. Requires the `staff` scope.',
+            '',
+            '`audit_log` has been append-only since the platform’s first increment and stays',
+            'that way: this is a READ, and there is no endpoint anywhere that updates or',
+            'deletes an entry.',
+            '',
+            '### Tenancy, and why the predicate is an equality',
+            '',
+            '`store_id` is nullable on this table — platform-level entries carry none — so the',
+            'filter is a plain equality rather than an `OR IS NULL`. A NULL store satisfies no',
+            'equality, which is exactly the intent: a tenant’s staff must not see the',
+            'platform’s trail.',
+            '',
+            '### `metadata` is not published',
+            '',
+            'Each module writes its own per-action context, reviewed at its own call site.',
+            'Publishing the union of all of them through one endpoint would make every future',
+            '`audit.record` call a disclosure decision on this route. What is published is who',
+            'did what, to which resource, and when.',
+            '',
+            'Ordered `createdAt DESC, id DESC`. The timestamp alone is not a total order — one',
+            'transaction writes several entries at one instant — and the id is UUIDv7, so it',
+            'orders within the tie by creation.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'action',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', maxLength: 128 },
+              description:
+                'Exact match, e.g. `order.cancelled`. Not a substring: `payment` must not quietly match every payment action a future module adds.',
+            },
+            {
+              name: 'actorType',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['staff', 'customer', 'system', 'job'] },
+            },
+            {
+              name: 'actorUserId',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', format: 'uuid' },
+            },
+            {
+              name: 'resourceType',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', maxLength: 64 },
+              description: 'Exact match, e.g. `app_user`, `order`, `refund`.',
+            },
+            {
+              name: 'resourceId',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', maxLength: 64 },
+            },
+            {
+              name: 'from',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', format: 'date-time' },
+              description: 'Inclusive lower bound. ISO-8601 with an offset.',
+            },
+            {
+              name: 'to',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', format: 'date-time' },
+              description:
+                'Inclusive upper bound, admitting the whole millisecond named — the project-wide convention, because `created_at` is microsecond-precise in storage and millisecond-precise here.',
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of audit entries.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['auditLogs', 'pagination'],
+                    properties: {
+                      auditLogs: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AuditLogEntry' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse(
+              'An unknown query parameter, a malformed instant or UUID, or an out-of-range limit.',
+              'VALIDATION_ERROR',
+            ),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+          },
+        },
+      },
+
+      '/api/v1/admin/business-profile': {
+        get: {
+          tags: ['Settings'],
+          summary: 'The store business profile (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The store’s presentational identity: name, custom domain, locale and timezone.',
+            'Requires the `staff` scope.',
+            '',
+            '**The GST identity is not here.** `legalName`, `gstin`, `pan` and the origin',
+            'address belong to `GET`/`PUT /admin/store/tax-profile`, which validates a GSTIN',
+            'against its checksum and a state against the place-of-supply rules. Two endpoints',
+            'writing those columns with different validation is how one of them becomes the',
+            'weak one.',
+            '',
+            '`slug` and `currency` are published but not editable: the slug is how a store is',
+            'resolved on every request, and the currency denominates money already written to',
+            'every order, payment, refund and invoice. Changing either is a migration.',
+          ].join('\n'),
+          responses: {
+            '200': {
+              description: 'The business profile.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['businessProfile'],
+                    properties: {
+                      businessProfile: { $ref: '#/components/schemas/BusinessProfile' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+          },
+        },
+        patch: {
+          tags: ['Settings'],
+          summary: 'Edit the store business profile (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Edits the store’s presentational identity. Requires the `staff` scope.',
+            '',
+            'A PATCH: an absent key is left alone rather than nulled, so a client changing the',
+            'timezone cannot blank the store name by omitting it. An empty body is a no-op that',
+            'reads the profile back.',
+            '',
+            '`domain` is nullable — clearing a custom domain is a real operation, distinct from',
+            'omitting it. `timezone` is checked against the runtime’s own IANA database rather',
+            'than a regex, so a value this accepts is one the invoice renderer can format',
+            'against.',
+            '',
+            'Audited inside the write’s transaction, recording only the fields that changed.',
+            'Naming `gstin`, `legalName`, `pan`, `slug` or `currency` is a `400`.',
+          ].join('\n'),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    name: { type: 'string', minLength: 1, maxLength: 200 },
+                    domain: {
+                      type: 'string',
+                      nullable: true,
+                      maxLength: 255,
+                      description: 'A bare hostname, without a scheme or path. Null clears it.',
+                    },
+                    defaultLocale: {
+                      type: 'string',
+                      example: 'en-IN',
+                      description: 'A BCP-47 language tag.',
+                    },
+                    timezone: {
+                      type: 'string',
+                      example: 'Asia/Kolkata',
+                      description: 'An IANA timezone name.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The updated business profile.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['businessProfile'],
+                    properties: {
+                      businessProfile: { $ref: '#/components/schemas/BusinessProfile' },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse(
+              'An unknown field — including `gstin`, `legalName`, `pan`, `slug` and `currency` — an invalid timezone, locale or hostname.',
+              'VALIDATION_ERROR',
+            ),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}/addresses': {
+        get: {
+          tags: ['Addresses'],
+          summary: "One customer's addresses (staff)",
+          security: [{ bearerAuth: [] }],
+          description: [
+            "A customer's live address book. Requires the `staff` scope.",
+            '',
+            'Unpaged, matching the customer-facing equivalent: an address book is bounded by',
+            'what one person maintains. Soft-deleted addresses are excluded and cannot be asked',
+            'for. Ordered by label, then id — stable across reads, with UUIDv7 ordering equal',
+            'labels by creation.',
+            '',
+            '### An unknown customer is `200` with an empty list, not `404`',
+            '',
+            'This endpoint answers "what addresses may I see for this id". A `404` would make it',
+            'an oracle telling an operator which customer ids exist in OTHER stores. Existence is',
+            'established by `GET /admin/customers/{customerId}`, which does answer `404`.',
+            '',
+            'The tenant comes from the verified staff token; `customerId` names which customer,',
+            'never which store.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            '200': {
+              description: "The customer's live addresses. Empty if they have none.",
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['addresses'],
+                    properties: {
+                      addresses: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/Address' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed customer id.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}/sessions': {
+        get: {
+          tags: ['Users'],
+          summary: "One customer's sessions (staff)",
+          security: [{ bearerAuth: [] }],
+          description: [
+            "A page of a customer's refresh sessions, newest first. Requires the `staff` scope.",
+            '',
+            '### No token material, by construction',
+            '',
+            'The repository projection behind this endpoint does not select `token_hash`, so no',
+            'credential material is ever in scope for a response to publish — it is not redacted',
+            'downstream, it is never loaded.',
+            '',
+            '`active` is derived: not revoked, and not yet expired. `isCurrent` is deliberately',
+            'absent — answering it would require comparing against a refresh token, and the',
+            'caller is a staff member looking at somebody else’s account.',
+            '',
+            'An unknown or foreign `customerId` is `404`, so an operator can tell a mistyped id',
+            'from a customer who has never signed in.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of sessions.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['sessions', 'pagination'],
+                    properties: {
+                      sessions: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminSession' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed id or an out-of-range limit.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse(
+              'Unknown, another store’s, or soft-deleted customer.',
+              'NOT_FOUND',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}/sessions/{sessionId}': {
+        delete: {
+          tags: ['Users'],
+          summary: "Revoke one of a customer's sessions (staff)",
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Revokes a session, cutting the customer off from it. Requires the `staff` scope.',
+            '',
+            '### It revokes the FAMILY, not one row',
+            '',
+            'A refresh token rotates on every use, so one sign-in is a chain of rows sharing a',
+            '`family_id`. Revoking only the named row would leave its successor live and the',
+            'session still usable — the opposite of what an operator means by "revoke".',
+            '',
+            '`204` with no body. `404` for an unknown session, another customer’s, another',
+            'tenant’s, and one already revoked — all four indistinguishable, because',
+            'distinguishing them would make this an oracle for which session ids exist.',
+            '',
+            'Audited as `customer.session_revoked` with the session id and the number of rows',
+            'cut. Never any token material.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+            {
+              name: 'sessionId',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', format: 'uuid' },
+            },
+          ],
+          responses: {
+            '204': { description: 'Revoked.' },
+            '400': errorResponse('A malformed id.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse(
+              'Unknown customer, or no live session with that id for them.',
+              'NOT_FOUND',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/customers/{customerId}/orders': {
+        get: {
+          tags: ['Orders'],
+          summary: 'List one customer’s orders (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of one customer’s order history, newest first. Requires the `staff` scope.',
+            '',
+            'This is `GET /admin/orders` with one more predicate — the same statement, the same',
+            'ordering and the same `AdminOrderSummary` rows — so a customer’s history cannot drift',
+            'from the store-wide list. `pagination.total` is therefore that customer’s order count.',
+            '',
+            '### Paging only',
+            '',
+            'No status, date or search filters. Those belong to `GET /admin/orders`; offering half',
+            'of them here would invite a client to discover which half. The query object is strict,',
+            'so sending one is a `400` naming it.',
+            '',
+            'Ordered by `placedAt` descending, then `orderNumber` descending — a total order, so',
+            '`offset` paging cannot skip or repeat rows when two orders share an instant.',
+            '',
+            '### Not found versus empty',
+            '',
+            'A customer who exists and has never ordered is `200` with an empty `orders` array and',
+            '`total: 0`. A customer who is unknown, belongs to another store, or has been',
+            'soft-deleted is `404` — an empty page is a fact about somebody’s history and must not',
+            'be the answer for somebody who is not there.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'customerId',
+              in: 'path',
+              required: true,
+              description: 'A UUID by shape only. Same 400/404 rules as the customer detail route.',
+              schema: { type: 'string', format: 'uuid' },
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of that customer’s orders, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders', 'pagination'],
+                    properties: {
+                      orders: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminOrderSummary' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such customer in this store — unknown, another store’s, or soft-deleted. Distinct from a customer who exists with no orders, which is a 200 with an empty page.',
+              'NOT_FOUND',
             ),
             ...COMMON_ERRORS,
           },
@@ -3849,8 +6447,43 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '',
             'The page and the total share one predicate, so a caller on the last page is never',
             'told the total counted rows it cannot see.',
+            '',
+            '### There is no `usedCount`',
+            '',
+            'The Figma list shows a "Used" column and this API does not publish one, because',
+            'nothing counts redemptions: there is no redemption table, and a promotion carries no',
+            'usage counter. A number derived from anything currently stored would be a guess',
+            'presented as a figure a merchant makes decisions with, so none is published.',
+            'Recorded as a remaining structural gap rather than fabricated.',
           ].join('\n'),
           parameters: [
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description:
+                'Case-insensitive substring over the promotion code and name. `%` and `_` are literal characters, not wildcards.',
+              schema: { type: 'string', minLength: 1, maxLength: 300 },
+            },
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              description: [
+                'Lifecycle state, DERIVED from `isActive`, `startsAt` and `endsAt` — there is no',
+                'status column, and adding one would be a second source of truth the customer',
+                'facing usability rule could contradict.',
+                '',
+                '- `disabled` — switched off, whatever the dates say. It outranks the window.',
+                '- `scheduled` — enabled, and `startsAt` is in the future.',
+                '- `expired` — enabled, and `endsAt` is in the past.',
+                '- `active` — enabled, started (or unbounded), not yet ended (or unbounded).',
+                '',
+                'The four are mutually exclusive and cover every row, so tab counts sum to the',
+                'unfiltered total.',
+              ].join('\n'),
+              schema: { type: 'string', enum: ['active', 'scheduled', 'expired', 'disabled'] },
+            },
             {
               name: 'limit',
               in: 'query',
@@ -4464,8 +7097,12 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'case is theirs to see. The store comes from the verified token, so one tenant’s',
             'staff can never reach another’s returns.',
             '',
-            'The response carries `staffNote` and the per-line inspection counts, neither of',
-            'which appears on the customer-facing endpoints.',
+            'The response carries `staffNote`, the per-line inspection counts and the',
+            '`customer` who raised it, none of which appears on the customer-facing endpoints.',
+            '',
+            'Ordered `requestedAt DESC, returnNumber DESC`. The second key makes the order',
+            'total rather than merely usually-stable: `returnNumber` is unique per store, so two',
+            'returns raised in the same instant still page deterministically.',
           ].join('\n'),
           parameters: [
             {
@@ -4485,6 +7122,35 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                 ],
               },
               description: 'Narrow the queue to one state.',
+            },
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', minLength: 1, maxLength: 320 },
+              description: [
+                'Case-insensitive **substring** search over four fields: the return number, the',
+                'order number, the customer’s email, and any SKU code on the return’s lines.',
+                '',
+                '`%` and `_` are treated as literal characters, not wildcards. Deliberately not a',
+                'search over names, addresses or notes — a wider search is a wider disclosure.',
+              ].join('\n'),
+            },
+            {
+              name: 'requestedFrom',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', format: 'date-time' },
+              description:
+                'Only returns requested at or after this instant. ISO-8601 **with an offset**; a bare `YYYY-MM-DD` is rejected rather than widened into a timezone the server picked.',
+            },
+            {
+              name: 'requestedTo',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', format: 'date-time' },
+              description:
+                'Only returns requested at or before this instant, **inclusive of the whole millisecond named**. `requested_at` is microsecond-precise in storage and millisecond-precise in this API, so the bound admits every microsecond inside the millisecond given — including the return a client copied the value from.',
             },
             {
               name: 'limit',
@@ -4510,7 +7176,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                     properties: {
                       returns: {
                         type: 'array',
-                        items: { $ref: '#/components/schemas/StaffReturn' },
+                        items: { $ref: '#/components/schemas/StaffReturnListItem' },
                       },
                       total: { type: 'integer' },
                       limit: { type: 'integer' },
@@ -4520,7 +7186,10 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                 },
               },
             },
-            '400': errorResponse('An invalid status, limit or offset.', 'VALIDATION_ERROR'),
+            '400': errorResponse(
+              'An unknown query parameter, an invalid status, a malformed instant, an over-long search term, or an out-of-range limit or offset.',
+              'VALIDATION_ERROR',
+            ),
             '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
             '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
           },
@@ -4554,7 +7223,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                   schema: {
                     type: 'object',
                     required: ['return'],
-                    properties: { return: { $ref: '#/components/schemas/StaffReturn' } },
+                    properties: { return: { $ref: '#/components/schemas/StaffReturnDetail' } },
                   },
                 },
               },
@@ -4698,6 +7367,284 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '409': errorResponse(
               'The return is not in a state that can be rejected.',
               'RETURN_NOT_TRANSITIONABLE',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/{returnNumber}/receive': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Record that returned goods arrived (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The parcel is at the warehouse. **Only `approved` → `received`.**',
+            '',
+            'Nothing about money or stock happens here. The units are physically present but',
+            'not yet judged, and restocking unexamined goods would put them back on sale before',
+            'anyone had looked at them. That judgement is `POST .../inspect`.',
+            '',
+            'The received instant is the `return_event` row this writes, not a new column: the',
+            'event log is already the append-only record of when each transition happened, and a',
+            'second timestamp on the header would be the same fact stored twice and free to',
+            'disagree.',
+            '',
+            '### No Idempotency-Key',
+            '',
+            'The status predicate on the update IS the idempotency, exactly as for approve and',
+            'reject: a second receipt matches no row and answers `409`.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: { staffNote: { type: 'string', maxLength: 500 } },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The received return.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/StaffReturn' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed number or an unknown field.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The return is not `approved`, so it cannot be received.',
+              'RETURN_NOT_TRANSITIONABLE',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/{returnNumber}/inspect': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Record the inspection result (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Decides, per line, how many returned units are good to sell and how many are',
+            'written off. **Only `received` → `inspected`.**',
+            '',
+            '### The counts do not change what the customer is owed',
+            '',
+            'A smashed jar is still a jar they sent back. The frozen refund snapshot taken when',
+            'the return was created is never touched here. What these counts decide is how many',
+            'units go back into sellable stock when the return is completed.',
+            '',
+            'Counts rather than a verdict, because a single line legitimately splits — three',
+            'jars returned, one smashed. A label would force staff to either lie about the good',
+            'two or raise a second return for the broken one.',
+            '',
+            '### Every line, exactly once, fully accounted for',
+            '',
+            'Each line of the return must appear, no line may appear twice, and each line’s',
+            '`restockQuantity + writeOffQuantity` must equal the quantity that came back. A',
+            'partial inspection is a `422` rather than a defaulted zero, because completion',
+            'would otherwise restock a number nobody decided.',
+            '',
+            '### There is no rejection from here',
+            '',
+            '`received` → `rejected` is the refusal edge, taken INSTEAD of this one. Reaching',
+            '`inspected` already means the return was accepted, which is what makes',
+            '`inspected` → `completed` unconditional.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['lines'],
+                  additionalProperties: false,
+                  properties: {
+                    lines: {
+                      type: 'array',
+                      minItems: 1,
+                      maxItems: 100,
+                      items: {
+                        type: 'object',
+                        required: ['skuCode', 'restockQuantity', 'writeOffQuantity'],
+                        additionalProperties: false,
+                        properties: {
+                          skuCode: { type: 'string', maxLength: 64, example: 'SHIRT-BLUE-M' },
+                          restockQuantity: {
+                            type: 'integer',
+                            minimum: 0,
+                            maximum: 999,
+                            example: 2,
+                          },
+                          writeOffQuantity: {
+                            type: 'integer',
+                            minimum: 0,
+                            maximum: 999,
+                            example: 1,
+                          },
+                        },
+                      },
+                    },
+                    staffNote: { type: 'string', maxLength: 500 },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The inspected return, with the counts on each line.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return'],
+                    properties: { return: { $ref: '#/components/schemas/StaffReturn' } },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed number or an unknown field.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The return is not `received`, so it cannot be inspected.',
+              'RETURN_NOT_TRANSITIONABLE',
+            ),
+            '422': errorResponse(
+              'The counts do not account for what came back, a line is missing or named twice, or a SKU is not on this return. `details` names the offending line.',
+              'RETURN_INSPECTION_INCOMPLETE',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/returns/{returnNumber}/complete': {
+        post: {
+          tags: ['Returns'],
+          summary: 'Complete a return: refund and restock (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            '**This is not "set status = completed".** It is where money and stock actually',
+            'move. **Only `inspected` → `completed`.**',
+            '',
+            '### The ordering, and why it is this way round',
+            '',
+            '1. raise a refund for the FROZEN `refundTotal` — never a figure recomputed from',
+            '   today’s catalogue, so a price change after the sale cannot alter what is owed;',
+            '2. **stop unless it succeeded**;',
+            '3. restock the good-to-sell units decided at inspection;',
+            '4. close the return.',
+            '',
+            'All in one transaction. Refund before restock deliberately: if the refund fails we',
+            'have moved nothing, whereas a restock that failed after a successful refund would',
+            'have given money back for goods the system still believes are with the customer.',
+            'The cheaper failure goes first.',
+            '',
+            '### A refund that did not succeed leaves the return open',
+            '',
+            'A **failed** refund is a `422` and the return stays `inspected`, ready to be',
+            'completed again once the cause is fixed.',
+            '',
+            'An **unresolved** refund is also a `422`, and `details.refundStatus` says',
+            '`processing`. That one must be reconciled against the provider and must **not** be',
+            'retried — the money may already have moved. A second attempt is refused with',
+            '`409 REFUND_ALREADY_RAISED`, because a partial unique index holds the return’s',
+            'refund slot until the outstanding attempt succeeds or fails.',
+            '',
+            '### COD completes with a pending manual refund',
+            '',
+            'There is no gateway to confirm and the disbursement happens by a route this backend',
+            'has no visibility of, so blocking on it would mean a COD return could never close.',
+            'The refund row records the obligation, and staff settle it with',
+            '`POST /api/v1/admin/refunds/{refundNumber}/settle` once the money is handed back.',
+            '',
+            '### Restock happens exactly once',
+            '',
+            'The `inspected` → `completed` compare-and-swap is the guarantee: a second',
+            'completion matches no row, throws, and rolls back its own stock movement.',
+            'Reservations are untouched — a returned unit was shipped, so its reservation was',
+            'settled at fulfilment.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'returnNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^RET-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: { staffNote: { type: 'string', maxLength: 500 } },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The completed return, with the refunds raised for it.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['return', 'refunds'],
+                    properties: {
+                      return: { $ref: '#/components/schemas/StaffReturn' },
+                      refunds: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/Refund' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '400': errorResponse('A malformed number or an unknown field.', 'VALIDATION_ERROR'),
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The return is not `inspected`, or a refund is already outstanding for it.',
+              'REFUND_ALREADY_RAISED',
+            ),
+            '422': errorResponse(
+              'The refund did not succeed. `details.refundStatus` is `failed` (retryable) or `processing` (reconcile, do NOT retry). Also returned when the refund would exceed the payment’s remaining refundable balance.',
+              'RETURN_REFUND_NOT_SETTLED',
             ),
           },
         },
@@ -5102,6 +8049,338 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
         },
       },
 
+      '/api/v1/admin/orders': {
+        get: {
+          tags: ['Orders'],
+          summary: 'List the store’s orders (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'A page of **every order in the store**, whosever it is. Requires the `staff` scope.',
+            '',
+            'The browsable operator surface that `GET /admin/orders/{orderNumber}/invoice`',
+            'deliberately declined to invent as a side effect of an invoice request. Its three',
+            'open questions are answered here on their own terms:',
+            '',
+            '| Question | Answer |',
+            '| --- | --- |',
+            '| Filtering | `displayStatus`, `paymentStatus`, `shipmentStatus`, a placed-at range, and `q` |',
+            '| Pagination | the usual `limit`/`offset`; page and total share one predicate |',
+            '| How much of another customer staff may see | an id, an email and a name — **no address** |',
+            '',
+            '### `displayStatus`, and why it is derived',
+            '',
+            'The order lifecycle has two states, `placed` and `cancelled`. Payment lives in the',
+            'payment table and fulfilment in the shipment table, and §43 records why folding them',
+            'together is the shortcut that makes all three impossible to model properly later.',
+            '',
+            'So the dashboard’s single status is **composed on read** from all three and stored',
+            'nowhere — see the `displayStatus` schema for the precedence table, and §49 in',
+            '`docs/DECISIONS.md` for the full argument. Filtering by it happens in the database,',
+            'before the page is cut, so a filtered page is a full page and the total agrees with',
+            'it.',
+            '',
+            '**Two statuses in the dashboard design are not produced**: `ready_to_ship` needs an',
+            'AWB column that does not exist, and `returned` needs a return to reach `completed`,',
+            'which no route currently permits.',
+            '',
+            '### Tenancy',
+            '',
+            'Store-scoped from the verified staff token. There is no `storeId` parameter, so there',
+            'is nothing a client could widen. Ownership within the store is what is relaxed, and',
+            'that is the entire meaning of “admin” here.',
+            '',
+            'Ordered by `placedAt` descending, then `orderNumber` descending, so the ordering is',
+            'total and a page boundary is stable when two orders share an instant.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'limit',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+            },
+            {
+              name: 'offset',
+              in: 'query',
+              required: false,
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'displayStatus',
+              in: 'query',
+              required: false,
+              description: 'The dashboard tab. Applied in the database, not after paging.',
+              schema: ORDER_DISPLAY_STATUS,
+            },
+            {
+              name: 'paymentStatus',
+              in: 'query',
+              required: false,
+              description:
+                'The raw payment status. Orders with no payment row match no value here — use ' +
+                '`displayStatus=pending` for those.',
+              schema: { type: 'string', enum: ['pending', 'succeeded', 'failed', 'expired'] },
+            },
+            {
+              name: 'shipmentStatus',
+              in: 'query',
+              required: false,
+              description: 'The raw shipment status. Orders with no shipment match no value here.',
+              schema: { type: 'string', enum: ['pending', 'shipped', 'delivered'] },
+            },
+            {
+              name: 'placedFrom',
+              in: 'query',
+              required: false,
+              description:
+                'Inclusive lower bound on `placedAt`. A full ISO-8601 instant WITH an offset — ' +
+                'the client owns the timezone, deliberately: a bare date would force the server ' +
+                'to pick one, and every choice is wrong for somebody.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-01T00:00:00+05:30',
+            },
+            {
+              name: 'placedTo',
+              in: 'query',
+              required: false,
+              description:
+                'Inclusive upper bound on `placedAt`, at millisecond granularity. Same format as ' +
+                '`placedFrom`. A bound NAMES A MILLISECOND — the finest instant this API can ' +
+                'express — and includes the whole of it, so an order stored at ' +
+                '`14:20:00.123456Z` and published as `14:20:00.123Z` is returned by ' +
+                '`placedTo=…123Z`: an order’s own timestamp always round-trips as a bound. ' +
+                'The following millisecond is not swept in.',
+              schema: { type: 'string', format: 'date-time' },
+              example: '2026-09-30T23:59:59+05:30',
+            },
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description:
+                'Case-insensitive substring of the **order number or the customer’s email**. ' +
+                'Deliberately not a search across names or addresses — a wider search is a wider ' +
+                'disclosure, and these two are what an operator already has from the customer. ' +
+                '`%` and `_` are escaped, so a typo cannot become a match-everything scan.',
+              schema: { type: 'string', minLength: 1, maxLength: 320 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'A page of the store’s orders, newest first.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['orders', 'pagination'],
+                    properties: {
+                      orders: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/AdminOrderSummary' },
+                      },
+                      pagination: { $ref: '#/components/schemas/Pagination' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope. Scopes are read from the database on every request, so a demotion takes effect immediately.',
+              'PERMISSION_DENIED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}': {
+        get: {
+          tags: ['Orders'],
+          summary: 'Read any order in the store (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The same order document the customer sees, for **any order in the store**, plus the',
+            'four things an operator needs and a customer does not: the composed `displayStatus`,',
+            'who placed it, where its payment stands and where its shipment stands.',
+            '',
+            'Requires the `staff` scope. Store-scoped and not owner-scoped — another customer’s',
+            'order in the same store is NOT a `404` here, which is the point of the route.',
+            '',
+            'The order body is composed from the customer response rather than restated, so the',
+            'money, the tax snapshot, the promotion and the line items cannot drift between the',
+            'two audiences.',
+            '',
+            '### A malformed order number is a `404`, not a `400`',
+            '',
+            'Unusually for this API, and deliberately. This path is one segment under',
+            '`/admin/orders/`, and it shares that shape with `GET /admin/orders/fulfilment`, which',
+            'already exists. A path segment that is not shaped like an order number is therefore',
+            'declined by this route and left to the rest of the application, so the fulfilment',
+            'queue keeps working — measured, not assumed.',
+            '',
+            'The side effect is a better answer anyway: a `400` that distinguished “wrong shape”',
+            'from “no such order” would tell an unauthorized prober which path shapes are real.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+              example: 'ORD-20260904-7QK4M2',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The order, with its customer and its lifecycle states.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['order'],
+                    properties: {
+                      order: { $ref: '#/components/schemas/AdminOrderDetail' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'The caller is authenticated but does not hold the `staff` scope.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such order in this store. An unknown number, another store’s order, and a malformed order number are all deliberately indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}/timeline': {
+        get: {
+          tags: ['Orders'],
+          summary: 'The order status timeline (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The order’s append-only status history, oldest first. Requires the `staff` scope.',
+            '',
+            'A READ over `order_status_history`, which checkout and cancellation have written',
+            'since the order module’s first increment and nothing has read until now. There is',
+            'no second history table and nothing here can write.',
+            '',
+            '`actorType` says what KIND of actor caused each transition. The actor’s user id is',
+            'deliberately absent: naming the colleague is an `audit_log` question, answered at',
+            '`GET /admin/audit-logs` where the access controls for it already live.',
+            '',
+            'Ordered `(createdAt, id)` — the timestamp alone is not a total order, and the id is',
+            'UUIDv7.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The transition history.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['timeline'],
+                    properties: {
+                      timeline: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/OrderTimelineEntry' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s — indistinguishable.', 'NOT_FOUND'),
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}/cancel': {
+        post: {
+          tags: ['Orders'],
+          summary: 'Cancel an order (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Cancels an order on the store’s behalf. Requires the `staff` scope.',
+            '',
+            '### The same rules as a customer cancellation',
+            '',
+            'This calls the SAME service method `POST /users/me/orders/{orderNumber}/cancel`',
+            'does, without an owner predicate — staff act for the tenant rather than for a',
+            'person. Every guard is shared rather than reimplemented:',
+            '',
+            '- a SHIPPED order is refused, checked under the order lock this transaction already',
+            '  holds, so a shipment cannot slip in between the read and the write;',
+            '- a PAID order is refused — reversing money is the refund aggregate’s job, not a',
+            '  side effect of cancelling;',
+            '- a payment still IN PROGRESS is refused;',
+            '- the status move is a compare-and-swap, so two concurrent cancellations resolve to',
+            '  exactly one;',
+            '- held stock is released only AFTER that swap proves this request is the one that',
+            '  cancelled.',
+            '',
+            '**`payment.status` is never written here.** A cancellation that would have needed a',
+            'refund is refused by the paid guard, so there is nothing for this path to reverse.',
+            '',
+            'No `Idempotency-Key`, matching the customer route: a second cancellation is a `409`',
+            'rather than a no-op, because a client that receives success twice cannot tell',
+            'whether it cancelled something or nothing.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64 },
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The cancelled order, in the admin projection.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['order'],
+                    properties: { order: { $ref: '#/components/schemas/AdminOrderDetail' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('No or invalid access token.', 'UNAUTHORIZED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s — indistinguishable.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The order cannot be cancelled: it was already cancelled, has shipped, has been paid for, or has a payment in progress. `details.reason` distinguishes them.',
+              'ORDER_NOT_CANCELLABLE',
+            ),
+          },
+        },
+      },
+
       '/api/v1/users/me/orders': {
         get: {
           tags: ['Orders'],
@@ -5118,7 +8397,9 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'The page and the total share one predicate, so a caller on the last page is never',
             'told the total counted rows it cannot see.',
             '',
-            'There is no staff or admin equivalent in this version.',
+            'The staff equivalent is `GET /admin/orders`, which is store-scoped rather than',
+            'owner-scoped and carries a composed `displayStatus`. This route is unchanged by it —',
+            'no customer response gained a field.',
           ].join('\n'),
           parameters: [
             {
@@ -5428,11 +8709,30 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'duplicate, an event this version has no rule for, an unrecognised reference, an',
             'event conflicting with a terminal state — would turn one stray notification into',
             'an indefinite retry loop that no future delivery can resolve.',
+            '',
+            '### Refund resolution',
+            '',
+            '`refund.processed` and `refund.failed` resolve a refund that was left `processing`',
+            'because the provider never answered the original refund call. `refund.created` and',
+            '`refund.speed_changed` are not outcomes and are acknowledged without change.',
+            '',
+            'The refund is located by `payload.refund.entity.notes.refund_id` — an identifier',
+            'this system generated and sent when raising the refund. Nothing else is used to',
+            'match: no charge id, no amount heuristic. A refund raised before this mechanism',
+            'existed carries no such note and stays manually resolvable.',
+            '',
+            'Only a `processing`, provider-mode refund whose amount matches the stored figure',
+            'exactly may move. A manual (COD) obligation is never settled by a gateway, a',
+            'terminal refund is never re-opened, and a refund row is never created here — this',
+            'path only transitions a row that already exists, so a notification cannot change',
+            'the refundable balance. **`payment.status` is not written on this path**: a refund',
+            'is its own aggregate, and whether the original collection succeeded stays true',
+            'however much money later goes back.',
           ].join('\n'),
           requestBody: {
             required: true,
             description:
-              'Razorpay’s event envelope, delivered as raw bytes. Only `event` and `payload.payment.entity.order_id` are read; everything else is ignored, and no part of the body is persisted.',
+              'Razorpay’s event envelope, delivered as raw bytes. Only `event`, `payload.payment.entity.order_id` and — for refund events — `payload.refund.entity.{id, amount, notes.refund_id}` are read; everything else is ignored, and no part of the body is persisted.',
             content: {
               'application/json': {
                 schema: {
@@ -5442,7 +8742,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                     event: {
                       type: 'string',
                       description:
-                        'Acted on for `payment.captured` and `payment.failed`. Every other event — refunds, settlements, disputes, subscriptions — is out of scope for this version and acknowledged without change.',
+                        'Acted on for `payment.captured`, `payment.failed`, `refund.processed` and `refund.failed`. Every other event — `refund.created`, `refund.speed_changed`, settlements, disputes, subscriptions — is out of scope for this version and acknowledged without change.',
                       example: 'payment.captured',
                     },
                   },
@@ -5453,7 +8753,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
           responses: {
             '200': {
               description:
-                'Received. `applied` means the payment transitioned; `ignored` means it was deliberately not acted on, and `reason` says why (duplicate_event, unsupported_event, unknown_reference, already_terminal, illegal_transition, ambiguous_reference).',
+                'Received. `applied` means a payment or a refund transitioned; `ignored` means it was deliberately not acted on, and `reason` says why (duplicate_event, unsupported_event, unknown_reference, already_terminal, illegal_transition, ambiguous_reference, unsupported_mode, amount_mismatch). A payment transition reports under `payment` and a refund transition under `refund` — never both, and never one in the other’s field.',
               content: {
                 'application/json': {
                   schema: {
@@ -5468,6 +8768,15 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                           status: {
                             type: 'string',
                             enum: ['pending', 'succeeded', 'failed', 'expired'],
+                          },
+                        },
+                      },
+                      refund: {
+                        type: 'object',
+                        properties: {
+                          status: {
+                            type: 'string',
+                            enum: ['pending', 'processing', 'succeeded', 'failed'],
                           },
                         },
                       },
@@ -5893,8 +9202,16 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'page, so it never includes another store or a deleted product.',
             '',
             'Unknown query parameters are rejected rather than ignored — `?limitt=50` is a `400`,',
-            'not a silently defaulted page. There is deliberately no search, filter, sort, or',
-            'status parameter yet.',
+            'not a silently defaulted page.',
+            '',
+            '`q` matches the product **name or slug**, case-insensitively, anywhere in the value.',
+            '`%` and `_` are matched literally rather than as wildcards, so a merchant searching',
+            'for `50%` finds that product rather than everything.',
+            '',
+            '`counts` reports how many products sit in each lifecycle status — the tab badges.',
+            'It answers for the **whole store**, so it is unchanged by `limit`, `offset`, `q` and',
+            '`status`: a count that moved when you filtered could not tell you what the other tab',
+            'holds. Every status is present, zero-filled, so a tab does not vanish when it empties.',
           ].join('\n'),
           parameters: [
             {
@@ -5918,21 +9235,59 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               schema: { type: 'integer', minimum: 0, default: 0 },
               example: 0,
             },
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description:
+                'Case-insensitive substring of the product name or slug. Trimmed; a whitespace-only value is a 400 rather than an unfiltered page.',
+              schema: { type: 'string', minLength: 1, maxLength: 100 },
+              example: 'shirt',
+            },
+            {
+              name: 'status',
+              in: 'query',
+              required: false,
+              description:
+                'Narrows the page to one lifecycle status. Does not affect `counts`. An unrecognised value is a 400, not an empty page.',
+              schema: { type: 'string', enum: ['draft', 'active', 'archived'] },
+              example: 'active',
+            },
+            {
+              name: 'stockState',
+              in: 'query',
+              required: false,
+              description: [
+                "Narrows the page by aggregate stock across the product's live SKUs.",
+                '',
+                '`out_of_stock` means NO live SKU has stock — a product with one sold-out variant',
+                'and one in stock is `in_stock`, and a product with no SKUs at all is',
+                '`out_of_stock`. `in_stock` and `low_stock` deliberately OVERLAP: a low SKU is',
+                'still sellable.',
+                '',
+                '`low_stock` uses the SKU’s configured reorder point. A SKU with no configured',
+                'threshold is never low — the merchant has not said what low means for it.',
+                '',
+                'Does not affect `counts`, which remain store-wide.',
+              ].join('\n'),
+              schema: { type: 'string', enum: ['in_stock', 'low_stock', 'out_of_stock'] },
+            },
           ],
           responses: {
             '200': {
-              description: 'A page of products, newest first.',
+              description: 'A page of products, newest first, with the store-wide tab counts.',
               content: {
                 'application/json': {
                   schema: {
                     type: 'object',
-                    required: ['products', 'pagination'],
+                    required: ['products', 'pagination', 'counts'],
                     properties: {
                       products: {
                         type: 'array',
                         items: { $ref: '#/components/schemas/Product' },
                       },
                       pagination: { $ref: '#/components/schemas/Pagination' },
+                      counts: { $ref: '#/components/schemas/ProductCounts' },
                     },
                   },
                 },
@@ -6064,6 +9419,14 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'SKUs and **case-sensitive**: unlike a slug, `ABC-1` and `abc-1` are different codes.',
             'Deleting a SKU frees its code for reuse.',
             '',
+            '**`code` is optional.** Omit it and the server generates one from the product slug —',
+            '`BLUE-SHIRT-K7M2QP`. The suffix is drawn with a CSPRNG from an alphabet that excludes',
+            '`I`, `O`, `0` and `1`, so a code read off a shelf label cannot be mistyped into a',
+            'different SKU. A generated collision is redrawn against the unique constraint rather',
+            'than checked beforehand, so two concurrent creates cannot both pass a check and then',
+            'race; a **supplied** code that collides is still a `409`, because quietly storing',
+            'something other than what the merchant sent would be worse than refusing.',
+            '',
             'Unknown body fields are rejected rather than ignored, including `storeId`,',
             '`productId`, `id`, and any tax field — tax classification is a later increment.',
           ].join('\n'),
@@ -6074,7 +9437,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'application/json': {
                 schema: {
                   type: 'object',
-                  required: ['code', 'price'],
+                  required: ['price'],
                   additionalProperties: false,
                   properties: {
                     code: {
@@ -6082,7 +9445,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                       minLength: 1,
                       maxLength: 64,
                       description:
-                        'The merchant SKU code. Case-sensitive, unique per store among non-deleted SKUs. Letters, digits, dots, underscores, slashes and hyphens; must start with a letter or digit.',
+                        'The merchant SKU code. Case-sensitive, unique per store among non-deleted SKUs. Letters, digits, dots, underscores, slashes and hyphens; must start with a letter or digit. **Omit it to have one generated from the product slug.**',
                       example: 'SHIRT-BLUE-M',
                     },
                     price: {
@@ -6103,6 +9466,14 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                       default: true,
                       description:
                         'Whether the SKU is sellable. Defaults to true — the product’s own status already governs whether customers see it, so a second activation step would serve no purpose.',
+                    },
+                    lowStockThreshold: {
+                      type: 'integer',
+                      minimum: 0,
+                      maximum: 1000000,
+                      description:
+                        'Optional reorder point. **Absent stores `null` — no threshold — never `0`.** A SKU with no threshold is never reported as low; `0` is a configured value meaning "warn me only when this is gone". Use `PATCH /admin/skus/{code}` with an explicit `null` to clear one later.',
+                      example: 5,
                     },
                   },
                 },
@@ -6127,7 +9498,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'NOT_FOUND',
             ),
             '409': errorResponse(
-              'A live SKU already uses this code in this store. The code is not echoed back.',
+              'A live SKU already uses the code you supplied in this store. The code is not echoed back. A GENERATED code never produces this — a collision is redrawn.',
               'SKU_CODE_TAKEN',
             ),
             '401': errorResponse(
@@ -6200,7 +9571,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
           summary: 'Update a SKU',
           security: [{ bearerAuth: [] }],
           description: [
-            'Updates a SKU’s `name`, `price`, or `isActive`. **Requires the `staff` scope.**',
+            'Updates a SKU’s `name`, `price`, `isActive`, or `lowStockThreshold`. **Requires the `staff` scope.**',
             '',
             'Addressed by `code` alone rather than nested under its product: the code is unique',
             'per store, so the product adds nothing to the lookup. The lookup is always',
@@ -6242,6 +9613,12 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                     isActive: {
                       type: 'boolean',
                       description: 'Whether the SKU is sellable. Both directions are legal.',
+                    },
+                    lowStockThreshold: {
+                      description:
+                        'The reorder point. **Nullable here, unlike on creation:** omitting the key leaves the configured threshold alone, while an explicit `null` clears it back to no-threshold. Without the null arm a threshold could be set but never removed.',
+                      oneOf: [{ type: 'integer', minimum: 0, maximum: 1000000 }, { type: 'null' }],
+                      example: 5,
                     },
                   },
                 },
@@ -6905,13 +10282,38 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'sellable", not "not stocked", and a merchant managing stock needs to see everything',
             'they hold. That is also why an inactive SKU can still be adjusted.',
             '',
-            'There is no `storeId` parameter and no filter: the store comes from request',
-            'resolution, and an unknown query parameter is a `400` rather than being silently',
-            'ignored and returning a default page.',
+            'There is no `storeId` parameter: the store comes from request resolution, and an',
+            'unknown query parameter is a `400` rather than being silently ignored and returning',
+            'a default page.',
             '',
             '`total` counts rows under the identical visibility rules as the page.',
           ].join('\n'),
           parameters: [
+            {
+              name: 'q',
+              in: 'query',
+              required: false,
+              description:
+                'Case-insensitive substring over the SKU code and the SKU name — the two things on a shelf label. `%` and `_` are literal characters, not wildcards. The product name is deliberately not searched: this list is keyed by SKU, and matching a product would return every variant for a term on none of them.',
+              schema: { type: 'string', minLength: 1, maxLength: 200 },
+            },
+            {
+              name: 'stockState',
+              in: 'query',
+              required: false,
+              description: [
+                'Narrows the page by stock state, using this module’s own definitions so the',
+                'list cannot disagree with the summary counts beside it:',
+                '',
+                '- `out_of_stock` — `available <= 0`',
+                '- `low_stock` — still sellable and at or below the SKU’s CONFIGURED reorder',
+                '  point. A SKU with no configured threshold is never low.',
+                '- `in_stock` — `available > 0`, which deliberately includes low SKUs.',
+                '',
+                '`available` is a generated column (`on_hand - reserved`); nothing is recomputed.',
+              ].join('\n'),
+              schema: { type: 'string', enum: ['in_stock', 'low_stock', 'out_of_stock'] },
+            },
             {
               name: 'limit',
               in: 'query',
@@ -7541,6 +10943,638 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
           responses: {
             '200': PRODUCT_LIFECYCLE_RESPONSE('The product is now `archived`.'),
             ...PRODUCT_LIFECYCLE_ERRORS,
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/products/bulk': {
+        post: {
+          tags: ['Catalogue'],
+          summary: 'Apply a lifecycle action to many products',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Publishes, archives or deletes several products in one request. **Requires the',
+            '`staff` scope.**',
+            '',
+            '**All or nothing.** The whole batch commits in one transaction, and there is no',
+            'partial-success shape: an unknown slug is a `404` and an illegal transition a `409`,',
+            'in both cases with **nothing applied**. An operator who selected twelve products and',
+            'got a 200 knows all twelve moved; a partial result would leave them reconciling by',
+            'hand, which is exactly what the bulk action exists to avoid.',
+            '',
+            'The failures name the offending slugs in `details`, so the screen can highlight them',
+            'rather than making the operator find them.',
+            '',
+            'The actions are exactly the three the single-product routes expose, enforced by the',
+            'same transition table. A bulk action able to do something no individual action can',
+            'would be a second, less-guarded lifecycle.',
+            '',
+            'Duplicate slugs are collapsed rather than rejected — a slug named twice is one',
+            'product. `affected` therefore counts DISTINCT products, and `slugs` is sorted, so',
+            'two identical requests produce identical responses.',
+            '',
+            '`delete` is the same soft delete as `DELETE /api/v1/admin/products/{slug}`: the row',
+            'is retained so historical orders still resolve, and the slug is freed for reuse.',
+          ].join('\n'),
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['action', 'slugs'],
+                  additionalProperties: false,
+                  properties: {
+                    action: {
+                      type: 'string',
+                      enum: ['publish', 'archive', 'delete'],
+                      description:
+                        'The lifecycle verb to apply to every named product. An unrecognised value is a 400.',
+                      example: 'publish',
+                    },
+                    slugs: {
+                      type: 'array',
+                      minItems: 1,
+                      maxItems: PRODUCT_LIST_MAX_LIMIT_DOC,
+                      items: { type: 'string', maxLength: 255, pattern: SLUG_PATTERN },
+                      description:
+                        'The products to act on. Non-empty — an empty selection is a client bug, not a no-op worth a 200. Bounded, because the whole batch commits in one transaction.',
+                      example: ['blue-cotton-shirt', 'red-wool-scarf'],
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Every named product moved.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['action', 'affected', 'slugs'],
+                    properties: {
+                      action: { type: 'string', enum: ['publish', 'archive', 'delete'] },
+                      affected: {
+                        type: 'integer',
+                        minimum: 1,
+                        description:
+                          'DISTINCT products changed, after duplicate slugs are collapsed.',
+                        example: 2,
+                      },
+                      slugs: {
+                        type: 'array',
+                        items: { type: 'string' },
+                        description: 'The products changed, sorted.',
+                        example: ['blue-cotton-shirt', 'red-wool-scarf'],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'Authenticated, but the account does not hold the `staff` scope. `details.missing` names the required scopes.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'At least one slug does not name a live product in this store. `details.slugs` lists every one that did not resolve, and NOTHING was applied.',
+              'NOT_FOUND',
+            ),
+            '409': errorResponse(
+              'At least one product cannot make this transition from its current status. `details.slugs` lists every offender, and NOTHING was applied.',
+              'PRODUCT_STATUS_CONFLICT',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/products/{slug}/media': {
+        post: {
+          tags: ['Catalogue'],
+          summary: 'Register an uploaded image against a product',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Records an image that is **already in object storage**. **Requires the `staff`',
+            'scope.**',
+            '',
+            '**No binary ever travels through this API.** The bytes go straight from the browser',
+            'to storage; this call stores the key and the metadata needed to render the image.',
+            'Ask `POST /api/v1/admin/products/{slug}/media/upload-target` where to send them.',
+            '',
+            'The first image registered against a product becomes its primary automatically —',
+            'a product with images and no primary would have nothing to show on the list screen.',
+            'Later images append to the end of the gallery rather than jumping to the front.',
+            '',
+            '`skuCode` attaches the image to one variant. A code belonging to a DIFFERENT product',
+            'is a `404`, indistinguishable from one that does not exist: it is not this product’s',
+            'variant whatever else is true of it.',
+            '',
+            '`width` and `height` are a pair — both or neither. Half a measurement cannot lay',
+            'anything out and is worse than none, because it looks usable.',
+          ].join('\n'),
+          parameters: [PRODUCT_SLUG_PARAMETER],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['storageKey', 'contentType'],
+                  additionalProperties: false,
+                  properties: {
+                    storageKey: {
+                      type: 'string',
+                      minLength: 1,
+                      maxLength: 512,
+                      description:
+                        'The object key the bytes were uploaded under. Must start with a letter or digit and contain only letters, digits, dots, underscores, slashes and hyphens; a parent-directory segment is rejected.',
+                      example: 'stores/s1/products/p1/front.webp',
+                    },
+                    contentType: {
+                      type: 'string',
+                      enum: MEDIA_CONTENT_TYPES_DOC,
+                      description:
+                        'A closed list rather than any `image/*`: an SVG is a script container and a TIFF will not display, so accepting either would let a merchant upload an image that silently never appears.',
+                      example: 'image/webp',
+                    },
+                    skuCode: {
+                      type: 'string',
+                      minLength: 1,
+                      maxLength: 64,
+                      description: 'The variant this image is of. Omit for the product generally.',
+                      example: 'SHIRT-BLUE-M',
+                    },
+                    altText: { type: 'string', maxLength: 300, example: 'Blue shirt, front view' },
+                    width: { type: 'integer', minimum: 1, maximum: 20000, example: 1200 },
+                    height: { type: 'integer', minimum: 1, maximum: 20000, example: 1600 },
+                    byteSize: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: MEDIA_MAX_BYTES_DOC,
+                      example: 184320,
+                    },
+                    position: {
+                      type: 'integer',
+                      minimum: 0,
+                      maximum: 1000,
+                      description: 'Omit to append to the end of the gallery.',
+                      example: 0,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The image is registered.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['media'],
+                    properties: { media: { $ref: '#/components/schemas/ProductMedia' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'Authenticated, but the account does not hold the `staff` scope. `details.missing` names the required scopes.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such product in this store, it has been deleted, or `skuCode` does not name one of ITS variants.',
+              'NOT_FOUND',
+            ),
+            '409': errorResponse(
+              'This storage key is already registered in this store. Registering it twice would give one object two rows that could then disagree.',
+              'MEDIA_ALREADY_REGISTERED',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+
+        get: {
+          tags: ['Catalogue'],
+          summary: 'List a product’s images',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The product’s gallery, in the merchant’s order. **Requires the `staff` scope.**',
+            '',
+            '**Unpaginated**, deliberately: a gallery is a handful of images, bounded by what a',
+            'merchant will upload for one listing. Paginating it would add a contract for no',
+            'benefit and make the ordering harder to reason about.',
+            '',
+            'Ordered by `position` ascending, then by creation time, so the order is stable',
+            'across requests rather than reflecting insertion order alone.',
+            '',
+            'An empty array is a product with no images; an unknown product is a `404`. Those are',
+            'different facts and are reported differently.',
+          ].join('\n'),
+          parameters: [PRODUCT_SLUG_PARAMETER],
+          responses: {
+            '200': {
+              description: 'The gallery, in merchant order.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['media'],
+                    properties: {
+                      media: {
+                        type: 'array',
+                        items: { $ref: '#/components/schemas/ProductMedia' },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'Authenticated, but the account does not hold the `staff` scope. `details.missing` names the required scopes.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such product in this store, or it has been deleted.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/products/{slug}/media/upload-target': {
+        post: {
+          tags: ['Catalogue'],
+          summary: 'Ask where to upload an image',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Returns a pre-signed target to `PUT` the bytes to. **Requires the `staff` scope.**',
+            '',
+            'This is how a multi-megabyte image reaches storage without passing through this API,',
+            'and why nothing here accepts a file upload. Once the `PUT` succeeds, send the',
+            'returned `storageKey` to `POST /api/v1/admin/products/{slug}/media`.',
+            '',
+            '**A `503` here is the honest answer, not an outage.** This deployment has no object',
+            'storage configured, so nothing can sign a `PUT`. Everything around the upload —',
+            'registration, the gallery, ordering, the primary flag, deletion — works regardless;',
+            'only this one call needs external S3-compatible credentials.',
+          ].join('\n'),
+          parameters: [PRODUCT_SLUG_PARAMETER],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['contentType', 'byteSize'],
+                  additionalProperties: false,
+                  properties: {
+                    contentType: {
+                      type: 'string',
+                      enum: MEDIA_CONTENT_TYPES_DOC,
+                      example: 'image/webp',
+                    },
+                    byteSize: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: MEDIA_MAX_BYTES_DOC,
+                      description:
+                        'Declared up front so an oversized object is refused before it is uploaded rather than after.',
+                      example: 184320,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'Where to PUT the bytes.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['upload'],
+                    properties: {
+                      upload: { $ref: '#/components/schemas/MediaUploadTarget' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'Authenticated, but the account does not hold the `staff` scope. `details.missing` names the required scopes.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such product in this store, or it has been deleted.',
+              'NOT_FOUND',
+            ),
+            /*
+             * Spread FIRST here, uniquely: this route overrides the shared 503. The common one
+             * describes an unresolvable store, which is also reachable here; this one names the
+             * far likelier cause on this particular route, so the more specific text wins.
+             */
+            ...COMMON_ERRORS,
+            '503': errorResponse(
+              'Either this deployment has no object storage configured, so no upload can be signed — every other media route still works — or the store could not be resolved. An operational fault, not a client error.',
+              'DEPENDENCY_UNAVAILABLE',
+            ),
+          },
+        },
+      },
+
+      '/api/v1/admin/media/{id}': {
+        patch: {
+          tags: ['Catalogue'],
+          summary: 'Edit an image’s alt text, position or primary flag',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Edits the three things about an image a merchant changes. **Requires the `staff`',
+            'scope.**',
+            '',
+            'Addressed by media id rather than nested under the product, matching',
+            '`PATCH /api/v1/admin/options/{id}`: the id identifies the row within a store, and',
+            'requiring the product too would let a caller pass a mismatched pair whose behaviour',
+            'would then need defining.',
+            '',
+            'Promoting a primary demotes the previous one **in the same transaction**, so the',
+            'product is never left with two primaries or with none.',
+            '',
+            '`storageKey`, `productId` and `skuCode` are absent and therefore unreachable rather',
+            'than ignored: repointing an image at a different object or a different product is a',
+            'delete plus a create, not an edit, and allowing it here would let one row’s history',
+            'describe two different images.',
+            '',
+            'An empty body is a `400`, not a 200 — it would bump `updatedAt` and leave a caller',
+            'believing something changed.',
+          ].join('\n'),
+          parameters: [MEDIA_ID_PARAMETER],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  minProperties: 1,
+                  additionalProperties: false,
+                  description: 'Every field optional, but at least one required.',
+                  properties: {
+                    altText: { type: 'string', maxLength: 300, example: 'Blue shirt, back view' },
+                    position: { type: 'integer', minimum: 0, maximum: 1000, example: 2 },
+                    isPrimary: {
+                      type: 'boolean',
+                      description:
+                        'Setting this true demotes whichever image was primary. Setting it false leaves the product with NO primary rather than promoting a successor — which image represents a product is a merchandising decision.',
+                      example: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '200': {
+              description: 'The updated image.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['media'],
+                    properties: { media: { $ref: '#/components/schemas/ProductMedia' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'Authenticated, but the account does not hold the `staff` scope. `details.missing` names the required scopes.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such image, it has been deleted, or it belongs to another store. All three are indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+
+        delete: {
+          tags: ['Catalogue'],
+          summary: 'Remove an image',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Removes an image from the product. **Requires the `staff` scope.**',
+            '',
+            'Soft-deleted, so the row survives as a record that the storage object should be',
+            'reclaimed — a hard delete would lose the only pointer to an object still costing',
+            'money in the bucket. The storage key is freed for re-registration.',
+            '',
+            'Removing the primary leaves the product with **no** primary rather than promoting a',
+            'successor, for the reason given under `PATCH`.',
+            '',
+            'A repeated delete is a `404` rather than a silent success that the next read would',
+            'contradict.',
+          ].join('\n'),
+          parameters: [MEDIA_ID_PARAMETER],
+          responses: {
+            '204': { description: 'The image is removed. No body.' },
+            '401': errorResponse(
+              'No access token was supplied, or the token is invalid, expired, issued for a different store, or the account has been deactivated or deleted.',
+              'AUTHENTICATION_REQUIRED',
+            ),
+            '403': errorResponse(
+              'Authenticated, but the account does not hold the `staff` scope. `details.missing` names the required scopes.',
+              'PERMISSION_DENIED',
+            ),
+            '404': errorResponse(
+              'No such image, it has already been deleted, or it belongs to another store. All three are indistinguishable.',
+              'NOT_FOUND',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/orders/{orderNumber}/refund': {
+        post: {
+          tags: ['Payments'],
+          summary: 'Refund an order’s payment (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'Moves money back against the payment behind the named order.',
+            '',
+            '### Not a generic "refund any payment" endpoint',
+            '',
+            'The refund is bound to the payment behind THIS order — `uq_payment_order` makes the',
+            'two equivalent — its amount is checked against that payment’s remaining refundable',
+            'balance under a row lock, and the currency is copied from the payment rather than',
+            'accepted from the caller. A refund that could name its own currency would be a',
+            'refund that could claim ₹100 against a $100 charge.',
+            '',
+            'Addressed by order number because that is the identifier staff already have in front',
+            'of them, and because the payment’s internal UUID is published nowhere in this API.',
+            '',
+            '### Partial refunds, and the cumulative cap',
+            '',
+            'Send less than the remaining balance. There is no `partial` flag, because the',
+            'amount already says everything a flag would. **Σ(claimed refunds) can never exceed',
+            'the captured amount**, and an attempt still in flight holds its share of the balance',
+            'so nobody refunds around an unresolved provider call.',
+            '',
+            '`refundBalance.claimed` and `refundBalance.refunded` differ exactly in that window.',
+            '',
+            '### Provider outcomes',
+            '',
+            'A **4xx** from the gateway is evidence of refusal, so the refund is `failed` and its',
+            'amount is released for a retry. A **5xx**, a timeout or an unparseable response is',
+            'not evidence of anything: the refund is `processing`, it keeps consuming balance,',
+            'and it must be reconciled rather than retried.',
+            '',
+            '### COD and uncaptured charges are manual',
+            '',
+            'A COD payment, or an online one whose provider charge id was never captured, yields',
+            'a `manual` refund: a recorded obligation, settled offline and marked with',
+            '`POST /api/v1/admin/refunds/{refundNumber}/settle`. No gateway is called and none is',
+            'faked. A COD payment is refundable only once the order has been DELIVERED, which is',
+            'when the cash actually changed hands.',
+            '',
+            '### Idempotency-Key is required',
+            '',
+            'A client that never sees the response cannot know whether money moved, and its only',
+            'sane move is to retry — which without a key would refund twice.',
+            '',
+            '**The payment’s own status is never changed.** A refund is its own aggregate;',
+            '`payment.status` continues to mean "did the original collection succeed".',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'orderNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: '^ORD-\\d{8}-[A-Z2-9]{6}$' },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['amount'],
+                  additionalProperties: false,
+                  properties: {
+                    amount: {
+                      type: 'string',
+                      pattern: PRICE_PATTERN,
+                      description:
+                        'Decimal amount as a string, in the payment’s currency. At most 4 decimal places. Never a JSON number — a double cannot represent 19.99 exactly, and this is the last place to accept that.',
+                      example: '499.0000',
+                    },
+                    reason: { type: 'string', maxLength: 500, example: 'Damaged on arrival' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'The refund attempt and the payment’s new refund position.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['refund', 'refundBalance'],
+                    properties: {
+                      refund: { $ref: '#/components/schemas/Refund' },
+                      refundBalance: { $ref: '#/components/schemas/RefundBalance' },
+                    },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('No such order in this store, or it has no payment.', 'NOT_FOUND'),
+            '422': errorResponse(
+              'The payment never succeeded, the amount is not positive, or it exceeds the remaining refundable balance — `details.remaining` says what is left.',
+              'REFUND_EXCEEDS_BALANCE',
+            ),
+            ...COMMON_ERRORS,
+          },
+        },
+      },
+
+      '/api/v1/admin/refunds/{refundNumber}/settle': {
+        post: {
+          tags: ['Payments'],
+          summary: 'Record that a manual refund was paid out (staff)',
+          security: [{ bearerAuth: [] }],
+          description: [
+            'The minimum this backend can honestly say about money it did not move: a named',
+            'staff member asserts the offline disbursement happened, and the assertion is',
+            'attributed and timestamped.',
+            '',
+            '**No bank, UPI or payout integration is implied — there is none in this system.**',
+            'This records a fact about the world; it does not transfer anything.',
+            '',
+            'A `provider` refund is a `409`. Its outcome is the gateway’s to report, and letting',
+            'staff declare one succeeded would make the `processing` state — the entire point of',
+            'the three-way provider outcome — pointless.',
+          ].join('\n'),
+          parameters: [
+            {
+              name: 'refundNumber',
+              in: 'path',
+              required: true,
+              schema: { type: 'string', maxLength: 64, pattern: REFUND_NUMBER_PATTERN },
+              example: 'RFD-20260917-K7M2QP',
+            },
+          ],
+          responses: {
+            '200': {
+              description: 'The settled refund.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['refund'],
+                    properties: { refund: { $ref: '#/components/schemas/Refund' } },
+                  },
+                },
+              },
+            },
+            '401': errorResponse('No or invalid access token.', 'AUTHENTICATION_REQUIRED'),
+            '403': errorResponse('The caller is not staff.', 'PERMISSION_DENIED'),
+            '404': errorResponse('Unknown, or another store’s.', 'NOT_FOUND'),
+            '409': errorResponse(
+              'The refund is a provider refund, or it is not `pending`.',
+              'REFUND_NOT_SETTLEABLE',
+            ),
             ...COMMON_ERRORS,
           },
         },

@@ -115,12 +115,14 @@ export function createPromotionsRoutes(deps: {
     requireStaff,
     validate({ query: ListPromotionsQuerySchema }),
     asyncHandler(async (req, res) => {
-      const { limit, offset } = validatedQuery<ListPromotionsQuery>(req);
+      const query = validatedQuery<ListPromotionsQuery>(req);
 
       const page = await promotions.listPromotions({
         storeId: requireStore(req).id,
-        limit,
-        offset,
+        ...(query.q === undefined ? {} : { q: query.q }),
+        ...(query.status === undefined ? {} : { status: query.status }),
+        limit: query.limit,
+        offset: query.offset,
       });
 
       res.status(200).json(toPromotionListResponse(page));

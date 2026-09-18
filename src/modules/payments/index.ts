@@ -47,3 +47,30 @@ export {
   type PaymentExpirySweeper,
   type SweepResult,
 } from './payments.sweeper.js';
+
+/* ── Refunds. Increment 59. ────────────────────────────────────────────── */
+
+export {
+  createRefundsRepository,
+  REFUND_MODES,
+  REFUND_STATUSES,
+  BALANCE_CONSUMING_REFUND_STATUSES,
+  type RefundMode,
+  type RefundRecord,
+  type RefundsRepository,
+  type RefundStatus,
+} from './refunds.repository.js';
+
+export {
+  createRefundsService,
+  generateRefundNumber,
+  PaymentNotRefundable,
+  RefundAlreadyRaised,
+  RefundExceedsBalance,
+  RefundNotSettleable,
+  type RefundBalanceView,
+  type RefundExecutor,
+  type RefundsService,
+} from './refunds.service.js';
+
+export { REFUND_AUDIT, REFUND_RESOURCE, type RefundAuditAction } from './refunds.events.js';

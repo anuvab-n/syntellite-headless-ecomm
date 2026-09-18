@@ -8,7 +8,11 @@ import type { Logger } from '../../shared/logger.js';
 import {
   CreateReturnRequestSchema,
   StaffListReturnsQuerySchema,
+  InspectReturnRequestSchema,
   StaffReturnDecisionSchema,
+  toReturnRefundResponse,
+  toStaffReturnDetailResponse,
+  toStaffReturnListItemResponse,
   toStaffReturnResponse,
   ListReturnsQuerySchema,
   ReturnNumberParamsSchema,
@@ -17,6 +21,7 @@ import {
   type ListReturnsQuery,
   type ReturnNumberParams,
   type StaffListReturnsQuery,
+  type InspectReturnRequest,
   type StaffReturnDecisionRequest,
 } from './dto.js';
 import type { ReturnsService } from './returns.service.js';
@@ -213,22 +218,53 @@ export function createReturnsRoutes(deps: {
    * theirs to see. The store comes from the verified token, so one tenant’s staff can never
    * reach another’s returns.
    */
+  /**
+   * `GET /admin/returns/summary` — return counts by status for the store. Increment 53.
+   *
+   * Queue depth, not a report: no money, no period, no filters. Every status in the vocabulary
+   * appears, including the ones at zero, so the response shape does not change with the data.
+   *
+   * Registered BEFORE `/admin/returns/{returnNumber}` below, so the literal is matched before
+   * the parameter is ever considered — the same ordering rule the orders module documents.
+   *
+   * Store-scoped from the verified staff token; no query object at all, so there is nothing for
+   * a client to supply. `401` unauthenticated, `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/returns/summary',
+    auth,
+    requireStaff,
+    asyncHandler(async (req, res) => {
+      const byStatus = await returns.summaryForStore({ storeId: scope(req).storeId });
+      res.status(200).json({ returns: { byStatus } });
+    }),
+  );
+
   router.get(
     '/admin/returns',
     auth,
     requireStaff,
     validate({ query: StaffListReturnsQuerySchema }),
     asyncHandler(async (req, res) => {
-      const { status, limit, offset } = validatedQuery<StaffListReturnsQuery>(req);
+      const query = validatedQuery<StaffListReturnsQuery>(req);
       const page = await returns.listStoreReturns({
         storeId: staffStore(req),
-        ...(status === undefined ? {} : { status }),
-        limit,
-        offset,
+        ...(query.status === undefined ? {} : { status: query.status }),
+        ...(query.q === undefined ? {} : { q: query.q }),
+        /*
+         * Validated as an ISO string, widened to an instant HERE — the same place the orders
+         * list does it, so the service and repository only ever see a `Date`.
+         */
+        ...(query.requestedFrom === undefined
+          ? {}
+          : { requestedFrom: new Date(query.requestedFrom) }),
+        ...(query.requestedTo === undefined ? {} : { requestedTo: new Date(query.requestedTo) }),
+        limit: query.limit,
+        offset: query.offset,
       });
 
       res.status(200).json({
-        returns: page.items.map(toStaffReturnResponse),
+        returns: page.items.map(toStaffReturnListItemResponse),
         total: page.total,
         limit: page.limit,
         offset: page.offset,
@@ -248,12 +284,12 @@ export function createReturnsRoutes(deps: {
     requireStaff,
     validate({ params: ReturnNumberParamsSchema }),
     asyncHandler(async (req, res) => {
-      const view = await returns.getStoreReturn({
+      const view = await returns.getStoreReturnDetail({
         storeId: staffStore(req),
         returnNumber: returnNumberOf(req),
       });
 
-      res.status(200).json({ return: toStaffReturnResponse(view) });
+      res.status(200).json({ return: toStaffReturnDetailResponse(view) });
     }),
   );
 
@@ -315,6 +351,135 @@ export function createReturnsRoutes(deps: {
       });
 
       res.status(200).json({ return: toStaffReturnResponse(view) });
+    }),
+  );
+
+  /**
+   * `POST /admin/returns/{returnNumber}/receive`
+   *
+   * 200 with the received return. **Only `approved -> received`**; every other state is a
+   * `409` naming both ends of the refused move.
+   *
+   * The parcel is at the warehouse. Nothing about money or stock happens here — the units are
+   * present but not yet judged, and restocking unexamined goods would put them back on sale
+   * before anyone had looked at them. That judgement is the next endpoint.
+   *
+   * No `Idempotency-Key`, matching approve and reject: the status predicate on the update IS
+   * the idempotency, so a second receipt matches no row and answers `409` — the honest result,
+   * since a client that received `200` twice could not tell whether it moved anything.
+   */
+  router.post(
+    '/admin/returns/:returnNumber/receive',
+    auth,
+    requireStaff,
+    validate({ params: ReturnNumberParamsSchema, body: StaffReturnDecisionSchema }),
+    asyncHandler(async (req, res) => {
+      const body = validatedBody<StaffReturnDecisionRequest>(req);
+      const view = await returns.receiveReturn({
+        storeId: staffStore(req),
+        returnNumber: returnNumberOf(req),
+        actor: staffActor(req),
+        ...(body.staffNote === undefined ? {} : { staffNote: body.staffNote }),
+      });
+
+      res.status(200).json({ return: toStaffReturnResponse(view) });
+    }),
+  );
+
+  /**
+   * `POST /admin/returns/{returnNumber}/inspect`
+   *
+   * 200 with the inspected return. **Only `received -> inspected`.**
+   *
+   * The body carries the good-to-sell / written-off split for **every** line, as counts. Neither
+   * count changes what the customer is owed — a smashed jar is still a jar they sent back, and
+   * the frozen refund snapshot taken at creation is never touched here. What they decide is how
+   * many units go back into sellable stock at completion.
+   *
+   * Every line must be present and each line's two counts must sum exactly to the quantity that
+   * came back. A partial inspection is a `422` rather than a defaulted zero, because completion
+   * would otherwise restock a number nobody decided.
+   *
+   * **There is no rejection from here.** `received -> rejected` is the refusal edge, taken
+   * INSTEAD of this one; reaching `inspected` already means accepted, which is what makes
+   * `inspected -> completed` unconditional.
+   *
+   * Failure modes: `400` for an unknown field, a malformed SKU code or a negative count; `404`
+   * for an unknown return or another store's; `409` from any state but `received`; `422` when
+   * the counts do not account for what came back or a line is missing or named twice.
+   */
+  router.post(
+    '/admin/returns/:returnNumber/inspect',
+    auth,
+    requireStaff,
+    validate({ params: ReturnNumberParamsSchema, body: InspectReturnRequestSchema }),
+    asyncHandler(async (req, res) => {
+      const body = validatedBody<InspectReturnRequest>(req);
+      const view = await returns.inspectReturn({
+        storeId: staffStore(req),
+        returnNumber: returnNumberOf(req),
+        actor: staffActor(req),
+        lines: body.lines,
+        ...(body.staffNote === undefined ? {} : { staffNote: body.staffNote }),
+      });
+
+      res.status(200).json({ return: toStaffReturnResponse(view) });
+    }),
+  );
+
+  /**
+   * `POST /admin/returns/{returnNumber}/complete`
+   *
+   * 200 with the completed return and the refund it raised. **Only `inspected -> completed`.**
+   *
+   * **This is not "set status = completed".** It is where money and stock actually move, in
+   * this order:
+   *
+   *   1. raise a refund for the FROZEN `refundTotal` — never a figure recomputed from today's
+   *      catalogue;
+   *   2. stop unless it succeeded;
+   *   3. restock the good-to-sell units decided at inspection;
+   *   4. close the return.
+   *
+   * All in one transaction, so a failure at any step leaves the return exactly where it was.
+   *
+   * **A failed refund is a `422`, not a completion.** The return stays in `inspected` and may
+   * be completed again once the cause is fixed. An UNRESOLVED refund is also a `422`, and
+   * `details.refundStatus` says `processing` — that one must be reconciled against the provider
+   * and must **not** be retried, because the money may already have moved.
+   *
+   * **COD completes with a `pending` manual refund.** There is no gateway to confirm, and the
+   * disbursement happens by a route this backend has no visibility of; blocking on it would mean
+   * a COD return could never close. The refund row records the obligation and staff settle it
+   * with `POST /admin/refunds/{refundNumber}/settle` once the money is actually handed back.
+   *
+   * No `Idempotency-Key`: the `inspected -> completed` compare-and-swap is the idempotency, and
+   * it is also what guarantees the restock happens exactly once — a second completion matches no
+   * row, throws, and rolls back its own stock movement.
+   */
+  router.post(
+    '/admin/returns/:returnNumber/complete',
+    auth,
+    requireStaff,
+    validate({ params: ReturnNumberParamsSchema, body: StaffReturnDecisionSchema }),
+    asyncHandler(async (req, res) => {
+      const body = validatedBody<StaffReturnDecisionRequest>(req);
+      const storeId = staffStore(req);
+      const returnNumber = returnNumberOf(req);
+
+      const view = await returns.completeReturn({
+        storeId,
+        returnNumber,
+        actor: staffActor(req),
+        ...(body.staffNote === undefined ? {} : { staffNote: body.staffNote }),
+      });
+
+      res.status(200).json({
+        return: toStaffReturnResponse(view),
+        refunds: (await returns.refundsForReturn({ storeId, returnNumber })).map(
+          toReturnRefundResponse,
+        ),
+      });
     }),
   );
 

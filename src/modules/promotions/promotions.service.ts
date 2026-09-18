@@ -17,6 +17,7 @@ import { PROMOTION_AUDIT, PROMOTION_RESOURCE } from './promotions.events.js';
 import type {
   EditablePromotionFields,
   PromotionRecord,
+  PromotionStatusFilter,
   PromotionsRepository,
 } from './promotions.repository.js';
 import type { CreatePromotionRequest, UpdatePromotionRequest } from './dto.js';
@@ -287,7 +288,13 @@ export function createPromotionsService(deps: {
       return row;
     },
 
-    async listPromotions(params: { storeId: string; limit: number; offset: number }): Promise<{
+    async listPromotions(params: {
+      storeId: string;
+      q?: string;
+      status?: PromotionStatusFilter;
+      limit: number;
+      offset: number;
+    }): Promise<{
       items: readonly PromotionRecord[];
       total: number;
       limit: number;

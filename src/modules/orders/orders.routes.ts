@@ -8,12 +8,23 @@ import type { AuditActor } from '../../shared/audit.js';
 import type { Logger } from '../../shared/logger.js';
 import { renderInvoice, type InvoiceDocumentRecord, type InvoiceInput } from './invoice.js';
 import type { OrdersService } from './orders.service.js';
+import type { AdminOrderFilters } from './orders.repository.js';
 import {
+  AdminCustomerOrdersParamsSchema,
+  AdminCustomerOrdersQuerySchema,
+  AdminListOrdersQuerySchema,
   CheckoutRequestSchema,
   ListOrdersQuerySchema,
   OrderNumberParamsSchema,
+  toAdminOrderDetailResponse,
+  toOrderTimelineResponse,
+  toAdminOrderListResponse,
+  toAdminOrderStatusSummaryResponse,
   toOrderListResponse,
   toOrderResponse,
+  type AdminCustomerOrdersParams,
+  type AdminCustomerOrdersQuery,
+  type AdminListOrdersQuery,
   type CheckoutRequest,
   type ListOrdersQuery,
   type OrderNumberParams,
@@ -398,5 +409,295 @@ export function createOrdersRoutes(deps: {
     }),
   );
 
+  /**
+   * `GET /admin/orders` — a page of the store's orders. Increment 50.
+   *
+   * The surface §46 declined to invent as a side effect of the invoice route. It is invented
+   * here on its own terms, and the three questions that increment listed are answered:
+   *
+   *  - **Filtering** — by the dashboard's composed `displayStatus` (§49), by the raw payment and
+   *    shipment statuses, by a placed-at range, and by a substring of the order number or the
+   *    customer's email. All applied in the database, before the page is cut.
+   *  - **Pagination** — the project's `limit`/`offset` contract, with the page and the total
+   *    sharing one predicate.
+   *  - **How much of another customer staff may see** — an id, an email and a name. A list row
+   *    carries no delivery address at all; the detail route below does, because an operator
+   *    looking at one order is answering a question about that order.
+   *
+   * Store-scoped from the verified staff token. There is no `storeId` parameter, so there is
+   * nothing for a client to widen.
+   *
+   * Failure modes: `400` for an unknown query parameter, a malformed one, or an out-of-range
+   * `limit`; `401` unauthenticated; `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/orders',
+    auth,
+    requireStaff,
+    validate({ query: AdminListOrdersQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const query = validatedQuery<AdminListOrdersQuery>(req);
+
+      const page = await orders.listStoreOrders({
+        storeId: requireUser(req).storeId,
+        limit: query.limit,
+        offset: query.offset,
+        filters: adminOrderFilters(query),
+      });
+
+      res.status(200).json(toAdminOrderListResponse(page));
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/summary` — operational counts for the store. Increment 53.
+   *
+   * Three tallies: orders by the composed `displayStatus` (§49), and the raw payment and
+   * shipment statuses underneath it. Queue depths, not a report — no money, no period, no
+   * filters. Every status appears, including at zero, so the response shape is fixed.
+   *
+   * ### REGISTRATION ORDER IS LOAD-BEARING
+   *
+   * This route MUST stay above `/admin/orders/{orderNumber}`. That route's `onlyOrderNumber`
+   * guard calls `next('router')` for a segment that is not shaped like an order number, which
+   * leaves this router ENTIRELY — so a summary route declared after it would never be reached,
+   * and the request would fall through to a `404`. Declaring it first means Express matches the
+   * literal before it ever considers the parameter.
+   *
+   * A test asserts both halves: that this returns `200`, and that `/admin/orders/fulfilment` in
+   * the other router still does too.
+   *
+   * Store-scoped from the verified staff token; there is no `storeId` parameter and no query
+   * object at all, so there is nothing for a client to supply.
+   *
+   * Failure modes: `401` unauthenticated; `403` without the `staff` scope.
+   */
+  router.get(
+    '/admin/orders/summary',
+    auth,
+    requireStaff,
+    asyncHandler(async (req, res) => {
+      const summary = await orders.summaryForStore({ storeId: requireUser(req).storeId });
+      res.status(200).json({ orders: toAdminOrderStatusSummaryResponse(summary) });
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/{orderNumber}` — one order in the store, whosever it is.
+   *
+   * The same document the customer sees, plus the four things an operator needs and a customer
+   * does not: the composed `displayStatus`, who placed it, where its payment stands, and where
+   * its shipment stands.
+   *
+   * ### `onlyOrderNumber`, and the route it protects
+   *
+   * The orders router is mounted BEFORE the fulfilment router, so this path — `/admin/orders/`
+   * plus one segment — is consulted first and would otherwise swallow
+   * `GET /admin/orders/fulfilment`, an endpoint that already exists and already has clients.
+   * Measured, not assumed: without the guard that request resolves to this handler and dies on
+   * the order-number pattern as a `400`.
+   *
+   * `next('router')` is the fix, and it is the narrow one. A path segment that is not shaped like
+   * an order number leaves this router untouched and continues in the parent, so the fulfilment
+   * queue keeps its route and any future literal under `/admin/orders/` keeps working without
+   * anyone having to remember this file exists.
+   *
+   * The cost is that a MALFORMED order number is a `404` here rather than a `400`: nothing
+   * downstream claims it, so it falls through to the not-found handler. That is the better answer
+   * anyway — a `400` distinguishing "wrong shape" from "no such order" tells an unauthorized
+   * prober which path shapes are real.
+   */
+  router.get(
+    '/admin/orders/:orderNumber',
+    auth,
+    requireStaff,
+    onlyOrderNumber,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const view = await orders.getStoreOrder({
+        storeId: requireUser(req).storeId,
+        orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+      });
+
+      res.status(200).json({ order: toAdminOrderDetailResponse(view) });
+    }),
+  );
+
+  /**
+   * `GET /admin/orders/{orderNumber}/timeline` — the order's append-only status history.
+   * Increment 62.
+   *
+   * A READ over `order_status_history`, which checkout and cancellation have written since
+   * Increment 30 and nothing has read until now. No second history table, no backfill, and
+   * nothing here can write.
+   *
+   * `actorType` is published; the actor's user id is not. Which KIND of actor moved an order is
+   * operational; naming the colleague is an `audit_log` question, answered where the access
+   * controls for it already live.
+   */
+  router.get(
+    '/admin/orders/:orderNumber/timeline',
+    auth,
+    requireStaff,
+    onlyOrderNumber,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const events = await orders.timelineForStoreOrder({
+        storeId: requireUser(req).storeId,
+        orderNumber: validatedParams<OrderNumberParams>(req).orderNumber,
+      });
+
+      res.status(200).json({ timeline: events.map(toOrderTimelineResponse) });
+    }),
+  );
+
+  /**
+   * `POST /admin/orders/{orderNumber}/cancel` — staff cancellation. Increment 62.
+   *
+   * The SAME service call the customer route makes, without a `userId`: staff act for the
+   * tenant rather than for a person, so the lookup is store-scoped. Every guard is shared —
+   * a shipped order is refused, a paid order is refused, a payment in flight is refused, the
+   * status move is a compare-and-swap under the order lock, and the stock release happens after
+   * the CAS proves this request is the one that cancelled.
+   *
+   * **Payment status is not written here.** A cancellation that needed a refund would be
+   * refused by the `paid` guard above, so there is nothing for this path to reverse; the refund
+   * aggregate remains the only thing that moves money.
+   *
+   * No `Idempotency-Key`, matching the customer route and for the same stated reason: a second
+   * cancellation is a `409` rather than a no-op, because a client that receives success twice
+   * cannot tell whether it cancelled something or nothing.
+   */
+  router.post(
+    '/admin/orders/:orderNumber/cancel',
+    auth,
+    requireStaff,
+    onlyOrderNumber,
+    validate({ params: OrderNumberParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const user = requireUser(req);
+      const orderNumber = validatedParams<OrderNumberParams>(req).orderNumber;
+
+      await orders.cancelOrder({
+        storeId: user.storeId,
+        orderNumber,
+        actor: { type: 'staff', userId: user.id },
+      });
+
+      /*
+       * Re-read through the ADMIN projection, so a staff cancellation answers with the same
+       * shape the detail endpoint serves rather than the customer-facing view the service
+       * returns. One extra read on a rare, deliberate mutation, in exchange for one response
+       * contract instead of two.
+       */
+      const view = await orders.getStoreOrder({ storeId: user.storeId, orderNumber });
+      res.status(200).json({ order: toAdminOrderDetailResponse(view) });
+    }),
+  );
+
+  /**
+   * `GET /admin/customers/{customerId}/orders` — one customer's order history. Increment 52.
+   *
+   * ### Why this route lives in the ORDERS module
+   *
+   * The path reads like identity's, and the customer DETAIL endpoint is indeed there. This one
+   * is not, because it returns ORDERS. Putting it in identity would mean identity reading the
+   * `order` table — inverting a dependency that already runs the other way, since orders
+   * already joins `app_user` for the admin list. Splitting by the data returned rather than by
+   * the path keeps that direction intact and needs no new port.
+   *
+   * The two routers cannot collide: identity's `/admin/customers/{customerId}` is three
+   * segments and this is four, so neither pattern can match the other's path.
+   *
+   * ### What it is
+   *
+   * The store-wide admin order list with one more predicate, so the rows, their ordering and
+   * their DTO are literally the same code. `pagination.total` is therefore the customer's order
+   * count, and a customer with no orders is `200` with an empty page.
+   *
+   * A customer who does not exist in this store — unknown, foreign, or soft-deleted — is a
+   * `404`, NOT an empty page. An empty page is a fact about somebody's history and must not be
+   * the answer for somebody who is not there.
+   *
+   * Store-scoped from the verified staff token; `customerId` names which customer, never which
+   * store.
+   *
+   * Failure modes: `400` for a malformed UUID or an unknown query parameter; `401`
+   * unauthenticated; `403` without the `staff` scope; `404` per above.
+   */
+  router.get(
+    '/admin/customers/:customerId/orders',
+    auth,
+    requireStaff,
+    validate({
+      params: AdminCustomerOrdersParamsSchema,
+      query: AdminCustomerOrdersQuerySchema,
+    }),
+    asyncHandler(async (req, res) => {
+      const { limit, offset } = validatedQuery<AdminCustomerOrdersQuery>(req);
+
+      const page = await orders.listStoreOrdersForCustomer({
+        storeId: requireUser(req).storeId,
+        customerId: validatedParams<AdminCustomerOrdersParams>(req).customerId,
+        limit,
+        offset,
+      });
+
+      res.status(200).json(toAdminOrderListResponse(page));
+    }),
+  );
+
   return router;
+}
+
+/**
+ * The order-number shape, as a route guard rather than as validation.
+ *
+ * Duplicated from `OrderNumberParamsSchema` deliberately: this decides whether the request is
+ * ADDRESSED to this route at all, which has to happen before validation, and a Zod schema cannot
+ * answer that without also rejecting the request. The two are asserted to agree by the
+ * integration test that drives a real order number through both.
+ */
+const ADMIN_ORDER_NUMBER_PATTERN = /^ORD-\d{8}-[A-Z2-9]{6}$/u;
+
+/**
+ * Continue only if this segment looks like an order number; otherwise leave the router entirely.
+ *
+ * `next('router')` rather than `next()`: `next()` would fall through to the 404 handler inside
+ * this router's stack and still shadow whatever the parent had for this path.
+ */
+const onlyOrderNumber: RequestHandler = (req, _res, next) => {
+  /*
+   * Express types a path parameter as `string | string[]` because a repeated parameter name in a
+   * pattern produces an array. This pattern declares `:orderNumber` once, so only the string case
+   * can occur — but the array case is REFUSED rather than joined or indexed, because the honest
+   * answer to "this route was reached with a shape it does not model" is to decline it.
+   */
+  const raw: unknown = req.params['orderNumber'];
+  if (typeof raw === 'string' && ADMIN_ORDER_NUMBER_PATTERN.test(raw)) {
+    next();
+    return;
+  }
+  next('router');
+};
+
+/**
+ * The validated query, as the repository's filter shape.
+ *
+ * Instants are parsed here rather than in the schema so the DTO stays a description of the WIRE
+ * — strings in, strings out — and the `Date` conversion happens once, on the way in, at the
+ * adapter boundary where every other parse in this file happens.
+ *
+ * Built key by key with `exactOptionalPropertyTypes` in mind: an absent filter must be an absent
+ * KEY, not a key holding `undefined`, or the repository would build a predicate against it.
+ */
+function adminOrderFilters(query: AdminListOrdersQuery): AdminOrderFilters {
+  return {
+    ...(query.displayStatus === undefined ? {} : { displayStatus: query.displayStatus }),
+    ...(query.paymentStatus === undefined ? {} : { paymentStatus: query.paymentStatus }),
+    ...(query.shipmentStatus === undefined ? {} : { shipmentStatus: query.shipmentStatus }),
+    ...(query.placedFrom === undefined ? {} : { placedFrom: new Date(query.placedFrom) }),
+    ...(query.placedTo === undefined ? {} : { placedTo: new Date(query.placedTo) }),
+    ...(query.q === undefined ? {} : { q: query.q }),
+  };
 }

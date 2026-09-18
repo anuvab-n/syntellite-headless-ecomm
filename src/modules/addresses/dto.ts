@@ -257,3 +257,15 @@ export function toAddressResponse(record: AddressRecord): AddressResponse {
     updatedAt: record.updatedAt.toISOString(),
   };
 }
+
+/* ── GET /admin/customers/{customerId}/addresses. Increment 63. ──────────── */
+
+/**
+ * The staff path parameter.
+ *
+ * A UUID, so a malformed id is a `400` from validation and never reaches PostgreSQL. There is
+ * no `storeId` here and never will be: the tenant comes from the verified staff token.
+ */
+export const AdminCustomerAddressesParamsSchema = z.object({ customerId: z.uuid() });
+
+export type AdminCustomerAddressesParams = z.infer<typeof AdminCustomerAddressesParamsSchema>;

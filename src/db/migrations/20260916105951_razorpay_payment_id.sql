@@ -1,0 +1,3 @@
+ALTER TABLE "payment" ADD COLUMN "provider_transaction_id" varchar(255);--> statement-breakpoint
+CREATE UNIQUE INDEX "uq_payment_provider_txn" ON "payment" USING btree ("store_id","provider_transaction_id","provider") WHERE "payment"."provider_transaction_id" is not null;--> statement-breakpoint
+ALTER TABLE "payment" ADD CONSTRAINT "ck_payment_provider_txn_only_online" CHECK ("payment"."provider_transaction_id" IS NULL OR "payment"."method" = 'online');

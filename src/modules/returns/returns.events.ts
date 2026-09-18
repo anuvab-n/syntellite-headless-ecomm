@@ -18,6 +18,12 @@ export const RETURN_AUDIT = {
   cancelled: 'return.cancelled',
   approved: 'return.approved',
   rejected: 'return.rejected',
+  /** Increment 59. The goods arrived at the warehouse. */
+  received: 'return.received',
+  /** Increment 59. The good-to-sell / written-off split was decided. */
+  inspected: 'return.inspected',
+  /** Increment 59. Money was raised and stock was restored. The one that moves both. */
+  completed: 'return.completed',
 } as const;
 
 export type ReturnAuditAction = (typeof RETURN_AUDIT)[keyof typeof RETURN_AUDIT];

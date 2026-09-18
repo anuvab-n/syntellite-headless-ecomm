@@ -8,12 +8,16 @@ import { ValidationError } from '../../shared/errors.js';
 import type { Logger } from '../../shared/logger.js';
 import {
   CreateShipmentRequestSchema,
+  AdminListShipmentsQuerySchema,
   FulfilmentQueueQuerySchema,
   ShipmentIdParamsSchema,
   ShipmentTransitionRequestSchema,
   UpdateTrackingRequestSchema,
+  toAdminShipmentDetailResponse,
+  toAdminShipmentListResponse,
   toCustomerShipmentResponse,
   toStaffShipmentResponse,
+  type AdminListShipmentsQuery,
   type CreateShipmentRequest,
   type FulfilmentQueueQuery,
   type FulfilmentQueueRow,
@@ -237,6 +241,82 @@ export function createFulfilmentRoutes(deps: {
    * an online order that is not paid, permits a COD order whose payment is still `pending`, and
    * answers `409` on a second attempt without moving stock twice.
    */
+  /**
+   * `GET /admin/shipments` — a page of the store's shipments, newest first. Increment 54.
+   *
+   * The read this module never had. `PATCH /admin/shipments/{id}` and both transition routes
+   * have always addressed a shipment by id, so staff could change a shipment they had no way to
+   * look at, and the only listing was the fulfilment queue — which is a worklist of orders
+   * AWAITING shipment, and therefore excludes every shipment that already exists.
+   *
+   * Filters are exact, not searches: a status from the real vocabulary, and an order number
+   * matching the generated shape. An unknown order number is an empty page rather than a `404` —
+   * it is a filter, not a lookup.
+   *
+   * Ordered by `createdAt` descending then `id` descending. The tiebreaker is load-bearing:
+   * `createdAt` alone is not a total order, and a non-total order makes `offset` paging skip and
+   * repeat rows between pages.
+   *
+   * Store-scoped from the verified staff token. There is no `storeId` parameter, and the query
+   * object is strict, so supplying one is a `400`.
+   *
+   * Failure modes: `400` for an unknown query parameter, an out-of-range `limit`, a status
+   * outside the vocabulary or a malformed order number; `401` unauthenticated; `403` without the
+   * `staff` scope.
+   */
+  router.get(
+    '/admin/shipments',
+    auth,
+    requireStaff,
+    validate({ query: AdminListShipmentsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const query = validatedQuery<AdminListShipmentsQuery>(req);
+
+      const page = await fulfilment.listStoreShipments({
+        storeId: scope(req).storeId,
+        limit: query.limit,
+        offset: query.offset,
+        filters: {
+          ...(query.status === undefined ? {} : { status: query.status }),
+          ...(query.orderNumber === undefined ? {} : { orderNumber: query.orderNumber }),
+        },
+      });
+
+      res.status(200).json(toAdminShipmentListResponse(page));
+    }),
+  );
+
+  /**
+   * `GET /admin/shipments/{id}` — one shipment and its transition history. Increment 54.
+   *
+   * The list row plus `history`: every transition the shipment has made, oldest first, with the
+   * note a staff member typed at each. The history lives here and not on the list because a page
+   * of 100 shipments would otherwise carry every transition any of them ever made to render a
+   * table that shows none of them.
+   *
+   * Registered AFTER `GET /admin/shipments` above so the literal is matched before the parameter
+   * is considered. It does not collide with the existing routes under this prefix — those are
+   * `PATCH /admin/shipments/{id}` and two `POST`s, so the method distinguishes them.
+   *
+   * Failure modes: `400` for a malformed UUID; `401` unauthenticated; `403` without the `staff`
+   * scope; `404` for an unknown id and for another store's shipment alike — indistinguishable,
+   * because the query returns nothing for both.
+   */
+  router.get(
+    '/admin/shipments/:id',
+    auth,
+    requireStaff,
+    validate({ params: ShipmentIdParamsSchema }),
+    asyncHandler(async (req, res) => {
+      const view = await fulfilment.getStoreShipment({
+        shipmentId: validatedParams<ShipmentIdParams>(req).id,
+        storeId: scope(req).storeId,
+      });
+
+      res.status(200).json({ shipment: toAdminShipmentDetailResponse(view) });
+    }),
+  );
+
   router.post(
     '/admin/shipments/:id/ship',
     auth,

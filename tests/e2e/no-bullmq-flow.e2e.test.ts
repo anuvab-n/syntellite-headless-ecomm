@@ -206,6 +206,43 @@ describe('full e-commerce flow without BullMQ (in-process transport)', () => {
         })
       ).status,
     ).toBe(200);
+
+    /*
+     * The SKU must be CLASSIFIED, not just the store profiled.
+     *
+     * Once a store has a GST profile, a SKU with no tax class cannot be taxed, and checkout
+     * refuses it with `422 TAX_NOT_DETERMINABLE { reason: 'unclassified' }` rather than
+     * inventing a zero rate. The profile alone is therefore not enough to sell anything.
+     */
+    const taxClassCode = `NOBQGST-${newId().slice(0, 6)}`;
+    expect(
+      (
+        await api()
+          .post('/api/v1/admin/tax-classes')
+          .set(asAdmin())
+          .send({ code: taxClassCode, name: 'GST 5%', isActive: true })
+      ).status,
+    ).toBe(201);
+
+    expect(
+      (
+        await api().post(`/api/v1/admin/tax-classes/${taxClassCode}/rates`).set(asAdmin()).send({
+          cgstRate: '2.5',
+          sgstRate: '2.5',
+          igstRate: '5',
+          effectiveFrom: '2020-01-01T00:00:00.000Z',
+        })
+      ).status,
+    ).toBe(201);
+
+    expect(
+      (
+        await api()
+          .put(`/api/v1/admin/skus/${skuCode}/tax`)
+          .set(asAdmin())
+          .send({ taxClassCode, hsnCode: '61091000' })
+      ).status,
+    ).toBe(200);
   });
 
   it('customer shops, checks out, and pays COD — every write still lands in the DB', async () => {

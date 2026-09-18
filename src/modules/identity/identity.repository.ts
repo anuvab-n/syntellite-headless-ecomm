@@ -1,9 +1,10 @@
-import { and, eq, isNull, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gte, ilike, isNull, lt, ne, or, sql, type SQL } from 'drizzle-orm';
 
 import type { Database } from '../../db/client.js';
-import { appUser } from '../../db/schema/identity.js';
+import { appUser, auditLog } from '../../db/schema/identity.js';
 import { uniqueViolationConstraint } from '../../db/errors.js';
 import { executor } from '../../db/transaction.js';
+import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
 import type { MappableUser } from './dto.js';
 
 /**
@@ -407,5 +408,390 @@ export function createIdentityRepository(deps: { db: Database }) {
 
       return updated.length > 0;
     },
+
+    /**
+     * **A page of the STORE's customers, for staff.** Increment 51. Read-only.
+     *
+     * Every other read in this file is keyed to ONE subject — by id from a verified token, or by
+     * email during authentication. This is the first that returns many, and it is a separate
+     * method with `Store` in its name rather than an optional `userId` on an existing one: a
+     * caller that forgot to pass an owner would otherwise silently get store-wide reach, which
+     * is exactly the hole an optional security parameter creates.
+     *
+     * `store_id` is still non-negotiable and comes from the staff member's verified token.
+     * Only the "one subject" narrowing is dropped.
+     *
+     * **Staff accounts are not filtered out.** A store's staff are rows in this table, and
+     * hiding them would make the list disagree with the database for no stated reason. What IS
+     * filtered is `deleted_at IS NULL`, matching every other read here — an erased customer is
+     * invisible to staff for the same reason they are invisible to authentication.
+     *
+     * Page and count share ONE predicate, so a caller on the last page is never told the total
+     * counted rows it cannot see. Ordered by `created_at DESC, id DESC`: `created_at` alone is
+     * not a total order — two accounts created in the same instant would tie — and a non-total
+     * order makes `offset` pagination silently skip and repeat rows between pages.
+     *
+     * One query for the page and one for the count, both over `app_user` alone. There is no
+     * join and no per-row lookup, so there is no N+1 to avoid.
+     */
+    /**
+     * **One customer in this store, for staff.** Increment 52. Read-only.
+     *
+     * Deliberately NOT `findSubjectById`, which exists for token refresh and selects
+     * `SUBJECT_COLUMNS` — including `is_staff`, `is_superuser` and `store_id`. Reusing it here
+     * would publish privilege flags on an operator screen, so this takes the same
+     * `ADMIN_CUSTOMER_COLUMNS` allowlist the list uses and nothing else.
+     *
+     * The predicate is the list's, narrowed to one id: tenant, liveness, and now identity. An
+     * unknown id, another store's customer and a soft-deleted one are all `undefined`, so the
+     * caller answers one `404` and reveals nothing — the §25 rule that ownership belongs in the
+     * query rather than in a comparison performed afterwards.
+     *
+     * Served by `uq_app_user_id_store` on `(id, store_id)`, which already exists as an FK
+     * target: measured at 0.018 ms with `deleted_at` applied as a filter on the single row.
+     */
+    async findStoreCustomerById(params: {
+      storeId: string;
+      customerId: string;
+    }): Promise<AdminCustomerRecord | undefined> {
+      const [row] = await executor(db)
+        .select(ADMIN_CUSTOMER_COLUMNS)
+        .from(appUser)
+        .where(
+          and(
+            eq(appUser.id, params.customerId),
+            eq(appUser.storeId, params.storeId),
+            isNull(appUser.deletedAt),
+          ),
+        )
+        .limit(1);
+      return row;
+    },
+
+    /**
+     * Set a customer's active flag, store-scoped, with a compare-and-swap on the old value.
+     * Increment 62.
+     *
+     * The `is_active <> :next` predicate is the idempotency: a second identical request matches
+     * no row and comes back `undefined`, so the caller answers `409` rather than writing an
+     * audit entry for a change that did not happen. Without it, deactivating an already
+     * deactivated account would leave a trail suggesting two separate decisions.
+     *
+     * **`is_staff` and `is_superuser` are untouched and unreadable from here.** This flips one
+     * boolean on one customer; it is not a privilege operation and must never become one.
+     *
+     * Soft-deleted accounts are excluded: re-activating a deleted customer would resurrect an
+     * account the deletion policy retired.
+     */
+    /**
+     * A page of the store's audit log, newest first. Increment 62.
+     *
+     * **Read-only, and the only read of this table anywhere.** `audit_log` is append-only by
+     * policy; nothing in this file updates or deletes it, and exposing it does not change that.
+     *
+     * `metadata` is deliberately NOT selected. Entries carry per-action context written by
+     * whichever module recorded them, and while each is reviewed at its call site, publishing
+     * the union of every module's metadata through one endpoint means every future `audit.record`
+     * call would become a disclosure decision on this route. The columns here are the ones every
+     * entry has and every entry is safe to show.
+     *
+     * Ordered `(created_at DESC, id DESC)`. The timestamp is not a total order — a single
+     * transaction writes several entries at one `now()` — and `id` is UUIDv7, so it orders
+     * within the tie by creation. `ix_audit_log_store_time (store_id, created_at)` serves the
+     * leading column.
+     */
+    async listStoreAuditLog(params: {
+      storeId: string;
+      action?: string;
+      actorType?: string;
+      actorUserId?: string;
+      resourceType?: string;
+      resourceId?: string;
+      from?: Date;
+      to?: Date;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: AuditLogRecord[]; total: number }> {
+      const predicate = auditLogFilter(params);
+
+      const items = await executor(db)
+        .select({
+          action: auditLog.action,
+          actorType: auditLog.actorType,
+          actorUserId: auditLog.actorUserId,
+          resourceType: auditLog.resourceType,
+          resourceId: auditLog.resourceId,
+          createdAt: auditLog.createdAt,
+        })
+        .from(auditLog)
+        .where(predicate)
+        .orderBy(desc(auditLog.createdAt), desc(auditLog.id))
+        .limit(params.limit)
+        .offset(params.offset);
+
+      const [counted] = await executor(db)
+        .select({ total: sql<string>`count(*)` })
+        .from(auditLog)
+        .where(predicate);
+
+      return { items, total: Number(counted?.total ?? 0) };
+    },
+
+    async setCustomerActive(params: {
+      storeId: string;
+      customerId: string;
+      isActive: boolean;
+      at: Date;
+    }): Promise<AdminCustomerRecord | undefined> {
+      const [row] = await executor(db)
+        .update(appUser)
+        .set({ isActive: params.isActive, updatedAt: params.at })
+        .where(
+          and(
+            eq(appUser.id, params.customerId),
+            eq(appUser.storeId, params.storeId),
+            isNull(appUser.deletedAt),
+            ne(appUser.isActive, params.isActive),
+          ),
+        )
+        .returning(ADMIN_CUSTOMER_COLUMNS);
+      return row;
+    },
+
+    async listStoreCustomers(params: {
+      storeId: string;
+      filters: AdminCustomerFilters;
+      limit: number;
+      offset: number;
+    }): Promise<{ items: AdminCustomerRecord[]; total: number }> {
+      const where = adminCustomerPredicate(params.storeId, params.filters);
+
+      const [items, [counted]] = await Promise.all([
+        executor(db)
+          .select(ADMIN_CUSTOMER_COLUMNS)
+          .from(appUser)
+          .where(where)
+          .orderBy(desc(appUser.createdAt), desc(appUser.id))
+          .limit(params.limit)
+          .offset(params.offset),
+        executor(db).select({ total: count() }).from(appUser).where(where),
+      ]);
+
+      return { items, total: counted?.total ?? 0 };
+    },
+
+    /**
+     * **How many of the store's customers are active, and how many are not.** Increment 56.
+     *
+     * Tenancy and liveness ONLY — deliberately not the list's filters. These are the screen's
+     * tabs, and a tab whose count changed as you typed in the search box could never tell you
+     * how many rows switching to it would show. `pagination.total` is the filtered figure; this
+     * is the unfiltered one, and the two differing is correct rather than a discrepancy.
+     *
+     * Soft-deleted accounts are excluded, exactly as they are from the list — an erased customer
+     * is invisible to staff for the same reason it is invisible to authentication.
+     *
+     * One grouped scan over one store. A full aggregate must read every live account in the
+     * tenant, which is honest work; `ix_app_user_store_created` is partial on the same
+     * `deleted_at IS NULL` predicate and serves it.
+     */
+    async countStoreCustomersByStatus(params: {
+      storeId: string;
+    }): Promise<{ isActive: boolean; count: number }[]> {
+      return executor(db)
+        .select({ isActive: appUser.isActive, count: count() })
+        .from(appUser)
+        .where(and(eq(appUser.storeId, params.storeId), isNull(appUser.deletedAt)))
+        .groupBy(appUser.isActive);
+    },
   };
+}
+
+/**
+ * The columns the staff customer list reads. **An allowlist, and the omissions are the point.**
+ *
+ * Selected explicitly rather than with `select()`: a bare select would silently start returning
+ * any column a later increment adds, which is how an internal field reaches a response body
+ * nobody meant to widen.
+ *
+ * Never selected, here or anywhere downstream:
+ *
+ *  - `password_hash` — a credential. It has exactly two legitimate readers, both of them
+ *    authentication paths with their own projections (`CREDENTIAL_COLUMNS`), and a list is
+ *    neither of them.
+ *  - `is_staff`, `is_superuser` — privilege flags. Publishing them would make an operator
+ *    screen double as a map of which accounts are worth attacking.
+ *  - `store_id` — tenancy is an invariant of the query, not a field to inspect.
+ *  - `deleted_at` — every row here is live by construction.
+ *
+ * Password-reset tokens and refresh sessions live in their own tables and are not reachable
+ * from this query at all.
+ */
+const ADMIN_CUSTOMER_COLUMNS = {
+  id: appUser.id,
+  email: appUser.email,
+  /**
+   * The mobile number the operator screen shows. Increment 56.
+   *
+   * Nullable, and it always will be: `phone` has never been required at registration, so a
+   * customer who signed up with an email alone has none. `uq_user_phone_active` makes it unique
+   * per store where it is present.
+   */
+  phone: appUser.phone,
+  firstName: appUser.firstName,
+  lastName: appUser.lastName,
+  isActive: appUser.isActive,
+  createdAt: appUser.createdAt,
+  updatedAt: appUser.updatedAt,
+} as const;
+
+/** One customer as the staff list reads them. Structurally the projection above. */
+export type AdminCustomerRecord = {
+  readonly id: string;
+  readonly email: string;
+  readonly phone: string | null;
+  readonly firstName: string;
+  readonly lastName: string;
+  readonly isActive: boolean;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+};
+
+/** The filters the staff customer list accepts. Every one of them is optional. */
+export type AdminCustomerFilters = {
+  readonly isActive?: boolean;
+  readonly createdFrom?: Date;
+  readonly createdTo?: Date;
+  readonly q?: string;
+};
+
+/**
+ * The staff list's WHERE clause: tenancy and liveness, then whichever filters were supplied.
+ *
+ * A free function rather than a closure inside the factory because it takes everything it needs
+ * and captures nothing — which is what makes it readable as the one place tenancy is applied.
+ * The first two conjuncts are not optional; every filter below can only narrow, so no
+ * combination of query parameters widens the result past one tenant.
+ */
+function adminCustomerPredicate(storeId: string, filters: AdminCustomerFilters): SQL | undefined {
+  const clauses: SQL[] = [eq(appUser.storeId, storeId), isNull(appUser.deletedAt)];
+
+  if (filters.isActive !== undefined) clauses.push(eq(appUser.isActive, filters.isActive));
+
+  /*
+   * The lower bound needs no adjustment: every microsecond inside the named millisecond is
+   * already greater than its start, so `>=` admits them all.
+   */
+  if (filters.createdFrom !== undefined) clauses.push(gte(appUser.createdAt, filters.createdFrom));
+  /*
+   * STRICT `<` against the start of the NEXT millisecond, not `<=` against this one.
+   *
+   * `created_at` is microsecond-precise in the database and millisecond-precise everywhere in
+   * this API, so `<=` dropped every row whose stored microseconds were non-zero — including the
+   * row a client had just read the bound from. `exclusiveEndOfMillisecond` carries the reasoning.
+   */
+  if (filters.createdTo !== undefined) {
+    clauses.push(lt(appUser.createdAt, exclusiveEndOfMillisecond(filters.createdTo)));
+  }
+
+  /**
+   * The operator's search box: one term across the four identity fields the screen shows.
+   * Increment 56.
+   *
+   * Case-insensitive substring, the same shape `GET /admin/orders?q=` already uses, with `%` and
+   * `_` escaped first — an unescaped `%` would turn a typo into a term that matched every row,
+   * which reads to an operator as "the filter is broken".
+   *
+   * **Wider than the order list's search, deliberately.** That one is an order number or an
+   * email, because those are what an operator holds in hand. This is the customer DIRECTORY: its
+   * entire purpose is finding a person from a partial name or a partial number, so names and
+   * phone are in scope here and the disclosure is the feature rather than a leak.
+   *
+   * The phone arm matches on digits alone. A stored `+919876543210` must be found by `98765`
+   * and by `+91 98765` alike, so the term's separators are stripped for that comparison only —
+   * the other three arms keep the term verbatim, because a name may legitimately contain any of
+   * those characters.
+   *
+   * Unindexed by construction: a leading-wildcard `LIKE` cannot use a B-tree, and this codebase
+   * has no `pg_trgm`. Measured before it shipped rather than assumed — see the increment's
+   * EXPLAIN evidence — and if the store outgrows it the answer is a trigram GIN index, which is
+   * an extension and therefore its own decision.
+   */
+  if (filters.q !== undefined && filters.q.length > 0) {
+    const escaped = filters.q.replace(/([\\%_])/gu, '\\$1');
+    const term = `%${escaped}%`;
+
+    const arms: SQL[] = [
+      ilike(appUser.email, term),
+      ilike(appUser.firstName, term),
+      ilike(appUser.lastName, term),
+    ];
+
+    const digits = filters.q.replace(/\D/gu, '');
+    if (digits.length > 0) arms.push(ilike(appUser.phone, `%${digits}%`));
+
+    const match = or(...arms);
+    if (match) clauses.push(match);
+  }
+
+  return and(...clauses);
+}
+
+/**
+ * One audit entry, as the admin API publishes it. Increment 62.
+ *
+ * `metadata` is absent from the shape, not merely from the response: a read model that never
+ * carries it cannot leak it through a later careless DTO change.
+ */
+export type AuditLogRecord = {
+  readonly action: string;
+  readonly actorType: string;
+  readonly actorUserId: string | null;
+  readonly resourceType: string | null;
+  readonly resourceId: string | null;
+  readonly createdAt: Date;
+};
+
+/**
+ * The audit log's WHERE clause. Increment 62.
+ *
+ * One builder for the page and its count, so a total cannot be computed from a different
+ * predicate than the rows it claims to count.
+ *
+ * **`store_id` is unconditional and first.** `audit_log.store_id` is nullable — platform-level
+ * entries carry none — and that is exactly why the predicate is an equality rather than an
+ * `OR IS NULL`: a tenant's admin must not see the platform's entries, and a NULL store can
+ * never satisfy `= :storeId`.
+ */
+function auditLogFilter(params: {
+  storeId: string;
+  action?: string;
+  actorType?: string;
+  actorUserId?: string;
+  resourceType?: string;
+  resourceId?: string;
+  from?: Date;
+  to?: Date;
+}): SQL | undefined {
+  const clauses: SQL[] = [eq(auditLog.storeId, params.storeId)];
+
+  /* Exact matches, not substrings: these are closed vocabularies an operator picks from. */
+  if (params.action !== undefined) clauses.push(eq(auditLog.action, params.action));
+  if (params.actorType !== undefined) clauses.push(eq(auditLog.actorType, params.actorType));
+  if (params.actorUserId !== undefined) clauses.push(eq(auditLog.actorUserId, params.actorUserId));
+  if (params.resourceType !== undefined) {
+    clauses.push(eq(auditLog.resourceType, params.resourceType));
+  }
+  if (params.resourceId !== undefined) clauses.push(eq(auditLog.resourceId, params.resourceId));
+
+  if (params.from !== undefined) clauses.push(gte(auditLog.createdAt, params.from));
+  /*
+   * Inclusive of the whole millisecond named — the project-wide convention. `created_at` is
+   * microsecond-precise in storage and millisecond-precise in this API, so a plain `<=` would
+   * drop the entry an operator copied the bound from.
+   */
+  if (params.to !== undefined)
+    clauses.push(lt(auditLog.createdAt, exclusiveEndOfMillisecond(params.to)));
+
+  return and(...clauses);
 }

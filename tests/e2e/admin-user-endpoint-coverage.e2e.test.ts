@@ -519,7 +519,8 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
       'GET',
       '/api/v1/admin/tax-classes/:code/rates',
       rateList.status,
-      `${String(rateList.body.rates.length)} rate row(s)`,
+      // The response is `{ taxClass, taxRates }` — there is no `rates` key.
+      `${String(rateList.body.taxRates.length)} rate row(s)`,
     );
     expect(rateList.status).toBe(200);
 
@@ -537,7 +538,8 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
       'GET',
       '/api/v1/admin/inventory',
       invList.status,
-      `${String(invList.body.items.length)} stock row(s)`,
+      // The response is `{ inventory, pagination }` — there is no `items` key.
+      `${String(invList.body.inventory.length)} stock row(s)`,
     );
     expect(invList.status).toBe(200);
 
@@ -546,10 +548,11 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
       'GET',
       '/api/v1/admin/inventory/:skuCode/history',
       invHistory.status,
-      `${String(invHistory.body.items.length)} ledger entr(y/ies), append-only`,
+      // The response is `{ history, pagination }` — there is no `items` key.
+      `${String(invHistory.body.history.length)} ledger entr(y/ies), append-only`,
     );
     expect(invHistory.status).toBe(200);
-    expect(invHistory.body.items.length).toBeGreaterThan(0);
+    expect(invHistory.body.history.length).toBeGreaterThan(0);
   });
 
   /* ══ 4. Customer self-service depth: addresses, cart, tax identity ═════ */
@@ -669,7 +672,8 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
       `subtotal=${cartRead.body.cart.subtotal as string}`,
     );
     expect(cartRead.status).toBe(200);
-    expect(cartRead.body.cart.itemCount).toBe(5);
+    // `itemCount` is the number of LINES, not the sum of quantities: 5 units of one SKU is 1.
+    expect(cartRead.body.cart.itemCount).toBe(1);
 
     const promoApplied = await api()
       .put('/api/v1/users/me/cart/promotion')
@@ -680,15 +684,21 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
 
     const promoRemoved = await api().delete('/api/v1/users/me/cart/promotion').set(asCustomer());
     log('DELETE', '/api/v1/users/me/cart/promotion', promoRemoved.status, 'coupon removed');
-    expect(promoRemoved.status).toBe(200);
-    expect(promoRemoved.body.cart.promotion).toBeNull();
+    // 204: removing the coupon returns no body, so the cart is re-read to prove it is gone.
+    expect(promoRemoved.status).toBe(204);
+    const cartAfterPromoRemoved = await api().get('/api/v1/users/me/cart').set(asCustomer());
+    expect(cartAfterPromoRemoved.status).toBe(200);
+    expect(cartAfterPromoRemoved.body.cart.promotion).toBeNull();
 
     const itemRemoved = await api()
       .delete(`/api/v1/users/me/cart/items/${skuCode}`)
       .set(asCustomer());
     log('DELETE', '/api/v1/users/me/cart/items/:sku', itemRemoved.status, 'line removed');
-    expect(itemRemoved.status).toBe(200);
-    expect(itemRemoved.body.cart.itemCount).toBe(0);
+    // 204: removing a line returns no body, so the cart is re-read to prove it is empty.
+    expect(itemRemoved.status).toBe(204);
+    const cartAfterItemRemoved = await api().get('/api/v1/users/me/cart').set(asCustomer());
+    expect(cartAfterItemRemoved.status).toBe(200);
+    expect(cartAfterItemRemoved.body.cart.itemCount).toBe(0);
 
     /* ---- refill it, since checkout in the next section needs real items ---- */
 
@@ -706,8 +716,11 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
 
     const cleared = await api().delete('/api/v1/users/me/cart').set(asCustomer());
     log('DELETE', '/api/v1/users/me/cart', cleared.status, 'DELETE /cart empties it entirely');
-    expect(cleared.status).toBe(200);
-    expect(cleared.body.cart.itemCount).toBe(0);
+    // 204: clearing the cart returns no body, so the cart is re-read to prove it is empty.
+    expect(cleared.status).toBe(204);
+    const cartAfterClear = await api().get('/api/v1/users/me/cart').set(asCustomer());
+    expect(cartAfterClear.status).toBe(200);
+    expect(cartAfterClear.body.cart.itemCount).toBe(0);
 
     const final = await api()
       .put(`/api/v1/users/me/cart/items/${skuCode}`)
@@ -950,7 +963,8 @@ describe('admin + user endpoint coverage walkthrough (narrated)', () => {
       .post(`/api/v1/users/me/orders/${orderNumber}/returns`)
       .set(asCustomer())
       .set('idempotency-key', `covret-${newId()}`)
-      .send({ reason: 'changed_mind', lines: [{ skuCode, quantity: 1 }] });
+      // `changed_mind` is not in RETURN_REASONS; the approved vocabulary calls it this.
+      .send({ reason: 'no_longer_needed', lines: [{ skuCode, quantity: 1 }] });
     log('POST', '/api/v1/users/me/orders/:n/returns', created.status, 'customer raises a return');
     expect(created.status).toBe(201);
     const returnNumber = created.body.return.returnNumber as string;

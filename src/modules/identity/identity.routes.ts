@@ -8,10 +8,27 @@ import {
 } from '../../http/middleware/rate-limit.js';
 import { requireAuth, requireUser } from '../../http/middleware/auth.js';
 import { requireStore } from '../../http/middleware/store.js';
-import { validate, validatedBody } from '../../http/validate.js';
+import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
 import type { RateLimiter, RateLimitPolicy } from '../../redis/rate-limiter.js';
 import type { Logger } from '../../shared/logger.js';
+import type { AdminCustomerFilters } from './identity.repository.js';
 import {
+  AdminAuditLogQuerySchema,
+  AdminSessionParamsSchema,
+  AdminSessionsQuerySchema,
+  toAdminSessionResponse,
+  AdminListCustomersQuerySchema,
+  SetCustomerActiveRequestSchema,
+  toAuditLogEntryResponse,
+  CustomerIdParamsSchema,
+  toAdminCustomerListResponse,
+  toAdminCustomerResponse,
+  type AdminAuditLogQuery,
+  type AdminSessionParams,
+  type AdminSessionsQuery,
+  type AdminListCustomersQuery,
+  type SetCustomerActiveRequest,
+  type CustomerIdParams,
   ChangePasswordRequestSchema,
   LoginRequestSchema,
   ForgotPasswordRequestSchema,
@@ -82,8 +99,29 @@ export function createIdentityRoutes(deps: {
     refreshPolicy?: RateLimitPolicy;
     logger: Logger;
   };
+  /**
+   * The `staff` scope guard, pre-built by the composition root — the same instance the
+   * catalogue, inventory, orders and payments routers use.
+   *
+   * Passed in rather than built here even though this module OWNS authorization: the guard is
+   * constructed against the scope loader that reads privileges from the database on every
+   * request, and that wiring belongs to the composition root. This file only declares which
+   * privilege a route requires. Added in Increment 51 for `GET /admin/customers`, the module's
+   * first staff route.
+   *
+   * **Optional, and when it is absent the admin route is NOT MOUNTED** — the same shape
+   * `rateLimit` uses above, and for the same reason: a dozen existing suites mount this router
+   * directly to assert handler behaviour, and none of them has a scope loader.
+   *
+   * Note the asymmetry with `rateLimit`, which mounts its endpoints UNPROTECTED when absent.
+   * That would be indefensible here: an unguarded customer directory is a data breach, not a
+   * missing limit. So the route disappears instead, which is a safe default in a way that
+   * "mount it without the guard" could never be. `container.integration.test.ts` is what proves
+   * the composition root always supplies it.
+   */
+  requireStaff?: RequestHandler;
 }): Router {
-  const { identity, tokens, logger, rateLimit } = deps;
+  const { identity, tokens, logger, rateLimit, requireStaff } = deps;
   const router = Router();
 
   /**
@@ -529,5 +567,270 @@ export function createIdentityRoutes(deps: {
     }),
   );
 
+  /**
+   * `GET /admin/customers` — a page of the store's customers. Increment 51.
+   *
+   * The module's first staff route, and its first read that returns many subjects. Every other
+   * authenticated endpoint here is about the caller's OWN account; this one is about the
+   * store's, and the difference is `requireStaff` plus a repository method whose name says
+   * `Store`.
+   *
+   * **Read-only, and deliberately narrow.** No customer detail, no order history, no
+   * activation or deactivation, no search. Staff may see who exists and whether the account is
+   * live; acting on one is not part of this increment.
+   *
+   * Store-scoped from the verified staff token. There is no `storeId` parameter, and the query
+   * schema is strict, so supplying one is a `400` rather than something to be ignored.
+   *
+   * `passwordHash`, `isStaff` and `isSuperuser` are absent from the repository projection, from
+   * the record type, and from the response mapper — three deliberate edits would be needed to
+   * publish one. Password-reset tokens and refresh sessions live in other tables this query
+   * never touches.
+   *
+   * Failure modes: `400` for an unknown query parameter, a malformed instant, an `isActive`
+   * that is not `true`/`false`, or an out-of-range `limit`; `401` unauthenticated; `403`
+   * without the `staff` scope — including for a customer asking about themselves, who should
+   * use `GET /users/me`.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/customers',
+      auth,
+      requireStaff,
+      validate({ query: AdminListCustomersQuerySchema }),
+      asyncHandler(async (req, res) => {
+        const query = validatedQuery<AdminListCustomersQuery>(req);
+
+        const page = await identity.listStoreCustomers({
+          storeId: requireUser(req).storeId,
+          limit: query.limit,
+          offset: query.offset,
+          filters: adminCustomerFilters(query),
+        });
+
+        res.status(200).json(toAdminCustomerListResponse(page));
+      }),
+    );
+  }
+
+  /**
+   * `GET /admin/customers/{customerId}` — one customer in the store. Increment 52.
+   *
+   * The single-subject counterpart of the list above, and it publishes the SAME seven fields
+   * through the SAME mapper, so list and detail cannot drift into describing a customer
+   * differently.
+   *
+   * **Read-only, and deliberately narrow.** No order history here — that lives in the orders
+   * module, which owns the `order` table; assembling it here would make identity depend on
+   * orders and invert a dependency that already runs the other way. No activation, no
+   * deactivation, no editing.
+   *
+   * Store-scoped from the verified staff token. `customerId` names WHICH customer, never which
+   * store — there is no store parameter anywhere on this route.
+   *
+   * Failure modes: `400` for a malformed UUID; `401` unauthenticated; `403` without the
+   * `staff` scope; `404` for an unknown customer, another store's customer, and a soft-deleted
+   * one — all three indistinguishable, because the repository returns nothing for each.
+   *
+   * ### Route shape
+   *
+   * Three segments, where the list is two and the order history is four, so none of the three
+   * can match another. This router is mounted FIRST, so a future LITERAL under
+   * `/admin/customers/` — an export, say — would be swallowed by this `:customerId` and die on
+   * the UUID check. `orders.routes.ts` documents the `next('router')` remedy for exactly that;
+   * no literal exists today, so none is applied here.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/customers/:customerId',
+      auth,
+      requireStaff,
+      validate({ params: CustomerIdParamsSchema }),
+      asyncHandler(async (req, res) => {
+        const customer = await identity.getStoreCustomer({
+          storeId: requireUser(req).storeId,
+          customerId: validatedParams<CustomerIdParams>(req).customerId,
+        });
+
+        res.status(200).json({ customer: toAdminCustomerResponse(customer) });
+      }),
+    );
+  }
+
+  /**
+   * `POST /admin/customers/{customerId}/activation` — enable or disable an account.
+   * Increment 62.
+   *
+   * A noun, not two verb routes, because the operation is "set this state" and a single
+   * endpoint cannot be called in the wrong direction by a client that guessed the path. The
+   * body carries the target state; the service refuses a redundant change with `409` so the
+   * audit trail records decisions rather than repeated clicks.
+   *
+   * **This is not a privilege route.** `isStaff` and `isSuperuser` cannot be reached from the
+   * body — `strictObject` rejects them — nor written by the repository method behind it.
+   *
+   * Failure modes: `400` for an unknown or malformed field; `401` unauthenticated; `403`
+   * without the `staff` scope; `404` for an unknown, foreign or soft-deleted customer; `409`
+   * when the account is already in the requested state.
+   */
+  if (requireStaff) {
+    router.post(
+      '/admin/customers/:customerId/activation',
+      auth,
+      requireStaff,
+      validate({ params: CustomerIdParamsSchema, body: SetCustomerActiveRequestSchema }),
+      asyncHandler(async (req, res) => {
+        const user = requireUser(req);
+        const customer = await identity.setCustomerActive({
+          storeId: user.storeId,
+          customerId: validatedParams<CustomerIdParams>(req).customerId,
+          isActive: validatedBody<SetCustomerActiveRequest>(req).isActive,
+          actor: { type: 'staff', userId: user.id },
+        });
+
+        res.status(200).json({ customer: toAdminCustomerResponse(customer) });
+      }),
+    );
+  }
+
+  /**
+   * `GET /admin/audit-logs` — the store's audit trail. Increment 62.
+   *
+   * The first READER `audit_log` has ever had. The table has been append-only since Increment 8
+   * and stays that way: there is no write, update or delete on this path, and none anywhere in
+   * this module.
+   *
+   * **Store-scoped by equality, which matters more here than usual.** `audit_log.store_id` is
+   * nullable — platform-level entries carry none — so an `OR IS NULL` would hand a tenant's
+   * admin the platform's trail. The predicate is a plain equality and NULL satisfies none.
+   *
+   * `metadata` is not published; see the DTO for why. Newest first, with `id` breaking the tie
+   * within a transaction that wrote several entries at one instant.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/audit-logs',
+      auth,
+      requireStaff,
+      validate({ query: AdminAuditLogQuerySchema }),
+      asyncHandler(async (req, res) => {
+        const query = validatedQuery<AdminAuditLogQuery>(req);
+
+        const page = await identity.listStoreAuditLog({
+          storeId: requireUser(req).storeId,
+          limit: query.limit,
+          offset: query.offset,
+          ...(query.action === undefined ? {} : { action: query.action }),
+          ...(query.actorType === undefined ? {} : { actorType: query.actorType }),
+          ...(query.actorUserId === undefined ? {} : { actorUserId: query.actorUserId }),
+          ...(query.resourceType === undefined ? {} : { resourceType: query.resourceType }),
+          ...(query.resourceId === undefined ? {} : { resourceId: query.resourceId }),
+          /* Parsed at the adapter boundary, exactly as every other list route does it. */
+          ...(query.from === undefined ? {} : { from: new Date(query.from) }),
+          ...(query.to === undefined ? {} : { to: new Date(query.to) }),
+        });
+
+        res.status(200).json({
+          auditLogs: page.items.map(toAuditLogEntryResponse),
+          pagination: { limit: page.limit, offset: page.offset, total: page.total },
+        });
+      }),
+    );
+  }
+
+  /**
+   * `GET /admin/customers/{customerId}/sessions` — one customer's refresh sessions.
+   * Increment 63.
+   *
+   * **No token material is reachable from here.** The repository projection does not select
+   * `token_hash`, so there is no value in scope for a response mapper to leak.
+   *
+   * Store-scoped from the verified staff token, and the customer is resolved before the
+   * sessions are read — so an unknown or foreign id is a `404` rather than an empty list that
+   * an operator could not distinguish from "this customer has never signed in".
+   *
+   * Newest first, with the UUIDv7 id breaking ties within one instant.
+   */
+  if (requireStaff) {
+    router.get(
+      '/admin/customers/:customerId/sessions',
+      auth,
+      requireStaff,
+      validate({ params: CustomerIdParamsSchema, query: AdminSessionsQuerySchema }),
+      asyncHandler(async (req, res) => {
+        const query = validatedQuery<AdminSessionsQuery>(req);
+        const page = await identity.listCustomerSessions({
+          storeId: requireUser(req).storeId,
+          customerId: validatedParams<CustomerIdParams>(req).customerId,
+          limit: query.limit,
+          offset: query.offset,
+        });
+
+        /* One instant for the whole page, so two rows cannot disagree about "now". */
+        const now = new Date();
+        res.status(200).json({
+          sessions: page.items.map((session) => toAdminSessionResponse(session, now)),
+          pagination: { limit: page.limit, offset: page.offset, total: page.total },
+        });
+      }),
+    );
+  }
+
+  /**
+   * `DELETE /admin/customers/{customerId}/sessions/{sessionId}` — revoke one session.
+   * Increment 63.
+   *
+   * Revokes the session's whole FAMILY. A refresh token rotates on every use, so one sign-in is
+   * a chain of rows sharing a `family_id`; cutting only the named row would leave its successor
+   * live and the session still usable, which is the opposite of what an operator means.
+   *
+   * `204`, with no body. `404` for an unknown session, another customer's, another tenant's,
+   * and one already revoked — all four indistinguishable, because distinguishing them would
+   * make the endpoint an oracle for which session ids exist.
+   *
+   * Audited as `customer.session_revoked`, with the session id and the number of rows cut.
+   * Never the token hash.
+   */
+  if (requireStaff) {
+    router.delete(
+      '/admin/customers/:customerId/sessions/:sessionId',
+      auth,
+      requireStaff,
+      validate({ params: AdminSessionParamsSchema }),
+      asyncHandler(async (req, res) => {
+        const params = validatedParams<AdminSessionParams>(req);
+        const user = requireUser(req);
+
+        await identity.revokeCustomerSession({
+          storeId: user.storeId,
+          customerId: params.customerId,
+          sessionId: params.sessionId,
+          actor: { type: 'staff', userId: user.id },
+        });
+
+        res.status(204).send();
+      }),
+    );
+  }
+
   return router;
+}
+
+/**
+ * The validated query, as the repository's filter shape.
+ *
+ * Instants are parsed here rather than in the schema so the DTO stays a description of the WIRE
+ * — strings in, strings out — and the `Date` conversion happens once, at the adapter boundary.
+ *
+ * Built key by key with `exactOptionalPropertyTypes` in mind: an absent filter must be an absent
+ * KEY, not a key holding `undefined`, or the repository would build a predicate against it —
+ * and for `isActive` that would silently filter to deactivated accounts.
+ */
+function adminCustomerFilters(query: AdminListCustomersQuery): AdminCustomerFilters {
+  return {
+    ...(query.isActive === undefined ? {} : { isActive: query.isActive }),
+    ...(query.q === undefined ? {} : { q: query.q }),
+    ...(query.createdFrom === undefined ? {} : { createdFrom: new Date(query.createdFrom) }),
+    ...(query.createdTo === undefined ? {} : { createdTo: new Date(query.createdTo) }),
+  };
 }

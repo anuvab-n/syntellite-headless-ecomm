@@ -8,8 +8,8 @@ import { idempotencyKey } from '../../src/db/schema/idempotency.js';
 import { stockItem, stockLedger } from '../../src/db/schema/inventory.js';
 import { order, orderStatusHistory } from '../../src/db/schema/orders.js';
 import { outboxEvent } from '../../src/db/schema/outbox.js';
-import { paymentEvent } from '../../src/db/schema/payments.js';
-import { returnEvent } from '../../src/db/schema/returns.js';
+import { payment, paymentEvent } from '../../src/db/schema/payments.js';
+import { returnEvent, returnRequest } from '../../src/db/schema/returns.js';
 import { shipmentEvent } from '../../src/db/schema/shipments.js';
 import { newId } from '../../src/shared/id.js';
 import {
@@ -170,7 +170,7 @@ describe('DB integrity audit (customer + admin lifecycle)', () => {
       .where(
         and(
           eq(outboxEvent.storeId, storeId),
-          eq(outboxEvent.aggregateType, 'user'),
+          eq(outboxEvent.aggregateType, 'app_user'),
           eq(outboxEvent.aggregateId, customerUserId),
         ),
       );
@@ -189,10 +189,22 @@ describe('DB integrity audit (customer + admin lifecycle)', () => {
         .send({ slug, name: 'Audit Tee', status: 'active' }),
     );
 
+    /*
+     * Filtered by ACTION, not just by actor. The admin account is itself an `app_user` and
+     * carries its own `auth.registered` row — audited as `customer`, because a signup is a
+     * self-service act whoever performs it. An unfiltered query ordered by nothing returns
+     * that row first and asserts the wrong entry.
+     */
     const [productAudit] = await db()
       .select()
       .from(auditLog)
-      .where(and(eq(auditLog.storeId, storeId), eq(auditLog.actorUserId, adminUserId)));
+      .where(
+        and(
+          eq(auditLog.storeId, storeId),
+          eq(auditLog.actorUserId, adminUserId),
+          eq(auditLog.action, 'product.created'),
+        ),
+      );
     expect(productAudit).toBeDefined();
     expect(productAudit?.actorType).toBe('staff');
 
@@ -342,13 +354,22 @@ describe('DB integrity audit (customer + admin lifecycle)', () => {
         .set(asCustomer())
         .set('idempotency-key', `audit-pay-${newId()}`)
         .send({ method: 'cod' }),
-    ) as { payment: { id: string; status: string } };
+    ) as { payment: { status: string } };
     expect(pay.payment.status).toBe('pending');
+
+    /*
+     * The payment id comes from the DATABASE, not the response. `PaymentResponse` deliberately
+     * publishes no `id` — a payment is addressed by its order number everywhere in the API —
+     * so reading `pay.payment.id` yields `undefined` and the event query silently matches
+     * nothing.
+     */
+    const [paymentRow] = await db().select().from(payment).where(eq(payment.orderId, orderId));
+    expect(paymentRow).toBeDefined();
 
     const events = await db()
       .select()
       .from(paymentEvent)
-      .where(eq(paymentEvent.paymentId, pay.payment.id))
+      .where(eq(paymentEvent.paymentId, paymentRow!.id))
       .orderBy(paymentEvent.createdAt);
     expect(events.map((e) => [e.fromStatus, e.toStatus])).toEqual([[null, 'pending']]);
 
@@ -359,7 +380,7 @@ describe('DB integrity audit (customer + admin lifecycle)', () => {
         and(
           eq(auditLog.storeId, storeId),
           eq(auditLog.resourceType, 'payment'),
-          eq(auditLog.resourceId, pay.payment.id),
+          eq(auditLog.resourceId, paymentRow!.id),
         ),
       );
     expect(initiatedAudit).toBeDefined();
@@ -409,8 +430,24 @@ describe('DB integrity audit (customer + admin lifecycle)', () => {
         .set(asCustomer())
         .set('idempotency-key', `audit-ret-${newId()}`)
         .send({ reason: 'defective', lines: [{ skuCode, quantity: 1 }] }),
-    ) as { return: { id: string; returnNumber: string } };
-    returnId = created.return.id;
+    ) as { return: { returnNumber: string } };
+
+    /*
+     * Resolved from the DATABASE, for the reason the payment id is: `ReturnResponse` publishes
+     * no `id` — a return is addressed by its `returnNumber` — so the response field read here
+     * before was `undefined`.
+     */
+    const [returnRow] = await db()
+      .select()
+      .from(returnRequest)
+      .where(
+        and(
+          eq(returnRequest.storeId, storeId),
+          eq(returnRequest.returnNumber, created.return.returnNumber),
+        ),
+      );
+    expect(returnRow).toBeDefined();
+    returnId = returnRow!.id;
 
     capture(
       await api()

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
-import { boundedIntParam } from '../../shared/pagination.js';
-import type { ShipmentRecord } from './fulfilment.repository.js';
+import { boundedIntParam, type PaginationResponse } from '../../shared/pagination.js';
+import { SHIPMENT_STATUSES, type ShipmentRecord } from './fulfilment.repository.js';
 
 /**
  * Fulfilment request and response shapes.
@@ -221,3 +221,148 @@ export type FulfilmentQueueRow = {
   readonly postalCode: string;
   readonly shipmentStatus: string | null;
 };
+
+/* ── GET /admin/shipments ────────────────────────────────────────────────── */
+
+/** Page size for the staff shipment list, matching the other admin lists. */
+export const ADMIN_SHIPMENT_LIST_DEFAULT_LIMIT = 25;
+export const ADMIN_SHIPMENT_LIST_MAX_LIMIT = 100;
+
+/**
+ * The staff shipment list's query string.
+ *
+ * `strictObject`, so an unknown parameter is a `400` naming it rather than a filter silently
+ * ignored — the failure mode where an operator trusts a page that was never narrowed.
+ *
+ * **`storeId` is not here and never will be.** Tenancy comes from the verified staff token, and
+ * because this object is strict, sending one is a `400` rather than an ignored key.
+ *
+ * **No date filters.** None was asked for, and adding one would pull in the millisecond-versus-
+ * microsecond bound question the order and payment lists had to answer. If one is ever added it
+ * must reuse `exclusiveEndOfMillisecond` rather than introduce a second reading of "inclusive".
+ */
+export const AdminListShipmentsQuerySchema = z.strictObject({
+  limit: boundedIntParam({
+    min: 1,
+    max: ADMIN_SHIPMENT_LIST_MAX_LIMIT,
+    default: ADMIN_SHIPMENT_LIST_DEFAULT_LIMIT,
+  }),
+  offset: boundedIntParam({ min: 0, default: 0 }),
+
+  status: z.enum(SHIPMENT_STATUSES).optional(),
+
+  /**
+   * An EXACT order number, not a search.
+   *
+   * The same pattern the orders module validates, so a malformed number is a `400` rather than a
+   * query that can only ever miss. `uq_shipment_order` means this selects at most one shipment.
+   */
+  orderNumber: z
+    .string()
+    .trim()
+    .max(64)
+    .regex(/^ORD-\d{8}-[A-Z2-9]{6}$/, 'must be an order number of the form ORD-YYYYMMDD-XXXXXX')
+    .optional(),
+});
+
+export type AdminListShipmentsQuery = z.infer<typeof AdminListShipmentsQuerySchema>;
+
+/**
+ * One row of the staff shipment list.
+ *
+ * `StaffShipmentResponse` plus the order number, which is how staff address an order everywhere
+ * else — a shipment list that could only name internal ids would be unusable.
+ *
+ * **Extended, not modified.** `toStaffShipmentResponse` is shared with
+ * `GET /admin/orders/{orderNumber}/shipments` and the transition routes; changing it would change
+ * their published contract, so this composes on top of it instead.
+ *
+ * `storeId` and `orderId` are absent, as they are from every response in this module: tenancy is
+ * an invariant of the query, and an order is addressed by its number.
+ */
+export type AdminShipmentResponse = StaffShipmentResponse & {
+  readonly orderNumber: string;
+};
+
+export function toAdminShipmentResponse(
+  row: ShipmentRecord & { orderNumber: string },
+): AdminShipmentResponse {
+  return { ...toStaffShipmentResponse(row), orderNumber: row.orderNumber };
+}
+
+export type AdminShipmentListResponse = {
+  shipments: AdminShipmentResponse[];
+  pagination: PaginationResponse;
+};
+
+export function toAdminShipmentListResponse(page: {
+  items: readonly (ShipmentRecord & { orderNumber: string })[];
+  total: number;
+  limit: number;
+  offset: number;
+}): AdminShipmentListResponse {
+  return {
+    shipments: page.items.map(toAdminShipmentResponse),
+    pagination: { limit: page.limit, offset: page.offset, total: page.total },
+  };
+}
+
+/* ── GET /admin/shipments/{id} ───────────────────────────────────────────── */
+
+/**
+ * One transition in a shipment's history.
+ *
+ * `actorType` rather than an actor id: the timeline needs to say a STAFF member acted, not name
+ * a colleague on a screen that exists to explain a parcel. `note` is the free text a staff member
+ * typed at the transition, and is already staff-only — no customer route returns it.
+ */
+export type ShipmentEventResponse = {
+  readonly fromStatus: string | null;
+  readonly toStatus: string;
+  readonly actorType: string;
+  readonly note: string | null;
+  readonly occurredAt: string;
+};
+
+export function toShipmentEventResponse(event: {
+  fromStatus: string | null;
+  toStatus: string;
+  actorType: string;
+  note: string | null;
+  createdAt: Date;
+}): ShipmentEventResponse {
+  return {
+    fromStatus: event.fromStatus,
+    toStatus: event.toStatus,
+    actorType: event.actorType,
+    note: event.note,
+    occurredAt: event.createdAt.toISOString(),
+  };
+}
+
+/**
+ * One shipment with its transition history.
+ *
+ * The list row plus `history`, oldest first — the detail is where a timeline belongs, and putting
+ * it on the list would mean a page of 100 shipments carrying every transition any of them ever
+ * made, to render a table that shows none of them.
+ */
+export type AdminShipmentDetailResponse = AdminShipmentResponse & {
+  readonly history: ShipmentEventResponse[];
+};
+
+export function toAdminShipmentDetailResponse(view: {
+  shipment: ShipmentRecord & { orderNumber: string };
+  events: readonly {
+    fromStatus: string | null;
+    toStatus: string;
+    actorType: string;
+    note: string | null;
+    createdAt: Date;
+  }[];
+}): AdminShipmentDetailResponse {
+  return {
+    ...toAdminShipmentResponse(view.shipment),
+    history: view.events.map(toShipmentEventResponse),
+  };
+}
