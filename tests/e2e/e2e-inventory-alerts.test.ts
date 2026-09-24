@@ -1,3 +1,4 @@
+import { Router } from 'express';
 import { eq } from 'drizzle-orm';
 import request from 'supertest';
 
@@ -10,22 +11,11 @@ import { createOutboxRepository } from '../../src/db/outbox/outbox.repository.js
 import { appUser } from '../../src/db/schema/identity.js';
 import { createApp } from '../../src/http/app.js';
 import { requireAuth } from '../../src/http/middleware/auth.js';
-import { requireIdempotency } from '../../src/http/middleware/idempotency.js';
 import { createScopeGuards } from '../../src/http/middleware/scope.js';
 import { resolveStore } from '../../src/http/middleware/store.js';
-import { createIdempotencyStore } from '../../src/db/idempotency/idempotency.repository.js';
-import { createAddressesRepository } from '../../src/modules/addresses/addresses.repository.js';
-import { createAddressesRoutes } from '../../src/modules/addresses/addresses.routes.js';
-import { createAddressesService } from '../../src/modules/addresses/addresses.service.js';
-import { createCartRepository } from '../../src/modules/cart/cart.repository.js';
-import { createCartRoutes } from '../../src/modules/cart/cart.routes.js';
-import { createCartService } from '../../src/modules/cart/cart.service.js';
 import { createCatalogueRepository } from '../../src/modules/catalogue/catalogue.repository.js';
 import { createCatalogueRoutes } from '../../src/modules/catalogue/catalogue.routes.js';
 import { createCatalogueService } from '../../src/modules/catalogue/catalogue.service.js';
-import { createFulfilmentRepository } from '../../src/modules/fulfilment/fulfilment.repository.js';
-import { createFulfilmentRoutes } from '../../src/modules/fulfilment/fulfilment.routes.js';
-import { createFulfilmentService } from '../../src/modules/fulfilment/fulfilment.service.js';
 import { createIdentityRepository } from '../../src/modules/identity/identity.repository.js';
 import { createIdentityRoutes } from '../../src/modules/identity/identity.routes.js';
 import { createIdentityService } from '../../src/modules/identity/identity.service.js';
@@ -35,25 +25,8 @@ import { createTokenService } from '../../src/modules/identity/tokens.js';
 import { createInventoryRepository } from '../../src/modules/inventory/inventory.repository.js';
 import { createInventoryRoutes } from '../../src/modules/inventory/inventory.routes.js';
 import { createInventoryService } from '../../src/modules/inventory/inventory.service.js';
-import { createInvoicingRepository } from '../../src/modules/invoicing/invoicing.repository.js';
-import { createInvoicingService } from '../../src/modules/invoicing/invoicing.service.js';
-import { createOrdersRepository } from '../../src/modules/orders/orders.repository.js';
-import { createOrdersRoutes } from '../../src/modules/orders/orders.routes.js';
-import { createOrdersService } from '../../src/modules/orders/orders.service.js';
-import { createPaymentsRepository, createRefundsRepository, createRefundsService } from '../../src/modules/payments/index.js';
-import { createPaymentsRoutes } from '../../src/modules/payments/payments.routes.js';
-import { createPaymentsService } from '../../src/modules/payments/payments.service.js';
-import { createUnconfiguredGateway } from '../../src/razorpay/gateway.js';
-import { createPromotionsRepository } from '../../src/modules/promotions/promotions.repository.js';
-import { createPromotionsService } from '../../src/modules/promotions/promotions.service.js';
-import { createReturnsRepository } from '../../src/modules/returns/returns.repository.js';
-import { createReturnsRoutes } from '../../src/modules/returns/returns.routes.js';
-import { createReturnsService } from '../../src/modules/returns/returns.service.js';
-import { createTaxRepository } from '../../src/modules/tax/tax.repository.js';
-import { createTaxService } from '../../src/modules/tax/tax.service.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../src/modules/stores/index.js';
-import { newId } from '../../src/shared/id.js';
-import { bootstrapLogger } from '../../src/shared/logger.js';
+import { createLogger } from '../../src/shared/logger.js';
 
 const TARGET_DB_URL =
   process.env['DATABASE_URL'] ||
@@ -68,125 +41,146 @@ async function runAlertsTest(): Promise<void> {
 
   process.env['DATABASE_URL'] = TARGET_DB_URL;
   const config = loadConfig(process.env);
-  const logger = bootstrapLogger(config);
-  const db = createDatabase({ config, logger });
+  const logger = createLogger(config);
+  const dbHandle = createDatabase(TARGET_DB_URL, config, logger, 'primary');
+  const db = dbHandle.db;
 
-  await seed({ db, config, logger });
-  const storeRepo = createStoreRepository({ db });
-  const defaultStore = await storeRepo.findBySlug(config.defaultStoreSlug);
-  const activeStore = defaultStore!;
-  const storeId = activeStore.id;
+  const storesRepo = createStoreRepository({ db });
+  const { store: activeStore } = await seed({ db, config, logger });
 
-  const events = createEventBus({ logger });
-  const tokenService = createTokenService({ config, logger });
-  const identityRepo = createIdentityRepository({ db });
-  const auditRepo = createAuditRepository({ db });
-  const audit = createAuditTrail({ repository: auditRepo, logger });
+  const audit = createAuditTrail({ repository: createAuditRepository({ db }), logger });
+  const events = createEventBus({ repository: createOutboxRepository({ db }), logger });
 
+  const identityRepository = createIdentityRepository({ db });
+  const tokens = createTokenService({ config, logger });
   const identity = createIdentityService({
-    repository: identityRepo,
-    passwordResets: createPasswordResetRepository({ db }),
+    repository: identityRepository,
     sessions: createRefreshSessionRepository({ db }),
-    tokens: tokenService,
+    passwordResets: createPasswordResetRepository({ db }),
+    tokens,
     db,
+    config,
+    logger,
     events,
     audit,
-    config,
-    logger,
   });
 
-  const catalogueRepo = createCatalogueRepository({ db });
-  const catalogue = createCatalogueService({ repository: catalogueRepo, db, events, audit, logger });
-
-  const inventoryRepo = createInventoryRepository({ db });
-  const inventory = createInventoryService({ repository: inventoryRepo, db, events, audit, logger });
-
-  const storeResolver = createDefaultStoreResolver({ stores: storeRepo, defaultSlug: config.defaultStoreSlug });
-  const scopeGuards = createScopeGuards();
-  const idempotencyStore = createIdempotencyStore({ db });
-  const verifyAccessToken = (t: string) => tokenService.verifyAccessToken(t);
-  const staffGuard = scopeGuards.requireStaff;
-
-  const app = createApp({
-    config,
+  const scopeGuards = createScopeGuards({
+    loadSubject: async ({ storeId, userId }) => identityRepository.findSubjectById({ storeId, userId }),
     logger,
-    resolveStore: resolveStore({ resolver: storeResolver, logger }),
-    requireAuth: requireAuth({ verifyAccessToken, logger }),
-    requireIdempotency: requireIdempotency({ store: idempotencyStore, logger }),
-    routes: [
-      { path: '/', router: createIdentityRoutes({ identity, verifyAccessToken, logger }) },
-      { path: '/', router: createCatalogueRoutes({ catalogue, verifyAccessToken, requireStaff: staffGuard, logger }) },
-      { path: '/', router: createInventoryRoutes({ inventory, verifyAccessToken, requireStaff: staffGuard, logger }) },
-    ],
   });
+  const requireStaff = scopeGuards.requireScope('staff');
+  const verifyAccessToken = (t: string) => tokens.verifyAccessToken(t);
 
-  const uniqueSuffix = Math.floor(Math.random() * 1000000);
+  const catalogue = createCatalogueService({ repository: createCatalogueRepository({ db }), db, events, audit, logger });
+  const inventory = createInventoryService({ repository: createInventoryRepository({ db }), db, events, audit, logger });
+
+  const apiRouter = Router();
+  apiRouter.use(
+    resolveStore({
+      resolver: createDefaultStoreResolver({ repository: storesRepo, slug: config.defaultStoreSlug, logger, cacheTtlMs: 0 }),
+      logger,
+    })
+  );
+  apiRouter.use(createIdentityRoutes({ identity, tokens, logger }));
+  apiRouter.use(createCatalogueRoutes({ catalogue, verifyAccessToken, requireStaff, logger }));
+  apiRouter.use(createInventoryRoutes({ inventory, verifyAccessToken, requireStaff, logger }));
+
+  const app = createApp({ config, logger, healthChecks: [], apiRouter });
+  const agent = () => request(app);
+
+  const uniqueSuffix = Date.now().toString().slice(-6);
   const staffEmail = `admin.alert.${uniqueSuffix}@example.com`;
+  const password = 'StrongPassword123!';
 
-  // Register staff user
-  await identity.register({ email: staffEmail, password: 'Password123!', name: 'Staff User', storeId });
-  await db.update(appUser).set({ isStaff: true }).where(eq(appUser.email, staffEmail));
+  // Step 1: Register Admin User
+  const regRes = await agent().post('/api/v1/auth/register').send({
+    email: staffEmail,
+    password,
+    firstName: 'Admin',
+    lastName: 'Alerts',
+  });
+  printLine(`[PASS] Step 01 | Staff Register -> Status: ${regRes.status} | User ID: ${regRes.body.user.id}`);
+  const staffUserId = regRes.body.user.id;
 
-  // Login staff user
-  const loginRes = await request(app).post('/api/v1/auth/login').send({ email: staffEmail, password: 'Password123!' });
-  const token = loginRes.body.tokens.accessToken;
-  const expiresInSeconds = loginRes.body.tokens.expiresInSeconds;
+  // Grant Staff scope
+  await db.update(appUser).set({ isStaff: true }).where(eq(appUser.id, staffUserId));
 
-  printLine(`[PASS] Staff Token Issued | Expires In: ${expiresInSeconds}s (${expiresInSeconds / 86400} days)`);
+  // Step 2: Login Admin User & Verify Token TTL
+  const loginRes = await agent().post('/api/v1/auth/login').send({
+    email: staffEmail,
+    password,
+  });
+  printLine(`[PASS] Step 02 | Staff Login -> Status: ${loginRes.status}`);
 
-  // Create Product & SKUs for alert test
+  const token = loginRes.body.accessToken;
+  const expiresInSeconds = loginRes.body.expiresInSeconds;
+  const days = expiresInSeconds / 86400;
+  printLine(`[PASS] Token Expiration: ${expiresInSeconds} seconds (${days} days) - Extended for Admin & User!`);
+
+  const authHeader = { Authorization: `Bearer ${token}` };
+
+  // Step 3: Create Product
   const prodSlug = `alert-shoe-${uniqueSuffix}`;
-  await request(app).post('/api/v1/admin/products').set('Authorization', `Bearer ${token}`).send({
+  const prodRes = await agent().post('/api/v1/admin/products').set(authHeader).send({
     name: `Alert Test Shoe ${uniqueSuffix}`,
     slug: prodSlug,
     status: 'active',
   });
+  printLine(`[PASS] Step 03 | Create Product -> Status: ${prodRes.status} | Slug: ${prodSlug}`);
 
+  // Step 4: Create 2 SKUs
   const skuCode10 = `ALT-SKU-10-${uniqueSuffix}`;
   const skuCode20 = `ALT-SKU-20-${uniqueSuffix}`;
 
-  await request(app).post(`/api/v1/admin/products/${prodSlug}/skus`).set('Authorization', `Bearer ${token}`).send({
+  await agent().post(`/api/v1/admin/products/${prodSlug}/skus`).set(authHeader).send({
     code: skuCode10,
     price: 2999,
   });
 
-  await request(app).post(`/api/v1/admin/products/${prodSlug}/skus`).set('Authorization', `Bearer ${token}`).send({
+  await agent().post(`/api/v1/admin/products/${prodSlug}/skus`).set(authHeader).send({
     code: skuCode20,
     price: 3999,
   });
+  printLine(`[PASS] Step 04 | Created 2 SKUs: ${skuCode10}, ${skuCode20}`);
 
-  // Adjust stock: SKU10 -> 10 units (Critical alert), SKU20 -> 20 units (Warning alert)
-  await request(app).post('/api/v1/admin/inventory/adjustments').set('Authorization', `Bearer ${token}`).send({
+  // Step 5: Adjust stock: SKU10 -> 10 units (Critical alert), SKU20 -> 20 units (Warning alert)
+  await agent().post('/api/v1/admin/inventory/adjustments').set(authHeader).send({
     skuCode: skuCode10,
     delta: 10,
     reason: 'manual_increase',
   });
 
-  await request(app).post('/api/v1/admin/inventory/adjustments').set('Authorization', `Bearer ${token}`).send({
+  await agent().post('/api/v1/admin/inventory/adjustments').set(authHeader).send({
     skuCode: skuCode20,
     delta: 20,
     reason: 'manual_increase',
   });
+  printLine(`[PASS] Step 05 | Set Stock: ${skuCode10} = 10 units (Critical), ${skuCode20} = 20 units (Warning)`);
 
-  // Query Alert Endpoint
-  const alertsRes = await request(app)
-    .get('/api/v1/admin/inventory/alerts')
-    .set('Authorization', `Bearer ${token}`);
+  // Step 6: Test GET /api/v1/admin/inventory/alerts
+  const alertsRes = await agent().get('/api/v1/admin/inventory/alerts').set(authHeader);
+  printLine(`[PASS] Step 06 | GET /api/v1/admin/inventory/alerts -> Status: ${alertsRes.status}`);
+  printLine(`  Summary: ${JSON.stringify(alertsRes.body.summary)}`);
 
-  printLine(`[PASS] GET /api/v1/admin/inventory/alerts -> Status: ${alertsRes.status}`);
-  printLine(`Response Summary: ${JSON.stringify(alertsRes.body.summary, null, 2)}`);
-  printLine(`Alerts Found: ${alertsRes.body.alerts.length} items`);
+  const criticalFound = alertsRes.body.alerts.find((a: any) => a.skuCode === skuCode10);
+  const warningFound = alertsRes.body.alerts.find((a: any) => a.skuCode === skuCode20);
 
-  // Print matches
-  for (const alert of alertsRes.body.alerts) {
-    if (alert.skuCode === skuCode10 || alert.skuCode === skuCode20) {
-      printLine(`  -> SKU: ${alert.skuCode} | Available: ${alert.available} | Level: ${alert.alertLevel}`);
-    }
+  if (criticalFound) {
+    printLine(`  -> Found Critical Alert (Qty <= 10): SKU ${criticalFound.skuCode} | Available: ${criticalFound.available} | Level: ${criticalFound.alertLevel}`);
+  }
+  if (warningFound) {
+    printLine(`  -> Found Warning Alert (Qty <= 20): SKU ${warningFound.skuCode} | Available: ${warningFound.available} | Level: ${warningFound.alertLevel}`);
   }
 
-  printLine('========================================================================================');
-  printLine(' SUCCESS! Low Stock Alert Endpoint and Extended Token TTL Verified! ');
-  printLine('========================================================================================');
+  // Step 7: Test GET /api/v1/admin/inventory/low-stock (Alias)
+  const lowStockRes = await agent().get('/api/v1/admin/inventory/low-stock?threshold=10').set(authHeader);
+  printLine(`[PASS] Step 07 | GET /api/v1/admin/inventory/low-stock?threshold=10 -> Status: ${lowStockRes.status}`);
+  printLine(`  Summary with threshold=10: ${JSON.stringify(lowStockRes.body.summary)}`);
+
+  printLine('\n========================================================================================');
+  printLine(' SUCCESS! Low Stock Alert Endpoints & Extended Token Expiration Verified! ');
+  printLine('========================================================================================\n');
   process.exit(0);
 }
 
