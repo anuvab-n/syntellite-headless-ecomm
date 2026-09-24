@@ -21,6 +21,7 @@ import { createScopeGuards } from './http/middleware/scope.js';
 import { resolveStore } from './http/middleware/store.js';
 import { postgresCheck, redisCheck, type HealthCheck } from './http/routes/health.js';
 import { waitForRedisReady } from './redis/ready.js';
+import { createInMemoryRateLimiter } from './redis/in-memory-rate-limiter.js';
 import {
   createRateLimiter,
   hashRateLimitSubject,
@@ -217,8 +218,15 @@ export type AppContainer = {
    * Must run `noeviction` in production. Losing a key here is not a cache miss — it is a
    * duplicate charge, which is why the readiness probe treats it as required and the
    * degradation policy fails closed on it.
+   *
+   * **`undefined` when `REDIS_LOCK_URL` is unset**, which `config.ts` permits outside
+   * production only. In that mode nothing here connects to Redis at all: rate limiting runs
+   * in process memory and the scheduler assumes leadership locally. The field is left in
+   * the shape rather than hidden behind a flag so that every consumer has to acknowledge
+   * the absence at the type level — a `Redis` that silently pointed at nothing would fail
+   * at the first command instead of at compile time.
    */
-  locks: Redis;
+  locks: Redis | undefined;
   outbox: OutboxSubsystem;
   /**
    * The idempotency key store.
@@ -421,13 +429,25 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * it would also make the readiness probe report on a dependency no code path uses.
    * Phase 1 adds it alongside the first selector that caches.
    */
-  const locks = new Redis(config.redisLockUrl, LOCK_CLIENT_OPTIONS);
+  /**
+   * Built only when a URL is configured.
+   *
+   * An unset `REDIS_LOCK_URL` is Redis-free mode, not a misconfiguration — `config.ts`
+   * decides whether that is allowed (it is not, in production) so the decision is not
+   * re-litigated here. Constructing a client against a placeholder URL instead would be
+   * worse than useless: ioredis would retry a connection that is never coming, and every
+   * readiness probe would report a dependency the deployment does not have.
+   */
+  const locks =
+    config.redisLockUrl !== undefined
+      ? new Redis(config.redisLockUrl, LOCK_CLIENT_OPTIONS)
+      : undefined;
 
   /**
    * Required: an unhandled 'error' event on an ioredis client is an unhandled exception and
    * takes the process down. A Redis outage must degrade readiness, not kill the API.
    */
-  locks.on('error', (err) => {
+  locks?.on('error', (err) => {
     logger.error({ err, client: 'locks' }, 'redis_client_error');
   });
 
@@ -496,7 +516,9 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      * only its default.
      */
     transport: opts.transport ?? 'in-process',
-    redisUrl: config.redisQueueUrl,
+    // Conditional because `exactOptionalPropertyTypes` rejects an explicit `undefined` for an
+    // optional field. Only the 'queue' transport reads it, and that is not the default.
+    ...(config.redisQueueUrl !== undefined ? { redisUrl: config.redisQueueUrl } : {}),
     runWorkers: opts.role === 'worker',
     ...(opts.drainer ? { drainer: opts.drainer } : {}),
     ...(opts.queueRoutes ? { queueRoutes: opts.queueRoutes } : {}),
@@ -556,7 +578,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * a terminal state ('end') or genuinely cannot connect, 'ready' never fires and the route's
    * timeout produces the 503 — which is the right answer either way.
    */
-  async function pingLocks(): Promise<void> {
+  async function pingLocks(client: Redis): Promise<void> {
     /**
      * Bounded wait, not `events.once(locks, 'ready')`.
      *
@@ -566,18 +588,26 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      * against a merely-unreachable client (ioredis emits 'error' per reconnect, which
      * rejects it), which is what kept the leak hidden in the common case.
      */
-    await waitForRedisReady(locks, READINESS_WAIT_MS);
+    await waitForRedisReady(client, READINESS_WAIT_MS);
     // Annotated as `string`, not inferred: ioredis types `ping()` as returning the literal
     // 'PONG', so the comparison below narrows the value to `never` and the template
     // literal becomes untypeable. Widening keeps the guard meaningful at runtime, which is
     // where an unexpected reply would actually show up.
-    const reply: string = await locks.ping();
+    const reply: string = await client.ping();
     if (reply !== 'PONG') throw new Error(`unexpected PING reply: ${reply}`);
   }
 
+  /**
+   * The Redis probe is OMITTED, not faked, when there is no Redis.
+   *
+   * A check hard-coded to pass would make `/health/ready` assert something false, and the
+   * whole value of a readiness endpoint is that its answer can be trusted during an
+   * incident. Reporting only on dependencies that exist keeps it honest: with no Redis
+   * configured, Postgres is genuinely the only thing this process needs to serve traffic.
+   */
   const healthChecks: readonly HealthCheck[] = [
     postgresCheck(() => checkDatabase(db)),
-    redisCheck(pingLocks),
+    ...(locks !== undefined ? [redisCheck(() => pingLocks(locks))] : []),
   ];
 
   /* ── 8. Domain modules ───────────────────────────────────────────────── */
@@ -638,7 +668,10 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * a command issued while disconnected throws immediately instead of queueing up requests
    * behind a dead socket, which is what makes failing closed fast rather than slow.
    */
-  const rateLimiter = createRateLimiter({ redis: locks, logger });
+  const rateLimiter =
+    locks !== undefined
+      ? createRateLimiter({ redis: locks, logger })
+      : createInMemoryRateLimiter({ logger });
 
   const ipPolicy: RateLimitPolicy = {
     max: config.authRateLimitIpMax,
@@ -1630,7 +1663,9 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
         logger.error({ err }, 'outbox_shutdown_failed');
       });
 
-      await locks.quit().catch((err: unknown) => {
+      // `?.` rather than a branch: with no Redis client there is simply nothing to close,
+      // and the remaining steps must run exactly as they otherwise would.
+      await locks?.quit().catch((err: unknown) => {
         // `quit()` rejects if the connection is already gone, which is not a failure worth
         // reporting loudly during shutdown.
         logger.debug({ err }, 'locks_quit_failed');

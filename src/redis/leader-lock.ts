@@ -233,3 +233,60 @@ export function createLeaderLock(opts: LeaderLockOptions): LeaderLock {
     },
   };
 }
+
+/**
+ * A leader lock for a deployment with no Redis: this instance is always the leader.
+ *
+ * Selected when `REDIS_LOCK_URL` is unset, which `config.ts` allows outside production and
+ * refuses inside it. The refusal is the whole safety argument, so it is worth stating
+ * plainly: **this enforces nothing.** It is a token that always says yes. With one process
+ * that is precisely correct — there is no second instance to exclude, and the Redis lock's
+ * answer would be the same `true` after a round trip. With two, both would lead, and the
+ * duplicated reservation sweeps and doubled abandoned-cart emails that `createLeaderLock`
+ * exists to prevent would happen exactly as described above.
+ *
+ * Why this rather than skipping the scheduler entirely when Redis is absent: the scheduler
+ * is where the payment-expiry sweep runs, and a developer whose sweeps silently never fire
+ * debugs the sweeper instead of their configuration. Running it, on the same code path as
+ * production, with the difference logged, is the honest trade.
+ *
+ * It takes no TTL and starts no renewal timer. Leadership that cannot be lost has nothing
+ * to renew, and a timer here would be ceremony imitating the real lock rather than doing
+ * anything.
+ */
+export function createInProcessLeaderLock(opts: {
+  logger: Logger;
+  /** Namespaced key. Carried for logging only — nothing is keyed by it. */
+  key: string;
+}): LeaderLock {
+  const { logger, key } = opts;
+  const token = randomUUID();
+  let leader = false;
+
+  return {
+    token,
+    isLeader: () => leader,
+
+    tryAcquire() {
+      if (!leader) {
+        leader = true;
+        // Warn, not info. This is a real reduction in a guarantee the surrounding code
+        // documents at length, and it should be visible in a log without being looked for.
+        logger.warn(
+          { key, token },
+          'leadership_assumed_in_process: no REDIS_LOCK_URL, so singleton scheduling is ' +
+            'NOT enforced. Safe for a single instance only.',
+        );
+      }
+      return Promise.resolve(true);
+    },
+
+    release() {
+      if (leader) {
+        leader = false;
+        logger.info({ key, token }, 'leadership_released');
+      }
+      return Promise.resolve();
+    },
+  };
+}

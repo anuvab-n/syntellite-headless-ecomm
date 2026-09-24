@@ -99,9 +99,23 @@ const ConfigSchema = z
     databaseStatementTimeoutMs: z.coerce.number().int().positive().default(30_000),
 
     /* ── Redis ─────────────────────────────────────────────────────────── */
-    redisCacheUrl: z.string().url(),
-    redisLockUrl: z.string().url(),
-    redisQueueUrl: z.string().url(),
+    /**
+     * All three are OPTIONAL, and each absence means something specific.
+     *
+     * Omitting `REDIS_LOCK_URL` puts the process in Redis-free mode: the container builds no
+     * Redis client, rate limiting runs in-process, the readiness probe stops reporting on a
+     * dependency that is not there, and the scheduler holds an in-process leadership token
+     * instead of a distributed one. That trade is sound for exactly one deployment shape —
+     * a single instance — which is what local development is, and it is why the production
+     * guard below still demands all three. A second replica without Redis would run every
+     * scheduled task twice and give each instance its own private rate-limit budget.
+     *
+     * `REDIS_QUEUE_URL` is needed only by `transport: 'queue'`, which is not the default;
+     * `REDIS_CACHE_URL` has no consumer yet.
+     */
+    redisCacheUrl: z.string().url().optional(),
+    redisLockUrl: z.string().url().optional(),
+    redisQueueUrl: z.string().url().optional(),
 
     /* ── Auth ──────────────────────────────────────────────────────────── */
     jwtPrivateKey: privateKeyPem,
@@ -275,14 +289,30 @@ const ConfigSchema = z
     if (!cfg.sentryDsn) {
       issue('error reporting is required in production', 'SENTRY_DSN');
     }
+    /**
+     * Redis is OPTIONAL in development and MANDATORY here.
+     *
+     * The Redis-free mode the schema above allows is safe only on a single instance. In
+     * production there is more than one, and without a shared Redis each replica would keep
+     * its own rate-limit counters — an attacker simply spreads guesses across replicas to
+     * multiply the budget — and each scheduler would believe itself leader, running every
+     * recurring task once per replica. Both failures are silent, so they are refused at
+     * boot rather than discovered in an incident.
+     */
+    if (!cfg.redisCacheUrl) issue('is required in production', 'REDIS_CACHE_URL');
+    if (!cfg.redisLockUrl) issue('is required in production', 'REDIS_LOCK_URL');
+    if (!cfg.redisQueueUrl) issue('is required in production', 'REDIS_QUEUE_URL');
+
     // Three separate Redis endpoints, because the lock DB must run `noeviction`.
     // Sharing one means an eviction storm can drop idempotency keys or queued jobs.
-    const redis = new Set([cfg.redisCacheUrl, cfg.redisLockUrl, cfg.redisQueueUrl]);
-    if (redis.size !== 3) {
-      issue(
-        'cache, lock, and queue Redis endpoints must be distinct in production',
-        'REDIS_LOCK_URL',
-      );
+    if (cfg.redisCacheUrl && cfg.redisLockUrl && cfg.redisQueueUrl) {
+      const redis = new Set([cfg.redisCacheUrl, cfg.redisLockUrl, cfg.redisQueueUrl]);
+      if (redis.size !== 3) {
+        issue(
+          'cache, lock, and queue Redis endpoints must be distinct in production',
+          'REDIS_LOCK_URL',
+        );
+      }
     }
   });
 

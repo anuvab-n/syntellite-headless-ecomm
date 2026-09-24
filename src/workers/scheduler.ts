@@ -1,6 +1,6 @@
 import { buildContainer } from '../container.js';
 import { manageLifecycle } from '../lifecycle.js';
-import { createLeaderLock } from '../redis/leader-lock.js';
+import { createInProcessLeaderLock, createLeaderLock } from '../redis/leader-lock.js';
 
 /**
  * The scheduler process.
@@ -81,21 +81,41 @@ const TASKS: readonly ScheduledTask[] = [
   },
 ];
 
-const lock = createLeaderLock({
-  redis: container.locks,
-  logger,
-  /**
-   * One key for the whole scheduler, not one per task. Splitting per task would let two
-   * instances each lead a different subset — which is a legitimate design, but it makes
-   * "did anything run twice?" much harder to answer during an incident. One leader runs
-   * everything.
-   */
-  key: 'ecom:scheduler:leader',
-  ttlMs: LEADERSHIP_TTL_MS,
-  onLeadershipLost: (reason) => {
-    logger.warn({ reason }, 'scheduler_standing_down');
-  },
-});
+/**
+ * One key for the whole scheduler, not one per task. Splitting per task would let two
+ * instances each lead a different subset — which is a legitimate design, but it makes
+ * "did anything run twice?" much harder to answer during an incident. One leader runs
+ * everything.
+ */
+const LEADERSHIP_KEY = 'ecom:scheduler:leader';
+
+/**
+ * Distributed leadership when there is a Redis to hold it, in-process leadership when there
+ * is not.
+ *
+ * The branch is the ONLY thing that changes: everything below — the tick loop, the
+ * per-task `isLeader()` re-check, the standby behaviour, shutdown — runs identically in
+ * both modes, because both sides return the same `LeaderLock`. That is deliberate. A
+ * scheduler that took a different code path locally would be a scheduler nobody had
+ * actually exercised before deploying it.
+ *
+ * What genuinely differs is the guarantee, and it is worth being blunt: the in-process lock
+ * enforces nothing. It is correct for a single instance and wrong for two, which is why
+ * `config.ts` refuses an unset `REDIS_LOCK_URL` in production rather than leaving the
+ * choice here.
+ */
+const lock =
+  container.locks !== undefined
+    ? createLeaderLock({
+        redis: container.locks,
+        logger,
+        key: LEADERSHIP_KEY,
+        ttlMs: LEADERSHIP_TTL_MS,
+        onLeadershipLost: (reason) => {
+          logger.warn({ reason }, 'scheduler_standing_down');
+        },
+      })
+    : createInProcessLeaderLock({ logger, key: LEADERSHIP_KEY });
 
 /** Last completed run per task, so a tick can tell what is due. */
 const lastRunAt = new Map<string, number>();

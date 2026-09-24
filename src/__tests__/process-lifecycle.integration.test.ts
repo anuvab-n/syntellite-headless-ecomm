@@ -49,7 +49,16 @@ describe('process lifecycle (integration)', () => {
    * surrounding test times out, which is exactly the leak worth catching: a connected
    * socket keeps the event loop alive and the process never exits.
    */
-  async function expectRedisClosed(client: Redis): Promise<void> {
+  async function expectRedisClosed(client: Redis | undefined): Promise<void> {
+    /**
+     * Accepts `undefined` because `AppContainer.locks` is optional — a deployment with no
+     * `REDIS_LOCK_URL` builds no client. Every container here is built with one, so a
+     * missing client means the wiring broke, and asserting that is the point: skipping the
+     * check instead would let a container that silently stopped creating the client pass a
+     * test named "leaves no Redis connection connected".
+     */
+    expect(client).toBeDefined();
+    if (!client) return;
     if (client.status !== 'end') {
       await once(client, 'end');
     }

@@ -96,6 +96,57 @@ local count = tonumber(redis.call('get', KEYS[1])) or 0
 return { count, redis.call('pttl', KEYS[1]) }
 `;
 
+/**
+ * Which attempts the raw counter already includes.
+ *
+ * Getting this wrong is an off-by-one that hands out a free attempt, so it is named rather
+ * than passed as a bare boolean. See `rateLimitVerdict`.
+ */
+export type RateLimitCounting = 'includes-this-attempt' | 'prior-attempts-only';
+
+/**
+ * Turn a raw `(count, ttl)` pair into a verdict.
+ *
+ * **Module scope, exported, and shared by every `RateLimiter` implementation on purpose.**
+ * The in-process limiter in `in-memory-rate-limiter.ts` answers the same questions from a
+ * `Map` rather than from Redis, and if the two derived their own `allowed` and `remaining`
+ * they would eventually disagree — a limit that fires in production and not locally, or the
+ * reverse. Only one copy of this arithmetic can exist for that reason, exactly as
+ * `hashRateLimitSubject` exists so the middleware and the service cannot key differently.
+ *
+ * `ttlMs` follows the `PTTL` convention: negative means "no live window", so the full
+ * window is reported rather than a negative `Retry-After`, which some clients treat as
+ * "retry immediately" and others reject outright.
+ *
+ * `counting` distinguishes the two callers:
+ *
+ *  - `consume` has ALREADY incremented, so `count` includes the attempt being judged and
+ *    the limit is reached when `count > max`.
+ *  - `peek` counts only PRIOR attempts, so with `max` failures already recorded the budget
+ *    is spent and the request being judged must be refused — `count >= max`.
+ *
+ * One shared comparison cannot serve both: it would either allow `max + 1` attempts through
+ * the peek path or block the last legitimate one through consume.
+ */
+export function rateLimitVerdict(
+  count: number,
+  ttlMs: number,
+  policy: RateLimitPolicy,
+  counting: RateLimitCounting,
+): RateLimitVerdict {
+  const retryAfterSeconds = ttlMs > 0 ? Math.max(1, Math.ceil(ttlMs / 1000)) : policy.windowSeconds;
+
+  const spent = counting === 'includes-this-attempt' ? count : count + 1;
+
+  return {
+    allowed: spent <= policy.max,
+    count,
+    // Budget left AFTER this request, which is what a client should back off against.
+    remaining: Math.max(0, policy.max - spent),
+    retryAfterSeconds,
+  };
+}
+
 export function createRateLimiter(deps: {
   redis: Redis;
   logger: Logger;
@@ -108,44 +159,18 @@ export function createRateLimiter(deps: {
   const keyFor = (bucket: string, subject: string): string => `${prefix}:${bucket}:${subject}`;
 
   /**
-   * Turn a Lua `{count, pttl}` reply into a verdict.
+   * Unpack a Lua `{count, pttl}` reply and hand it to the shared verdict arithmetic.
    *
-   * `PTTL` returns -2 for a missing key and -1 for a key with no expiry. Both mean "no live
-   * window", so the full window is reported rather than a negative `Retry-After`, which some
-   * clients treat as "retry immediately" and others reject outright.
-   *
-   * `counting` distinguishes the two callers, and getting it wrong is an off-by-one that
-   * hands out a free attempt:
-   *
-   *  - `consume` has ALREADY incremented, so `count` includes the attempt being judged and
-   *    the limit is reached when `count > max`.
-   *  - `peek` counts only PRIOR attempts, so with `max` failures already recorded the budget
-   *    is spent and the request being judged must be refused — `count >= max`.
-   *
-   * One shared comparison cannot serve both: it would either allow `max + 1` attempts through
-   * the peek path or block the last legitimate one through consume.
+   * Only the unpacking lives here. The comparison itself is `rateLimitVerdict`, so the
+   * Redis and in-process limiters cannot drift apart on what "allowed" means.
    */
   function toVerdict(
     raw: unknown,
     policy: RateLimitPolicy,
-    counting: 'includes-this-attempt' | 'prior-attempts-only',
+    counting: RateLimitCounting,
   ): RateLimitVerdict {
     const [rawCount, rawTtl] = raw as [number, number];
-    const count = Number(rawCount);
-    const ttlMs = Number(rawTtl);
-
-    const retryAfterSeconds =
-      ttlMs > 0 ? Math.max(1, Math.ceil(ttlMs / 1000)) : policy.windowSeconds;
-
-    const spent = counting === 'includes-this-attempt' ? count : count + 1;
-
-    return {
-      allowed: spent <= policy.max,
-      count,
-      // Budget left AFTER this request, which is what a client should back off against.
-      remaining: Math.max(0, policy.max - spent),
-      retryAfterSeconds,
-    };
+    return rateLimitVerdict(Number(rawCount), Number(rawTtl), policy, counting);
   }
 
   /**
@@ -219,5 +244,5 @@ export function createRateLimiter(deps: {
  * collision would merely make two subjects share a budget, not bypass one.
  */
 export function hashRateLimitSubject(...parts: readonly string[]): string {
-  return createHash('sha256').update(parts.join(' '), 'utf8').digest('hex').slice(0, 32);
+  return createHash('sha256').update(parts.join(' '), 'utf8').digest('hex').slice(0, 32);
 }

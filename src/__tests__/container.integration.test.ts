@@ -1,5 +1,7 @@
 import { once } from 'node:events';
 
+import type { Redis } from 'ioredis';
+
 import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -27,6 +29,20 @@ import { newId } from '../shared/id.js';
  * which is not a property anybody cares about.
  */
 describe('composition root (integration)', () => {
+  /**
+   * The lock client, asserted present.
+   *
+   * `AppContainer.locks` is `Redis | undefined` because a deployment with no
+   * `REDIS_LOCK_URL` builds no client at all. Every container in this file is built with
+   * one, so an absence here is a wiring bug rather than a case to handle — throwing says
+   * that, where a `?.` would quietly turn it into a passing test that asserted nothing.
+   */
+  function locksOf(container: AppContainer): Redis {
+    const { locks } = container;
+    if (!locks) throw new Error('expected the container to have built a lock client');
+    return locks;
+  }
+
   let testDb: TestDatabase;
   let redis: TestRedis;
   const built: AppContainer[] = [];
@@ -413,7 +429,7 @@ describe('composition root (integration)', () => {
 
       // Close only the Redis client, leaving Postgres up. This is the closest honest
       // simulation of a Redis outage without disturbing the shared container.
-      await container.locks.quit();
+      await locksOf(container).quit();
 
       const response = await request(container.app).get('/health/ready');
 
@@ -571,7 +587,7 @@ describe('composition root (integration)', () => {
       // client to reach 'ready', whereas a raw command on a still-connecting socket throws
       // because the offline queue is disabled.
       await request(container.app).get('/health/ready');
-      expect(container.locks.status).toBe('ready');
+      expect(locksOf(container).status).toBe('ready');
 
       await container.shutdown();
 
@@ -582,10 +598,11 @@ describe('composition root (integration)', () => {
        * 'end' the test times out, which is the genuine bug worth catching: a connected
        * client keeps the event loop alive and the process never exits.
        */
-      if (container.locks.status !== 'end') {
-        await once(container.locks, 'end');
+      const locks = locksOf(container);
+      if (locks.status !== 'end') {
+        await once(locks, 'end');
       }
-      expect(container.locks.status).toBe('end');
+      expect(locks.status).toBe('end');
     }, 30_000);
 
     it('survives shutdown when a dependency is already gone', async () => {
@@ -597,7 +614,7 @@ describe('composition root (integration)', () => {
       // Close things out from under it, as an unlucky ordering during a crash would.
       // `quit()` itself can reject when the socket was never writeable, which is precisely
       // the "already gone" state being simulated.
-      await container.locks.quit().catch(() => undefined);
+      await locksOf(container).quit().catch(() => undefined);
       await container.db.close();
 
       // Shutdown must still complete: one resource failing to close must not abandon the
