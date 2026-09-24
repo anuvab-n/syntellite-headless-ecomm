@@ -121,6 +121,19 @@ export const ListInventoryQuerySchema = PaginatedInventoryQuerySchema.extend({
 
 export type ListInventoryQuery = z.infer<typeof ListInventoryQuerySchema>;
 
+/* ── GET /admin/inventory/alerts ─────────────────────────────────────────── */
+
+export const ListAlertsQuerySchema = z.strictObject({
+  threshold: boundedIntParam({ min: 1, max: 10000, default: 20 }).optional(),
+  limit: boundedIntParam({
+    min: 1,
+    max: INVENTORY_LIST_MAX_LIMIT,
+    default: 50,
+  }),
+});
+
+export type ListAlertsQuery = z.infer<typeof ListAlertsQuerySchema>;
+
 /* ── POST /admin/inventory/adjustments ───────────────────────────────────── */
 
 /**

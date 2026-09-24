@@ -117,6 +117,10 @@ export type LowStockRecord = {
   readonly threshold: number | null;
 };
 
+export type StockAlertRecord = LowStockRecord & {
+  readonly alertLevel: 'critical' | 'warning';
+};
+
 /** The columns a stock read returns, joined to the SKU for its code. */
 const STOCK_COLUMNS = {
   skuId: stockItem.skuId,
@@ -347,6 +351,42 @@ export function createInventoryRepository(deps: { db: Database }) {
         )
         .orderBy(asc(stockItem.available), asc(sku.code))
         .limit(params.limit);
+    },
+
+    async getInventoryAlertsForStore(params: {
+      storeId: string;
+      threshold?: number | undefined;
+      limit: number;
+    }): Promise<StockAlertRecord[]> {
+      const maxThreshold = params.threshold ?? 20;
+      const rows = await executor(db)
+        .select({
+          skuCode: sku.code,
+          skuName: sku.name,
+          productName: product.name,
+          onHand: stockItem.onHand,
+          reserved: stockItem.reserved,
+          available: stockItem.available,
+          threshold: sku.lowStockThreshold,
+        })
+        .from(stockItem)
+        .innerJoin(sku, eq(sku.id, stockItem.skuId))
+        .innerJoin(product, and(eq(product.id, sku.productId), eq(product.storeId, sku.storeId)))
+        .where(
+          and(
+            eq(stockItem.storeId, params.storeId),
+            liveSkuIn(params.storeId),
+            sql`${stockItem.available} <= coalesce(${sku.lowStockThreshold}, ${maxThreshold})`,
+          ),
+        )
+        .orderBy(asc(stockItem.available), asc(sku.code))
+        .limit(params.limit);
+
+      return rows.map((row) => ({
+        ...row,
+        threshold: row.threshold ?? maxThreshold,
+        alertLevel: row.available <= 10 ? 'critical' : 'warning',
+      }));
     },
 
     async listStockForStore(params: {

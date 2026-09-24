@@ -33,6 +33,9 @@
     "db:seed": "node --env-file-if-exists=.env --import tsx src/db/seed.ts",
     "keys:generate": "tsx scripts/generate-keys.ts",
     "admin:create": "node --env-file-if-exists=.env --import tsx scripts/create-admin.ts",
+    "test:neon-e2e": "node --env-file-if-exists=.env --import tsx tests/e2e/e2e-user-journey-neon.ts",
+    "test:neon-admin-variants": "node --env-file-if-exists=.env --import tsx tests/e2e/e2e-admin-variants-neon.ts",
+    "test:neon-variant-checkout": "node --env-file-if-exists=.env --import tsx tests/e2e/e2e-variant-checkout-payment.test.ts",
     "verify": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm depcruise && pnpm test"
   },
   "dependencies": {

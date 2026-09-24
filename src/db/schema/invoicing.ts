@@ -71,6 +71,7 @@ export const FINANCIAL_YEAR_PATTERN = '^[0-9]{4}-[0-9]{2}$';
 /**
  * The shape of a whole invoice number, `INV/YYYY-YY/NNNNNN`.
  *
+ * 
  * A CHECK rather than a convention: this string is printed on a document with legal
  * consequences, and a row that does not match it is not something a reader should have to
  * detect by eye.

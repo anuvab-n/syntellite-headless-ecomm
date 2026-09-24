@@ -122,7 +122,7 @@ const ConfigSchema = z
     jwtPublicKey: publicKeyPem,
     jwtIssuer: z.string().min(1),
     jwtAudience: z.string().min(1),
-    jwtAccessTtlMinutes: z.coerce.number().int().positive().default(15),
+    jwtAccessTtlMinutes: z.coerce.number().int().positive().default(43200),
     jwtRefreshTtlDays: z.coerce.number().int().positive().default(30),
 
     /* ── CORS ──────────────────────────────────────────────────────────── */

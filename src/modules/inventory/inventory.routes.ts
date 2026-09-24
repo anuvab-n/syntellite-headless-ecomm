@@ -10,6 +10,7 @@ import type { Logger } from '../../shared/logger.js';
 import type { InventoryService } from './inventory.service.js';
 import {
   CreateAdjustmentRequestSchema,
+  ListAlertsQuerySchema,
   ListHistoryQuerySchema,
   ListInventoryQuerySchema,
   SkuCodeParamsSchema,
@@ -18,6 +19,7 @@ import {
   toStockLedgerResponse,
   toStockResponse,
   type CreateAdjustmentRequest,
+  type ListAlertsQuery,
   type ListInventoryQuery,
   type SkuCodeParams,
 } from './dto.js';
@@ -108,6 +110,46 @@ export function createInventoryRoutes(deps: {
         storeId: requireUser(req).storeId,
       });
       res.status(200).json({ inventory: { outOfStockSkus } });
+    }),
+  );
+
+  /**
+   * GET /admin/inventory/alerts
+   * GET /admin/inventory/low-stock
+   *
+   * Returns product quantity alerts:
+   * - 'critical' level for available quantity <= 10
+   * - 'warning' level for available quantity <= 20 (or custom threshold)
+   */
+  router.get(
+    '/admin/inventory/alerts',
+    auth,
+    requireStaff,
+    validate({ query: ListAlertsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const query = validatedQuery<ListAlertsQuery>(req);
+      const result = await inventory.getInventoryAlerts({
+        storeId: requireUser(req).storeId,
+        ...(query.threshold !== undefined ? { threshold: query.threshold } : {}),
+        limit: query.limit,
+      });
+      res.status(200).json(result);
+    }),
+  );
+
+  router.get(
+    '/admin/inventory/low-stock',
+    auth,
+    requireStaff,
+    validate({ query: ListAlertsQuerySchema }),
+    asyncHandler(async (req, res) => {
+      const query = validatedQuery<ListAlertsQuery>(req);
+      const result = await inventory.getInventoryAlerts({
+        storeId: requireUser(req).storeId,
+        ...(query.threshold !== undefined ? { threshold: query.threshold } : {}),
+        limit: query.limit,
+      });
+      res.status(200).json(result);
     }),
   );
 

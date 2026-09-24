@@ -19,6 +19,7 @@ import type {
   ReservationSettledReason,
   StockLedgerRecord,
   LowStockRecord,
+  StockAlertRecord,
   StockRecord,
   StockStateFilter,
 } from './inventory.repository.js';
@@ -165,6 +166,32 @@ export function createInventoryService(deps: {
      */
     async listLowStock(params: { storeId: string; limit: number }): Promise<LowStockRecord[]> {
       return repository.listLowStockForStore(params);
+    },
+
+    async getInventoryAlerts(params: {
+      storeId: string;
+      threshold?: number | undefined;
+      limit?: number | undefined;
+    }): Promise<{
+      alerts: StockAlertRecord[];
+      summary: { criticalAlertsCount: number; warningAlertsCount: number; totalAlerts: number };
+    }> {
+      const limit = params.limit ?? 50;
+      const alerts = await repository.getInventoryAlertsForStore({
+        storeId: params.storeId,
+        ...(params.threshold !== undefined ? { threshold: params.threshold } : {}),
+        limit,
+      });
+      const criticalAlertsCount = alerts.filter((a) => a.alertLevel === 'critical').length;
+      const warningAlertsCount = alerts.filter((a) => a.alertLevel === 'warning').length;
+      return {
+        alerts,
+        summary: {
+          criticalAlertsCount,
+          warningAlertsCount,
+          totalAlerts: alerts.length,
+        },
+      };
     },
 
     /** A page of this store's stock. Visibility belongs to the repository query. */
