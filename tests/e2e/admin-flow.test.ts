@@ -54,7 +54,9 @@ const ORDER_QTY = 3;
 const CARRIER = 'Blue Dart';
 const AWB = `BD${stamp}`.toUpperCase();
 
-const log = (s: string): void => process.stdout.write(`      ${s}\n`);
+const log = (s: string): void => {
+  process.stdout.write(`      ${s}\n`);
+};
 
 describe('admin flow (e2e)', () => {
   let container: AppContainer;

@@ -49,7 +49,9 @@ const SKU = `CF-${stamp}`.toUpperCase();
 const UNIT_PRICE = '499.0000';
 
 /** Printed as the suite runs, so the output doubles as a transcript of the flow. */
-const log = (s: string): void => process.stdout.write(`      ${s}\n`);
+const log = (s: string): void => {
+  process.stdout.write(`      ${s}\n`);
+};
 
 describe('customer flow (e2e)', () => {
   let container: AppContainer;

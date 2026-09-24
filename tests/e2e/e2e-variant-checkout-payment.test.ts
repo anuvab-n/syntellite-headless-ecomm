@@ -45,6 +45,7 @@ import { createPaymentsRepository, createRefundsRepository, createRefundsService
 import { createPaymentsRoutes } from '../../src/modules/payments/payments.routes.js';
 import { createPaymentsService } from '../../src/modules/payments/payments.service.js';
 import { createUnconfiguredGateway } from '../../src/razorpay/gateway.js';
+import { createUnconfiguredMediaStorage } from '../../src/storage/media-storage.js';
 import { createPromotionsRepository } from '../../src/modules/promotions/promotions.repository.js';
 import { createPromotionsService } from '../../src/modules/promotions/promotions.service.js';
 import { createReturnsRepository } from '../../src/modules/returns/returns.repository.js';
@@ -66,7 +67,9 @@ const TARGET_DB_URL =
   process.env['DATABASE_URL'] ||
   'postgresql://neondb_owner:npg_HArnZm0au7xM@ep-bitter-lab-b583w2fo-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 
-const printLine = (msg: string): void => process.stdout.write(`${msg}\n`);
+const printLine = (msg: string): void => {
+  process.stdout.write(`${msg}\n`);
+};
 let stepCount = 0;
 
 function logStep(
@@ -139,7 +142,7 @@ async function runVariantCheckoutPaymentJourney(): Promise<void> {
     const verifyAccessToken = (t: string) => tokens.verifyAccessToken(t);
 
     const addresses = createAddressesService({ repository: createAddressesRepository({ db }), db, audit, logger });
-    const catalogue = createCatalogueService({ repository: createCatalogueRepository({ db }), db, events, audit, logger });
+    const catalogue = createCatalogueService({ repository: createCatalogueRepository({ db }), storage: createUnconfiguredMediaStorage({ logger }), db, events, audit, logger });
     const inventory = createInventoryService({ repository: createInventoryRepository({ db }), db, events, audit, logger });
     const promotions = createPromotionsService({ repository: createPromotionsRepository({ db }), db, audit, logger });
     const tax = createTaxService({ repository: createTaxRepository({ db }), db, audit, logger });

@@ -29,6 +29,7 @@ import { createInventoryRoutes } from '../../src/modules/inventory/inventory.rou
 import { createInventoryService } from '../../src/modules/inventory/inventory.service.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../src/modules/stores/index.js';
 import { bootstrapLogger } from '../../src/shared/logger.js';
+import { createUnconfiguredMediaStorage } from '../../src/storage/media-storage.js';
 
 /**
  * Admin E2E Multi-Variant Product Management Audit Script
@@ -39,7 +40,9 @@ const TARGET_DB_URL =
   process.env['DATABASE_URL'] ||
   'postgresql://neondb_owner:npg_HArnZm0au7xM@ep-bitter-lab-b583w2fo-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 
-const printLine = (msg: string): void => process.stdout.write(`${msg}\n`);
+const printLine = (msg: string): void => {
+  process.stdout.write(`${msg}\n`);
+};
 let stepCount = 0;
 
 function logStep(
@@ -113,6 +116,7 @@ async function runAdminVariantAudit(): Promise<void> {
 
     const catalogue = createCatalogueService({
       repository: createCatalogueRepository({ db }),
+      storage: createUnconfiguredMediaStorage({ logger }),
       db,
       events,
       audit,

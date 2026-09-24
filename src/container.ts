@@ -438,9 +438,10 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * worse than useless: ioredis would retry a connection that is never coming, and every
    * readiness probe would report a dependency the deployment does not have.
    */
+  const lockUrl = config.redisLockUrl ?? config.redisCacheUrl;
   const locks =
-    config.redisLockUrl !== undefined
-      ? new Redis(config.redisLockUrl, LOCK_CLIENT_OPTIONS)
+    lockUrl !== undefined
+      ? new Redis(lockUrl, LOCK_CLIENT_OPTIONS)
       : undefined;
 
   /**

@@ -28,11 +28,15 @@ import { createInventoryService } from '../../src/modules/inventory/inventory.se
 import { createDefaultStoreResolver, createStoreRepository } from '../../src/modules/stores/index.js';
 import { createLogger } from '../../src/shared/logger.js';
 
+import { createUnconfiguredMediaStorage } from '../../src/storage/media-storage.js';
+
 const TARGET_DB_URL =
   process.env['DATABASE_URL'] ||
   'postgresql://neondb_owner:npg_HArnZm0au7xM@ep-bitter-lab-b583w2fo-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require';
 
-const printLine = (msg: string): void => process.stdout.write(`${msg}\n`);
+const printLine = (msg: string): void => {
+  process.stdout.write(`${msg}\n`);
+};
 
 async function runAlertsTest(): Promise<void> {
   printLine('========================================================================================');
@@ -72,7 +76,7 @@ async function runAlertsTest(): Promise<void> {
   const requireStaff = scopeGuards.requireScope('staff');
   const verifyAccessToken = (t: string) => tokens.verifyAccessToken(t);
 
-  const catalogue = createCatalogueService({ repository: createCatalogueRepository({ db }), db, events, audit, logger });
+  const catalogue = createCatalogueService({ repository: createCatalogueRepository({ db }), storage: createUnconfiguredMediaStorage({ logger }), db, events, audit, logger });
   const inventory = createInventoryService({ repository: createInventoryRepository({ db }), db, events, audit, logger });
 
   const apiRouter = Router();
