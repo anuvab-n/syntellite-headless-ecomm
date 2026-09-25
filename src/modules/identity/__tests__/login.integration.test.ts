@@ -113,7 +113,6 @@ describe('POST /api/v1/auth/login (integration)', () => {
       isStaff?: boolean;
       isSuperuser?: boolean;
       deletedAt?: Date | null;
-      storeId?: string;
       passwordHash?: string;
     } = {},
   ): Promise<string> {
@@ -122,7 +121,6 @@ describe('POST /api/v1/auth/login (integration)', () => {
       .insert(appUser)
       .values({
         id,
-        storeId: overrides.storeId ?? storeId,
         email: overrides.email ?? EMAIL,
         passwordHash:
           overrides.passwordHash ?? (await hashPassword(overrides.password ?? PASSWORD)),
@@ -413,42 +411,12 @@ describe('POST /api/v1/auth/login (integration)', () => {
     }, 30_000);
   });
 
-  /* ── Store isolation ───────────────────────────────────────────────────── */
+  /* ── Global identity ───────────────────────────────────────────────────── */
 
-  describe('store isolation', () => {
-    it('refuses a user belonging to another store', async () => {
-      // A second store with the SAME email and password.
-      const otherStoreId = newId();
-      await db()
-        .insert((await import('../../../db/schema/store.js')).store)
-        .values({ id: otherStoreId, slug: 'other-store', name: 'Other', currency: 'INR' });
-      await createUser({ storeId: otherStoreId });
-
-      // The resolver returns the DEFAULT store, where this user does not exist.
-      const response = await login(validBody);
-
-      expect(response.status).toBe(401);
-      expect(await db().select().from(refreshSession)).toHaveLength(0);
-    });
-
-    it('authenticates the correct store when the email exists in both', async () => {
-      const otherStoreId = newId();
-      await db()
-        .insert((await import('../../../db/schema/store.js')).store)
-        .values({ id: otherStoreId, slug: 'other-store-2', name: 'Other', currency: 'INR' });
-
-      const otherUserId = await createUser({ storeId: otherStoreId });
-      const defaultUserId = await createUser();
-
-      const response = await login(validBody);
-
-      expect(response.status).toBe(200);
-      // Resolved to the default store's user, not the other store's.
-      expect(response.body.user.id).toBe(defaultUserId);
-      expect(response.body.user.id).not.toBe(otherUserId);
-
-      const [session] = await db().select().from(refreshSession);
-      expect(session?.storeId).toBe(storeId);
+  describe('global identity', () => {
+    it('refuses a second live account with the same email', async () => {
+      await createUser();
+      await expect(createUser({ email: EMAIL.toUpperCase() })).rejects.toThrow();
     });
   });
 

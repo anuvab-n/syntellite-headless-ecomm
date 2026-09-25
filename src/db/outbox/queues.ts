@@ -4,7 +4,7 @@ import type { Redis } from 'ioredis';
 /**
  * BullMQ wiring — DISABLED for now.
  *
- * "No queue system for now, only Redis for locks/cache" — the outbox's default transport is
+ * "No queue system for now" — the outbox's default transport is
  * `'in-process'` (see `outbox.module.ts`, `container.ts`), which runs handlers directly and
  * touches no queue Redis database at all. The real BullMQ implementation this file used to
  * hold (queue/worker construction, the publisher that called `queue.add`) has been removed;

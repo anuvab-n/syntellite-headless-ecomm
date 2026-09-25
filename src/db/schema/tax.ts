@@ -341,12 +341,10 @@ export const customerTaxIdentity = pgTable(
     id: primaryId(),
     storeId: storeIdColumn(() => store.id),
 
-    /**
-     * The owner. No single-column FK to `app_user`: the composite key below covers the
-     * reference AND the store agreement in one constraint, and a second weaker key to the same
-     * parent would imply the composite one was optional.
-     */
-    userId: uuid('user_id').notNull(),
+    /** The owner. `app_user` is global, so tenancy is decided by `store_id` on this row alone. */
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     /** Shape-validated in the database as well as at the boundary. See {@link GSTIN_PATTERN}. */
     gstin: varchar('gstin', { length: GSTIN_LENGTH }).notNull(),
@@ -363,17 +361,6 @@ export const customerTaxIdentity = pgTable(
     ...timestamps,
   },
   (t) => [
-    /**
-     * Ownership AND tenancy in one constraint, matching `fk_address_user_store` exactly: the
-     * row's user must exist, and its store must be that user's store. A cross-store tax
-     * identity is unrepresentable rather than merely refused by application code.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_customer_tax_identity_user_store',
-    }).onDelete('restrict'),
-
     /**
      * **One per user.** Not `(store_id, user_id)`: `app_user.id` is a UUIDv7 primary key,
      * globally unique on its own, so adding `store_id` would WEAKEN the constraint rather than

@@ -1,14 +1,5 @@
 import { sql } from 'drizzle-orm';
-import {
-  char,
-  check,
-  foreignKey,
-  index,
-  pgTable,
-  uniqueIndex,
-  uuid,
-  varchar,
-} from 'drizzle-orm/pg-core';
+import { char, check, index, pgTable, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 
 import { primaryId, softDelete, storeIdColumn, timestamps } from './_shared.js';
 import { appUser } from './identity.js';
@@ -33,13 +24,11 @@ import { store } from './store.js';
  * customer editing or soft-deleting the row afterwards changes no order, which is asserted by
  * test rather than assumed.
  *
- * ## Ownership: the user, and the store through the user
+ * ## Ownership: the user, and the store on the row
  *
- * `app_user.store_id` is NOT NULL and there is no user/store join table, so a user belongs to
- * exactly one store and an address is store-scoped automatically. `store_id` is denormalised
- * here anyway — matching `sku`, `stock_item` and `stock_ledger` — because every repository
- * predicate in this codebase carries `store_id` in its own `WHERE`, and because it is half of
- * the composite foreign key below.
+ * `app_user` is a single global identity with no `store_id`, so the address carries its own
+ * `store_id` and that column alone decides tenancy. Nothing in the database ties it to the
+ * user — every repository predicate must carry both `user_id` and `store_id` in its `WHERE`.
  *
  * ## What is deliberately absent
  *
@@ -62,12 +51,10 @@ export const address = pgTable(
   {
     id: primaryId(),
 
-    /**
-     * No single-column FK to `app_user`. The composite key below covers this reference AND the
-     * store agreement in one constraint; a second, weaker FK to the same parent would be
-     * redundant and would imply the composite one was optional.
-     */
-    userId: uuid('user_id').notNull(),
+    /** `RESTRICT`: users are soft-deleted, so a hard delete with addresses attached is a bug. */
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     storeId: storeIdColumn(() => store.id),
 
@@ -142,25 +129,6 @@ export const address = pgTable(
     ...softDelete,
   },
   (t) => [
-    /**
-     * Ownership AND tenancy in one constraint: the address's user must exist, and its store
-     * must be that user's store. A cross-store address row is unrepresentable rather than
-     * merely rejected by application code.
-     *
-     * The target index `uq_app_user_id_store` is created by the same migration, BEFORE this
-     * key — PostgreSQL requires a unique constraint on exactly the referenced columns, and
-     * drizzle-kit emits foreign keys before the indexes they target, which is the ordering bug
-     * Increment 25 hit and documented.
-     *
-     * `RESTRICT`, matching every other reference to `app_user`: users are soft-deleted, so a
-     * hard delete that still has addresses attached is a bug and must fail loudly.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_address_user_store',
-    }).onDelete('restrict'),
-
     /**
      * FK-target index, added by Increment 30 so `order` can carry a composite tenant key to
      * `address(id, store_id)`.

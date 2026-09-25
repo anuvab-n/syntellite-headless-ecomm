@@ -53,7 +53,6 @@ describe('returns schema (integration)', () => {
       .insert(appUser)
       .values({
         id: userId,
-        storeId,
         email: `returns.${userId}@example.com`,
         passwordHash: 'x',
         firstName: 'Ada',

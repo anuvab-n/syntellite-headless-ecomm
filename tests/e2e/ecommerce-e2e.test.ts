@@ -372,7 +372,6 @@ describe('e-commerce end-to-end flow', () => {
 
       const rows = await db().select().from(appUser).where(eq(appUser.id, flow.customerId));
       expect(rows, 'the account must be persisted exactly once').toHaveLength(1);
-      expect(rows[0]?.storeId, 'the account belongs to the resolved store').toBe(flow.storeId);
       expect(
         rows[0]?.isStaff,
         'registration must never be able to grant staff — DECISIONS §22',
@@ -500,9 +499,6 @@ describe('e-commerce end-to-end flow', () => {
       const rows = await db().select().from(appUser).where(eq(appUser.id, flow.adminId));
       expect(rows, 'the admin account must be persisted').toHaveLength(1);
       expect(rows[0]?.isStaff, 'the admin must actually hold staff').toBe(true);
-      expect(rows[0]?.storeId, 'the admin belongs to the same store as the customer').toBe(
-        flow.storeId,
-      );
       expect(rows[0]?.id, 'the admin must be a different account from the customer').not.toBe(
         flow.customerId,
       );

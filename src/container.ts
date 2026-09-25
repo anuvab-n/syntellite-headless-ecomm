@@ -1,5 +1,4 @@
 import { Router, type Express } from 'express';
-import { Redis } from 'ioredis';
 
 import { loadConfig, type Config } from './config.js';
 import { createAuditRepository, createAuditTrail } from './db/audit/index.js';
@@ -15,18 +14,10 @@ import {
 import { createApp } from './http/app.js';
 import { createPasswordResetMailHandler } from './mail/password-reset.handler.js';
 import { createSmtpMailer } from './mail/mailer.js';
-import { RATE_LIMIT_BUCKETS } from './http/middleware/rate-limit.js';
 import { requireIdempotency } from './http/middleware/idempotency.js';
 import { createScopeGuards } from './http/middleware/scope.js';
 import { resolveStore } from './http/middleware/store.js';
-import { postgresCheck, redisCheck, type HealthCheck } from './http/routes/health.js';
-import { waitForRedisReady } from './redis/ready.js';
-import { createInMemoryRateLimiter } from './redis/in-memory-rate-limiter.js';
-import {
-  createRateLimiter,
-  hashRateLimitSubject,
-  type RateLimitPolicy,
-} from './redis/rate-limiter.js';
+import { postgresCheck, type HealthCheck } from './http/routes/health.js';
 import {
   createIdentityRepository,
   createIdentityRoutes,
@@ -212,21 +203,6 @@ export type AppContainer = {
    * connection count for no benefit. Selectors will use this from Phase 1.
    */
   replica: DatabaseHandle;
-  /**
-   * The lock/coordination Redis: idempotency keys, rate-limit counters, distributed locks.
-   *
-   * Must run `noeviction` in production. Losing a key here is not a cache miss — it is a
-   * duplicate charge, which is why the readiness probe treats it as required and the
-   * degradation policy fails closed on it.
-   *
-   * **`undefined` when `REDIS_LOCK_URL` is unset**, which `config.ts` permits outside
-   * production only. In that mode nothing here connects to Redis at all: rate limiting runs
-   * in process memory and the scheduler assumes leadership locally. The field is left in
-   * the shape rather than hidden behind a flag so that every consumer has to acknowledge
-   * the absence at the type level — a `Redis` that silently pointed at nothing would fail
-   * at the first command instead of at compile time.
-   */
-  locks: Redis | undefined;
   outbox: OutboxSubsystem;
   /**
    * The idempotency key store.
@@ -361,29 +337,6 @@ export type AppContainer = {
   shutdown: () => Promise<void>;
 };
 
-/**
- * Ceiling on how long a readiness probe waits for the lock client to connect. Comfortably
- * under the health route's own 2s per-check timeout, so this produces a definite answer
- * rather than letting the route time out with no reason recorded.
- */
-const READINESS_WAIT_MS = 1_500;
-
-/**
- * The lock client's connection options.
- *
- * `enableOfflineQueue: false` is the load-bearing one. By default ioredis QUEUES commands
- * while disconnected and replays them on reconnect — so an idempotency-key write issued
- * during a Redis outage appears to succeed and silently lands seconds later, after the
- * decision that depended on it was already made. With the queue disabled the command fails
- * immediately, which is what "fail closed on anything touching money" requires.
- */
-const LOCK_CLIENT_OPTIONS = {
-  maxRetriesPerRequest: 2,
-  enableOfflineQueue: false,
-  enableReadyCheck: true,
-  connectTimeout: 5_000,
-} as const;
-
 export function buildContainer(opts: BuildContainerOptions): AppContainer {
   /* ── 1. Configuration ────────────────────────────────────────────────── */
 
@@ -415,44 +368,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
   const replica =
     replicaUrl !== undefined ? createDatabase(replicaUrl, config, logger, 'replica') : db;
 
-  /* ── 4. Redis ────────────────────────────────────────────────────────── */
-
-  /**
-   * Only the LOCK client is created here.
-   *
-   * The queue client is not: `createOutboxSubsystem` builds and owns its own BullMQ
-   * connections, and it closes them in its `shutdown()`. Creating a second one here would
-   * mean two owners for one resource and an ambiguous shutdown order.
-   *
-   * The CACHE client is not created either, because nothing consumes it yet. An idle
-   * connection that exists only to make the container look complete is a placeholder, and
-   * it would also make the readiness probe report on a dependency no code path uses.
-   * Phase 1 adds it alongside the first selector that caches.
-   */
-  /**
-   * Built only when a URL is configured.
-   *
-   * An unset `REDIS_LOCK_URL` is Redis-free mode, not a misconfiguration — `config.ts`
-   * decides whether that is allowed (it is not, in production) so the decision is not
-   * re-litigated here. Constructing a client against a placeholder URL instead would be
-   * worse than useless: ioredis would retry a connection that is never coming, and every
-   * readiness probe would report a dependency the deployment does not have.
-   */
-  const lockUrl = config.redisLockUrl ?? config.redisCacheUrl;
-  const locks =
-    lockUrl !== undefined
-      ? new Redis(lockUrl, LOCK_CLIENT_OPTIONS)
-      : undefined;
-
-  /**
-   * Required: an unhandled 'error' event on an ioredis client is an unhandled exception and
-   * takes the process down. A Redis outage must degrade readiness, not kill the API.
-   */
-  locks?.on('error', (err) => {
-    logger.error({ err, client: 'locks' }, 'redis_client_error');
-  });
-
-  /* ── 5/6. Outbox and queue infrastructure ────────────────────────────── */
+  /* ── 4. Outbox and queue infrastructure ──────────────────────────────── */
 
   /**
    * Reuses the Step 4 subsystem verbatim. There is exactly one event system in this
@@ -507,9 +423,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      *
      * The worker process still polls `outbox_event` and runs handlers itself (see
      * `workers/default.ts`, which calls `outbox.drainer.start()`); it simply does not hand
-     * the job to a second Redis-backed queue to do it. Redis stays in the picture only for
-     * what nothing else can do without it — locks (`redisLockUrl`) and, through the same
-     * client, auth rate limiting.
+     * the job to a second Redis-backed queue to do it.
      *
      * A deployment that later needs handlers to scale independently of the drain loop can
      * still opt back in explicitly with `buildContainer({ transport: 'queue' })`; nothing
@@ -564,52 +478,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * The probe hits the PRIMARY. A replica-only check would report ready while writes are
    * failing, which is the wrong way round: reads degrade gracefully, writes do not.
    */
-  /**
-   * Waits for the lock client to be connected, then pings it.
-   *
-   * The wait is necessary, not defensive. `enableOfflineQueue: false` makes a command throw
-   * IMMEDIATELY when the socket is not writeable — which is the correct behaviour for an
-   * idempotency write, and the wrong behaviour for a probe fired microseconds after the
-   * process started and before the TCP handshake finished. Pinging directly makes a
-   * perfectly healthy instance report 503 at boot, intermittently, depending on how fast
-   * Redis answered.
-   *
-   * There is no timeout here on purpose: the health route already bounds every check at 2s.
-   * Adding a second timeout would mean two numbers to keep consistent. If the client is in
-   * a terminal state ('end') or genuinely cannot connect, 'ready' never fires and the route's
-   * timeout produces the 503 — which is the right answer either way.
-   */
-  async function pingLocks(client: Redis): Promise<void> {
-    /**
-     * Bounded wait, not `events.once(locks, 'ready')`.
-     *
-     * `once()` never settles against a CLOSED client — neither 'ready' nor 'error' is ever
-     * emitted from that state — so it leaked one listener per probe, measurably growing
-     * 1 → 2 → 3, while the route's timeout silently absorbed each failure. It self-cleans
-     * against a merely-unreachable client (ioredis emits 'error' per reconnect, which
-     * rejects it), which is what kept the leak hidden in the common case.
-     */
-    await waitForRedisReady(client, READINESS_WAIT_MS);
-    // Annotated as `string`, not inferred: ioredis types `ping()` as returning the literal
-    // 'PONG', so the comparison below narrows the value to `never` and the template
-    // literal becomes untypeable. Widening keeps the guard meaningful at runtime, which is
-    // where an unexpected reply would actually show up.
-    const reply: string = await client.ping();
-    if (reply !== 'PONG') throw new Error(`unexpected PING reply: ${reply}`);
-  }
-
-  /**
-   * The Redis probe is OMITTED, not faked, when there is no Redis.
-   *
-   * A check hard-coded to pass would make `/health/ready` assert something false, and the
-   * whole value of a readiness endpoint is that its answer can be trusted during an
-   * incident. Reporting only on dependencies that exist keeps it honest: with no Redis
-   * configured, Postgres is genuinely the only thing this process needs to serve traffic.
-   */
-  const healthChecks: readonly HealthCheck[] = [
-    postgresCheck(() => checkDatabase(db)),
-    ...(locks !== undefined ? [redisCheck(() => pingLocks(locks))] : []),
-  ];
+  const healthChecks: readonly HealthCheck[] = [postgresCheck(() => checkDatabase(db))];
 
   /* ── 8. Domain modules ───────────────────────────────────────────────── */
 
@@ -657,36 +526,6 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     logger,
   });
 
-  /**
-   * Rate limiting, on the LOCK Redis client.
-   *
-   * Not the cache client, and the distinction matters. The cache database is the one that
-   * would be configured with an eviction policy, and an evicted rate-limit counter is a reset
-   * budget — an attacker could fill the cache with junk to flush their own block. The lock
-   * database holds correctness-critical keys that must expire only on their own TTL.
-   *
-   * It also already has the right client options for this job: `enableOfflineQueue: false`, so
-   * a command issued while disconnected throws immediately instead of queueing up requests
-   * behind a dead socket, which is what makes failing closed fast rather than slow.
-   */
-  const rateLimiter =
-    locks !== undefined
-      ? createRateLimiter({ redis: locks, logger })
-      : createInMemoryRateLimiter({ logger });
-
-  const ipPolicy: RateLimitPolicy = {
-    max: config.authRateLimitIpMax,
-    windowSeconds: config.authRateLimitWindowSeconds,
-  };
-  const emailPolicy: RateLimitPolicy = {
-    max: config.authRateLimitEmailMax,
-    windowSeconds: config.authRateLimitWindowSeconds,
-  };
-  const refreshPolicy: RateLimitPolicy = {
-    max: config.authRateLimitRefreshIpMax,
-    windowSeconds: config.authRateLimitWindowSeconds,
-  };
-
   const identity = createIdentityService({
     repository: identityRepository,
     sessions: refreshSessions,
@@ -697,16 +536,6 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     db: db.db,
     config,
     logger,
-    /**
-     * The adapter between the domain port and the Redis limiter.
-     *
-     * Hashing happens HERE rather than in the service, and it uses the same
-     * `hashRateLimitSubject(storeId, email)` shape as the middleware. That is not incidental:
-     * if these two disagreed by so much as an argument order, the middleware would check a key
-     * the service never increments and the limit would silently never fire — a security
-     * control that looks wired and does nothing. The shared helper is the only reason they
-     * cannot drift.
-     */
     events: outbox.events,
     audit,
     /**
@@ -725,21 +554,6 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
      */
     customerOrderStats: {
       forCustomers: (input) => orders.orderStatsForCustomers(input),
-    },
-    loginAttempts: {
-      async recordFailure({ storeId, email }) {
-        await rateLimiter.record(
-          RATE_LIMIT_BUCKETS.loginEmail,
-          hashRateLimitSubject(storeId, email),
-          emailPolicy,
-        );
-      },
-      async clear({ storeId, email }) {
-        await rateLimiter.reset(
-          RATE_LIMIT_BUCKETS.loginEmail,
-          hashRateLimitSubject(storeId, email),
-        );
-      },
     },
   });
 
@@ -804,8 +618,7 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
    * transaction.
    *
    * No dependency on identity either. Ownership arrives from the verified token at the route,
-   * and the composite foreign key `(user_id, store_id) -> app_user(id, store_id)` enforces it
-   * in the database — so `no-cross-module-imports` costs nothing here.
+   * and every repository predicate scopes by both `user_id` and `store_id`.
    */
   const addresses = createAddressesService({
     repository: createAddressesRepository({ db: db.db }),
@@ -1394,7 +1207,6 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
       // Needed by requireAuth() on the logout route, the first authenticated endpoint.
       tokens,
       logger,
-      rateLimit: { limiter: rateLimiter, ipPolicy, emailPolicy, refreshPolicy, logger },
       // For the ONE staff route in this module: the store-wide customer list, added in
       // Increment 51. Built here rather than inside the module even though identity owns
       // authorization, because the guard is constructed against the scope loader and that
@@ -1664,14 +1476,6 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
         logger.error({ err }, 'outbox_shutdown_failed');
       });
 
-      // `?.` rather than a branch: with no Redis client there is simply nothing to close,
-      // and the remaining steps must run exactly as they otherwise would.
-      await locks?.quit().catch((err: unknown) => {
-        // `quit()` rejects if the connection is already gone, which is not a failure worth
-        // reporting loudly during shutdown.
-        logger.debug({ err }, 'locks_quit_failed');
-      });
-
       await db.close().catch((err: unknown) => {
         logger.error({ err }, 'database_close_failed');
       });
@@ -1700,7 +1504,6 @@ export function buildContainer(opts: BuildContainerOptions): AppContainer {
     logger,
     db,
     replica,
-    locks,
     outbox,
     idempotency,
     identity,

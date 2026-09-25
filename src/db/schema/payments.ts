@@ -121,10 +121,12 @@ export const payment = pgTable(
      *
      * Denormalised from `order.user_id` on purpose: every customer-facing read of a payment is
      * scoped by the authenticated user, and carrying the owner here means that scoping is one
-     * predicate on this table rather than a join a caller could forget. The composite FK below
-     * is what keeps it honest.
+     * predicate on this table rather than a join a caller could forget. `app_user` is global,
+     * so nothing in the database ties this user to the payment's store — the write path must.
      */
-    userId: uuid('user_id').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     method: varchar('method', { length: 20 }).notNull(),
 
@@ -300,17 +302,6 @@ export const payment = pgTable(
     uniqueIndex('uq_payment_provider_txn')
       .on(t.storeId, t.providerTransactionId, t.provider)
       .where(sql`${t.providerTransactionId} is not null`),
-
-    /**
-     * Ownership AND tenancy in one constraint, matching `fk_order_user_store`: the payer must
-     * exist, and their store must be the payment's store. A cross-store payment is
-     * unrepresentable rather than merely refused by application code.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_payment_user_store',
-    }).onDelete('restrict'),
 
     /**
      * RESTRICT, matching every other order-adjacent FK. Deleting an order must never take its

@@ -119,7 +119,6 @@ describe('refresh-token collision handling (integration)', () => {
       .insert(appUser)
       .values({
         id,
-        storeId,
         email: EMAIL,
         passwordHash: await hashPassword(PASSWORD),
         firstName: 'Ada',

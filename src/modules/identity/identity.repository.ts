@@ -2,6 +2,7 @@ import { and, count, desc, eq, gte, ilike, isNull, lt, ne, or, sql, type SQL } f
 
 import type { Database } from '../../db/client.js';
 import { appUser, auditLog } from '../../db/schema/identity.js';
+import { order } from '../../db/schema/orders.js';
 import { uniqueViolationConstraint } from '../../db/errors.js';
 import { executor } from '../../db/transaction.js';
 import { exclusiveEndOfMillisecond } from '../../shared/time-bounds.js';
@@ -14,10 +15,16 @@ import type { MappableUser } from './dto.js';
  * barrel exists for drizzle-kit and the test truncate helper, and its own docblock rules out
  * using it as a general dependency.
  *
- * Every query in this file is scoped by `storeId`. That is not defensive habit: `app_user`
- * is tenant-owned, and a query that forgets the scope returns another merchant's customer.
- * The scope is part of the WHERE clause, never a check the caller performs afterwards.
+ * `app_user` is a single global identity with no `store_id`. Self-service reads and writes
+ * (login, refresh, profile, password) act on the caller's own account and are not store-scoped.
+ * Every STAFF-facing customer query is: it requires `storeId` and admits only customers with at
+ * least one order in that store (`customerOfStore`), inside the WHERE clause.
  */
+
+/** A customer belongs to a store once they have ordered from it. */
+function customerOfStore(storeId: string): SQL {
+  return sql`exists (select 1 from ${order} where ${order.userId} = ${appUser.id} and ${order.storeId} = ${storeId})`;
+}
 
 export type IdentityRepository = ReturnType<typeof createIdentityRepository>;
 
@@ -41,7 +48,6 @@ const PUBLIC_COLUMNS = {
 
 export type InsertUserValues = {
   id: string;
-  storeId: string;
   email: string;
   passwordHash: string;
   firstName: string;
@@ -67,7 +73,6 @@ export type InsertUserValues = {
  */
 const CREDENTIAL_COLUMNS = {
   id: appUser.id,
-  storeId: appUser.storeId,
   email: appUser.email,
   firstName: appUser.firstName,
   lastName: appUser.lastName,
@@ -88,7 +93,6 @@ const CREDENTIAL_COLUMNS = {
  * response while the sensitive ones stay in the service.
  */
 export type UserCredentials = MappableUser & {
-  storeId: string;
   passwordHash: string;
   isActive: boolean;
   isStaff: boolean;
@@ -104,7 +108,6 @@ export type UserCredentials = MappableUser & {
  */
 const SUBJECT_COLUMNS = {
   id: appUser.id,
-  storeId: appUser.storeId,
   email: appUser.email,
   firstName: appUser.firstName,
   lastName: appUser.lastName,
@@ -125,7 +128,6 @@ const SUBJECT_COLUMNS = {
  * selected.
  */
 export type UserSubject = MappableUser & {
-  storeId: string;
   isActive: boolean;
   isStaff: boolean;
   isSuperuser: boolean;
@@ -153,10 +155,10 @@ export type EditableUserFields = {
   acceptsMarketing?: boolean;
 };
 
-/** The partial unique index on `(store_id, lower(email)) WHERE deleted_at IS NULL`. */
+/** The partial unique index on `lower(email) WHERE deleted_at IS NULL` — global, not per store. */
 export const EMAIL_UNIQUE_CONSTRAINT = 'uq_user_email_active';
 
-/** The partial unique index on `(store_id, phone) WHERE deleted_at IS NULL AND phone IS NOT NULL`. */
+/** The partial unique index on `phone WHERE deleted_at IS NULL AND phone IS NOT NULL` — global. */
 export const PHONE_UNIQUE_CONSTRAINT = 'uq_user_phone_active';
 
 /**
@@ -185,19 +187,13 @@ export function createIdentityRepository(deps: { db: Database }) {
      * a fresh signup, which is the behaviour the partial index was chosen to give.
      */
     async findActiveByEmail(params: {
-      storeId: string;
       email: string;
+      storeId?: string;
     }): Promise<MappableUser | undefined> {
       const [row] = await executor(db)
         .select(PUBLIC_COLUMNS)
         .from(appUser)
-        .where(
-          and(
-            eq(appUser.storeId, params.storeId),
-            sql`lower(${appUser.email}) = ${params.email}`,
-            isNull(appUser.deletedAt),
-          ),
-        )
+        .where(and(sql`lower(${appUser.email}) = ${params.email}`, isNull(appUser.deletedAt)))
         .limit(1);
       return row;
     },
@@ -231,7 +227,7 @@ export function createIdentityRepository(deps: { db: Database }) {
      *
      * The ONLY method that selects `passwordHash`.
      *
-     * Same predicate as `findActiveByEmail` — store-scoped, `lower(email)`, `deletedAt IS
+     * Same predicate as `findActiveByEmail` — `lower(email)`, `deletedAt IS
      * NULL` — so login and registration agree about which account an address refers to. A
      * soft-deleted user is therefore invisible here, which is correct: erasure anonymises,
      * and an erased account must not authenticate.
@@ -239,19 +235,13 @@ export function createIdentityRepository(deps: { db: Database }) {
      * `isActive` is returned rather than filtered. See the note on `CREDENTIAL_COLUMNS`.
      */
     async findCredentialsByEmail(params: {
-      storeId: string;
       email: string;
+      storeId?: string;
     }): Promise<UserCredentials | undefined> {
       const [row] = await executor(db)
         .select(CREDENTIAL_COLUMNS)
         .from(appUser)
-        .where(
-          and(
-            eq(appUser.storeId, params.storeId),
-            sql`lower(${appUser.email}) = ${params.email}`,
-            isNull(appUser.deletedAt),
-          ),
-        )
+        .where(and(sql`lower(${appUser.email}) = ${params.email}`, isNull(appUser.deletedAt)))
         .limit(1);
       return row;
     },
@@ -274,19 +264,13 @@ export function createIdentityRepository(deps: { db: Database }) {
      * probing for which accounts exist.
      */
     async findSubjectById(params: {
-      storeId: string;
       userId: string;
+      storeId?: string;
     }): Promise<UserSubject | undefined> {
       const [row] = await executor(db)
         .select(SUBJECT_COLUMNS)
         .from(appUser)
-        .where(
-          and(
-            eq(appUser.id, params.userId),
-            eq(appUser.storeId, params.storeId),
-            isNull(appUser.deletedAt),
-          ),
-        )
+        .where(and(eq(appUser.id, params.userId), isNull(appUser.deletedAt)))
         .limit(1);
       return row;
     },
@@ -303,24 +287,17 @@ export function createIdentityRepository(deps: { db: Database }) {
      * the enumeration surface `GET /users/me` was built to avoid, and would let a caller aim
      * the operation at an account that is not theirs.
      *
-     * `deleted_at IS NULL` and the store predicate match `findCredentialsByEmail`, so an erased
-     * or foreign account is invisible here too. `isActive` is returned rather than filtered,
-     * per the note on `CREDENTIAL_COLUMNS` — the service decides what to do with it.
+     * `deleted_at IS NULL` matches `findCredentialsByEmail`, so an erased account is invisible here too.
+     * `isActive` is returned rather than filtered, per the note on `CREDENTIAL_COLUMNS` — the service decides what to do with it.
      */
     async findCredentialsById(params: {
-      storeId: string;
       userId: string;
+      storeId?: string;
     }): Promise<UserCredentials | undefined> {
       const [row] = await executor(db)
         .select(CREDENTIAL_COLUMNS)
         .from(appUser)
-        .where(
-          and(
-            eq(appUser.id, params.userId),
-            eq(appUser.storeId, params.storeId),
-            isNull(appUser.deletedAt),
-          ),
-        )
+        .where(and(eq(appUser.id, params.userId), isNull(appUser.deletedAt)))
         .limit(1);
       return row;
     },
@@ -335,29 +312,22 @@ export function createIdentityRepository(deps: { db: Database }) {
      * is exactly the friction the decision deserves — the same reasoning as
      * `EditableProductFields` in the catalogue (§29).
      *
-     * Store-scoped AND `deleted_at IS NULL` in the predicate, matching every other write here.
-     * The id alone would be enough for correctness, and is deliberately not relied on.
+     * `deleted_at IS NULL` in the predicate, matching every other write here.
      *
      * Returns the updated row through `SUBJECT_COLUMNS` — the same projection `findSubjectById`
      * uses — so the caller can map a response without a second read, and so the hash cannot
      * reach the response even by accident.
      */
     async updateUserProfile(params: {
-      storeId: string;
       userId: string;
       fields: EditableUserFields;
       at: Date;
+      storeId?: string;
     }): Promise<UserSubject | undefined> {
       const [row] = await executor(db)
         .update(appUser)
         .set({ ...params.fields, updatedAt: params.at })
-        .where(
-          and(
-            eq(appUser.id, params.userId),
-            eq(appUser.storeId, params.storeId),
-            isNull(appUser.deletedAt),
-          ),
-        )
+        .where(and(eq(appUser.id, params.userId), isNull(appUser.deletedAt)))
         .returning(SUBJECT_COLUMNS);
 
       return row;
@@ -365,15 +335,12 @@ export function createIdentityRepository(deps: { db: Database }) {
 
     /**
      * Stamp a successful login.
-     *
-     * Store-scoped in the predicate even though the id is unique, so a bug that carried a
-     * user id across tenants cannot write to another store's row.
      */
-    async updateLastLoginAt(params: { storeId: string; userId: string; at: Date }): Promise<void> {
+    async updateLastLoginAt(params: { userId: string; at: Date; storeId?: string }): Promise<void> {
       await executor(db)
         .update(appUser)
         .set({ lastLoginAt: params.at, updatedAt: new Date() })
-        .where(and(eq(appUser.id, params.userId), eq(appUser.storeId, params.storeId)));
+        .where(eq(appUser.id, params.userId));
     },
 
     /**
@@ -389,20 +356,16 @@ export function createIdentityRepository(deps: { db: Database }) {
      * racing a rehash could resurrect the old password.
      */
     async updatePasswordHash(params: {
-      storeId: string;
       userId: string;
       expectedCurrentHash: string;
       passwordHash: string;
+      storeId?: string;
     }): Promise<boolean> {
       const updated = await executor(db)
         .update(appUser)
         .set({ passwordHash: params.passwordHash, updatedAt: new Date() })
         .where(
-          and(
-            eq(appUser.id, params.userId),
-            eq(appUser.storeId, params.storeId),
-            eq(appUser.passwordHash, params.expectedCurrentHash),
-          ),
+          and(eq(appUser.id, params.userId), eq(appUser.passwordHash, params.expectedCurrentHash)),
         )
         .returning({ id: appUser.id });
 
@@ -410,49 +373,18 @@ export function createIdentityRepository(deps: { db: Database }) {
     },
 
     /**
-     * **A page of the STORE's customers, for staff.** Increment 51. Read-only.
-     *
-     * Every other read in this file is keyed to ONE subject — by id from a verified token, or by
-     * email during authentication. This is the first that returns many, and it is a separate
-     * method with `Store` in its name rather than an optional `userId` on an existing one: a
-     * caller that forgot to pass an owner would otherwise silently get store-wide reach, which
-     * is exactly the hole an optional security parameter creates.
-     *
-     * `store_id` is still non-negotiable and comes from the staff member's verified token.
-     * Only the "one subject" narrowing is dropped.
-     *
-     * **Staff accounts are not filtered out.** A store's staff are rows in this table, and
-     * hiding them would make the list disagree with the database for no stated reason. What IS
-     * filtered is `deleted_at IS NULL`, matching every other read here — an erased customer is
-     * invisible to staff for the same reason they are invisible to authentication.
-     *
-     * Page and count share ONE predicate, so a caller on the last page is never told the total
-     * counted rows it cannot see. Ordered by `created_at DESC, id DESC`: `created_at` alone is
-     * not a total order — two accounts created in the same instant would tie — and a non-total
-     * order makes `offset` pagination silently skip and repeat rows between pages.
-     *
-     * One query for the page and one for the count, both over `app_user` alone. There is no
-     * join and no per-row lookup, so there is no N+1 to avoid.
-     */
-    /**
      * **One customer in this store, for staff.** Increment 52. Read-only.
      *
      * Deliberately NOT `findSubjectById`, which exists for token refresh and selects
-     * `SUBJECT_COLUMNS` — including `is_staff`, `is_superuser` and `store_id`. Reusing it here
+     * `SUBJECT_COLUMNS` — including `is_staff` and `is_superuser`. Reusing it here
      * would publish privilege flags on an operator screen, so this takes the same
      * `ADMIN_CUSTOMER_COLUMNS` allowlist the list uses and nothing else.
      *
-     * The predicate is the list's, narrowed to one id: tenant, liveness, and now identity. An
-     * unknown id, another store's customer and a soft-deleted one are all `undefined`, so the
-     * caller answers one `404` and reveals nothing — the §25 rule that ownership belongs in the
-     * query rather than in a comparison performed afterwards.
-     *
-     * Served by `uq_app_user_id_store` on `(id, store_id)`, which already exists as an FK
-     * target: measured at 0.018 ms with `deleted_at` applied as a filter on the single row.
+     * The predicate is the list's, narrowed to one id: liveness, store membership, identity.
      */
     async findStoreCustomerById(params: {
-      storeId: string;
       customerId: string;
+      storeId: string;
     }): Promise<AdminCustomerRecord | undefined> {
       const [row] = await executor(db)
         .select(ADMIN_CUSTOMER_COLUMNS)
@@ -460,8 +392,8 @@ export function createIdentityRepository(deps: { db: Database }) {
         .where(
           and(
             eq(appUser.id, params.customerId),
-            eq(appUser.storeId, params.storeId),
             isNull(appUser.deletedAt),
+            customerOfStore(params.storeId),
           ),
         )
         .limit(1);
@@ -469,7 +401,7 @@ export function createIdentityRepository(deps: { db: Database }) {
     },
 
     /**
-     * Set a customer's active flag, store-scoped, with a compare-and-swap on the old value.
+     * Set a customer's active flag, with a compare-and-swap on the old value.
      * Increment 62.
      *
      * The `is_active <> :next` predicate is the idempotency: a second identical request matches
@@ -483,6 +415,27 @@ export function createIdentityRepository(deps: { db: Database }) {
      * Soft-deleted accounts are excluded: re-activating a deleted customer would resurrect an
      * account the deletion policy retired.
      */
+    async setCustomerActive(params: {
+      customerId: string;
+      isActive: boolean;
+      at: Date;
+      storeId: string;
+    }): Promise<AdminCustomerRecord | undefined> {
+      const [row] = await executor(db)
+        .update(appUser)
+        .set({ isActive: params.isActive, updatedAt: params.at })
+        .where(
+          and(
+            eq(appUser.id, params.customerId),
+            isNull(appUser.deletedAt),
+            ne(appUser.isActive, params.isActive),
+            customerOfStore(params.storeId),
+          ),
+        )
+        .returning(ADMIN_CUSTOMER_COLUMNS);
+      return row;
+    },
+
     /**
      * A page of the store's audit log, newest first. Increment 62.
      *
@@ -537,32 +490,11 @@ export function createIdentityRepository(deps: { db: Database }) {
       return { items, total: Number(counted?.total ?? 0) };
     },
 
-    async setCustomerActive(params: {
-      storeId: string;
-      customerId: string;
-      isActive: boolean;
-      at: Date;
-    }): Promise<AdminCustomerRecord | undefined> {
-      const [row] = await executor(db)
-        .update(appUser)
-        .set({ isActive: params.isActive, updatedAt: params.at })
-        .where(
-          and(
-            eq(appUser.id, params.customerId),
-            eq(appUser.storeId, params.storeId),
-            isNull(appUser.deletedAt),
-            ne(appUser.isActive, params.isActive),
-          ),
-        )
-        .returning(ADMIN_CUSTOMER_COLUMNS);
-      return row;
-    },
-
     async listStoreCustomers(params: {
-      storeId: string;
       filters: AdminCustomerFilters;
       limit: number;
       offset: number;
+      storeId: string;
     }): Promise<{ items: AdminCustomerRecord[]; total: number }> {
       const where = adminCustomerPredicate(params.storeId, params.filters);
 
@@ -583,17 +515,8 @@ export function createIdentityRepository(deps: { db: Database }) {
     /**
      * **How many of the store's customers are active, and how many are not.** Increment 56.
      *
-     * Tenancy and liveness ONLY — deliberately not the list's filters. These are the screen's
-     * tabs, and a tab whose count changed as you typed in the search box could never tell you
-     * how many rows switching to it would show. `pagination.total` is the filtered figure; this
-     * is the unfiltered one, and the two differing is correct rather than a discrepancy.
-     *
      * Soft-deleted accounts are excluded, exactly as they are from the list — an erased customer
      * is invisible to staff for the same reason it is invisible to authentication.
-     *
-     * One grouped scan over one store. A full aggregate must read every live account in the
-     * tenant, which is honest work; `ix_app_user_store_created` is partial on the same
-     * `deleted_at IS NULL` predicate and serves it.
      */
     async countStoreCustomersByStatus(params: {
       storeId: string;
@@ -601,7 +524,7 @@ export function createIdentityRepository(deps: { db: Database }) {
       return executor(db)
         .select({ isActive: appUser.isActive, count: count() })
         .from(appUser)
-        .where(and(eq(appUser.storeId, params.storeId), isNull(appUser.deletedAt)))
+        .where(and(isNull(appUser.deletedAt), customerOfStore(params.storeId)))
         .groupBy(appUser.isActive);
     },
   };
@@ -621,7 +544,6 @@ export function createIdentityRepository(deps: { db: Database }) {
  *    neither of them.
  *  - `is_staff`, `is_superuser` — privilege flags. Publishing them would make an operator
  *    screen double as a map of which accounts are worth attacking.
- *  - `store_id` — tenancy is an invariant of the query, not a field to inspect.
  *  - `deleted_at` — every row here is live by construction.
  *
  * Password-reset tokens and refresh sessions live in their own tables and are not reachable
@@ -666,15 +588,10 @@ export type AdminCustomerFilters = {
 };
 
 /**
- * The staff list's WHERE clause: tenancy and liveness, then whichever filters were supplied.
- *
- * A free function rather than a closure inside the factory because it takes everything it needs
- * and captures nothing — which is what makes it readable as the one place tenancy is applied.
- * The first two conjuncts are not optional; every filter below can only narrow, so no
- * combination of query parameters widens the result past one tenant.
+ * The staff list's WHERE clause: liveness, store membership, then whichever filters were supplied.
  */
 function adminCustomerPredicate(storeId: string, filters: AdminCustomerFilters): SQL | undefined {
-  const clauses: SQL[] = [eq(appUser.storeId, storeId), isNull(appUser.deletedAt)];
+  const clauses: SQL[] = [isNull(appUser.deletedAt), customerOfStore(storeId)];
 
   if (filters.isActive !== undefined) clauses.push(eq(appUser.isActive, filters.isActive));
 

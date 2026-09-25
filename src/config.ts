@@ -99,22 +99,7 @@ const ConfigSchema = z
     databaseStatementTimeoutMs: z.coerce.number().int().positive().default(30_000),
 
     /* ── Redis ─────────────────────────────────────────────────────────── */
-    /**
-     * All three are OPTIONAL, and each absence means something specific.
-     *
-     * Omitting `REDIS_LOCK_URL` puts the process in Redis-free mode: the container builds no
-     * Redis client, rate limiting runs in-process, the readiness probe stops reporting on a
-     * dependency that is not there, and the scheduler holds an in-process leadership token
-     * instead of a distributed one. That trade is sound for exactly one deployment shape —
-     * a single instance — which is what local development is, and it is why the production
-     * guard below still demands all three. A second replica without Redis would run every
-     * scheduled task twice and give each instance its own private rate-limit budget.
-     *
-     * `REDIS_QUEUE_URL` is needed only by `transport: 'queue'`, which is not the default;
-     * `REDIS_CACHE_URL` has no consumer yet.
-     */
-    redisCacheUrl: z.string().url().optional(),
-    redisLockUrl: z.string().url().optional(),
+    /** Needed only by the outbox's `transport: 'queue'`, which is not the default. */
     redisQueueUrl: z.string().url().optional(),
 
     /* ── Auth ──────────────────────────────────────────────────────────── */
@@ -122,7 +107,8 @@ const ConfigSchema = z
     jwtPublicKey: publicKeyPem,
     jwtIssuer: z.string().min(1),
     jwtAudience: z.string().min(1),
-    jwtAccessTtlMinutes: z.coerce.number().int().positive().default(43200),
+    /** Short on purpose: logout and password changes revoke refresh sessions, not access tokens. */
+    jwtAccessTtlMinutes: z.coerce.number().int().positive().default(15),
     jwtRefreshTtlDays: z.coerce.number().int().positive().default(30),
 
     /* ── CORS ──────────────────────────────────────────────────────────── */
@@ -194,34 +180,6 @@ const ConfigSchema = z
      */
     defaultStoreSlug: z.string().trim().min(1).max(255).default('default'),
 
-    /* ── Authentication rate limits ────────────────────────────────────── */
-
-    /**
-     * Configurable rather than hard-coded, because the right numbers are not knowable from
-     * a desk. Phase 8 load testing calibrates them against real traffic shape — a mobile
-     * client that retries on a flaky connection, or an office behind one NAT gateway, both
-     * change what "abusive" means — and that recalibration must not require a code change.
-     *
-     * The defaults are deliberately generous enough for a human and far too tight for a
-     * script: a person mistyping a password four times is normal, four hundred attempts is
-     * not.
-     */
-    authRateLimitWindowSeconds: z.coerce.number().int().positive().max(3_600).default(60),
-    /** Every login/register attempt from one address. Caps Argon2 CPU. */
-    authRateLimitIpMax: z.coerce.number().int().positive().default(10),
-    /** FAILED authentications per address per store. Caps guesses at one account. */
-    authRateLimitEmailMax: z.coerce.number().int().positive().default(5),
-
-    /**
-     * Refresh attempts per IP per window. Deliberately MUCH higher than the login limit.
-     *
-     * Refresh is a scheduled background call, not a human action: every active client wakes up
-     * every ~15 minutes to rotate, so an office or a mobile carrier behind one NAT address
-     * legitimately produces far more refreshes than logins. Setting this to the login limit
-     * would break the largest customers first and present as a random logout.
-     */
-    authRateLimitRefreshIpMax: z.coerce.number().int().positive().default(60),
-
     reservationTtlMinutes: z.coerce.number().int().positive().default(15),
     outboxPollIntervalMs: z.coerce.number().int().positive().default(1_000),
     outboxBatchSize: z.coerce.number().int().positive().max(1_000).default(100),
@@ -241,7 +199,7 @@ const ConfigSchema = z
     paymentExpiryMinutes: z.coerce.number().int().positive().default(30),
 
     /**
-     * How often the leader-elected sweeper looks for due payments. Approved at 60_000 ms.
+     * How often the scheduler's sweeper looks for due payments. Approved at 60_000 ms.
      *
      * This bounds how long stock stays held past its window: worst case is the window plus one
      * cadence. It is not the window itself, and making it shorter does not expire anything
@@ -289,12 +247,6 @@ const ConfigSchema = z
     if (!cfg.sentryDsn) {
       issue('error reporting is required in production', 'SENTRY_DSN');
     }
-    /**
-     * Redis is used for caching (`REDIS_CACHE_URL`).
-     */
-    if (!cfg.redisCacheUrl && (cfg.redisLockUrl || cfg.redisQueueUrl)) {
-      // Allow single Redis instance via REDIS_CACHE_URL for caching.
-    }
   });
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -311,8 +263,6 @@ function readEnvironment(env: NodeJS.ProcessEnv): Record<string, unknown> {
     databasePoolMax: env['DATABASE_POOL_MAX'],
     databaseStatementTimeoutMs: env['DATABASE_STATEMENT_TIMEOUT_MS'],
 
-    redisCacheUrl: env['REDIS_CACHE_URL'],
-    redisLockUrl: env['REDIS_LOCK_URL'],
     redisQueueUrl: env['REDIS_QUEUE_URL'],
 
     jwtPrivateKey: env['JWT_PRIVATE_KEY'],
@@ -345,10 +295,6 @@ function readEnvironment(env: NodeJS.ProcessEnv): Record<string, unknown> {
 
     defaultCurrency: env['DEFAULT_CURRENCY'],
     defaultStoreSlug: env['DEFAULT_STORE_SLUG'],
-    authRateLimitWindowSeconds: env['AUTH_RATE_LIMIT_WINDOW_SECONDS'],
-    authRateLimitIpMax: env['AUTH_RATE_LIMIT_IP_MAX'],
-    authRateLimitEmailMax: env['AUTH_RATE_LIMIT_EMAIL_MAX'],
-    authRateLimitRefreshIpMax: env['AUTH_RATE_LIMIT_REFRESH_IP_MAX'],
     reservationTtlMinutes: env['RESERVATION_TTL_MINUTES'],
     outboxPollIntervalMs: env['OUTBOX_POLL_INTERVAL_MS'],
     outboxBatchSize: env['OUTBOX_BATCH_SIZE'],

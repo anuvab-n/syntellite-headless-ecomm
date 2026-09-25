@@ -10,14 +10,14 @@ import { store } from './store.js';
  * Email login from the first migration — there is no username column and never will be.
  * Retrofitting the login identifier means reissuing every credential in the system.
  *
- * Scoped per store: the same person shopping at two storefronts has two accounts. That
- * matches the reference schema and keeps a merchant's customer list genuinely theirs.
+ * A single global identity: one account per email across every store. The row carries no
+ * `store_id`; a customer "belongs" to a store only through store-scoped rows they own (orders),
+ * and every staff-facing customer query derives membership from those.
  */
 export const appUser = pgTable(
   'app_user',
   {
     id: primaryId(),
-    storeId: storeIdColumn(() => store.id),
 
     /**
      * Normalised to lowercase at the API boundary, but uniqueness is enforced on
@@ -55,52 +55,24 @@ export const appUser = pgTable(
     ...timestamps,
   },
   (t) => [
-    // Partial + expression: one active account per email per store, case-insensitive.
+    // Partial + expression: one active account per email globally, case-insensitive.
     // Excluding soft-deleted rows lets an erased customer sign up again later.
     uniqueIndex('uq_user_email_active')
-      .on(t.storeId, sql`lower(${t.email})`)
+      .on(sql`lower(${t.email})`)
       .where(sql`${t.deletedAt} IS NULL`),
     uniqueIndex('uq_user_phone_active')
-      .on(t.storeId, t.phone)
+      .on(t.phone)
       .where(sql`${t.deletedAt} IS NULL AND ${t.phone} IS NOT NULL`),
 
     /**
-     * FK TARGET ONLY — `address` references `(user_id, store_id)`.
-     *
-     * PostgreSQL requires a unique constraint on exactly the referenced columns of a composite
-     * foreign key; without this, the key is rejected with "there is no unique constraint
-     * matching given keys". Trivially unique because `id` is already the primary key, so it
-     * adds no new guarantee about `app_user` — its entire purpose is to let a child table pin
-     * a row's owner AND that owner's store in one constraint, so a cross-store child row is
-     * unrepresentable rather than merely rejected by application code.
-     *
-     * The same pattern `uq_sku_id_store` established for `sku_option_value` and `stock_item`.
-     */
-    uniqueIndex('uq_app_user_id_store').on(t.id, t.storeId),
-
-    /**
-     * **The staff customer list, newest first** — `GET /admin/customers`, Increment 51.
-     *
-     * Neither index above can serve it. `uq_user_email_active` leads with `(store_id,
-     * lower(email))`, which orders by email and not by age; `uq_app_user_id_store` leads with
-     * `id`. So a store-wide list ordered by `created_at` had no usable path and fell back to a
-     * sequential scan of every account in the table.
-     *
-     * Measured on 60,000 accounts across three stores before this index was added, rather than
-     * assumed:
-     *
-     * ```
-     *   without : Seq Scan on app_user,                      6.540 ms
-     *   with    : Index Scan Backward using this index,      0.044 ms
-     * ```
+     * **The customer list, newest first**
      *
      * PARTIAL on `deleted_at IS NULL`, matching the list's own predicate and every other read
      * in this module: an erased account is invisible to staff for the same reason it is
-     * invisible to authentication. The partial form also keeps the index off rows no query
-     * here will ever want, which is the same judgement `uq_user_email_active` makes.
+     * invisible to authentication.
      */
-    index('ix_app_user_store_created')
-      .on(t.storeId, t.createdAt)
+    index('ix_app_user_created')
+      .on(t.createdAt)
       .where(sql`${t.deletedAt} IS NULL`),
   ],
 );

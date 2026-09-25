@@ -63,14 +63,14 @@ describe('idempotency middleware (integration)', () => {
     await testDb.truncate();
     storeId = (await seedTestStore(testDb)).id;
 
-    // Real rows, because `fk_idempotency_user_store` is a real constraint.
+    // Real rows, because the `user_id` foreign key is a real constraint.
     userId = newId();
     otherUserId = newId();
     await db()
       .insert(appUser)
       .values([
-        { id: userId, storeId, email: 'ada@example.com', passwordHash: 'x' },
-        { id: otherUserId, storeId, email: 'grace@example.com', passwordHash: 'x' },
+        { id: userId, email: 'ada@example.com', passwordHash: 'x' },
+        { id: otherUserId, email: 'grace@example.com', passwordHash: 'x' },
       ]);
   });
 
@@ -706,16 +706,10 @@ describe('idempotency middleware (integration)', () => {
       await db()
         .insert(store)
         .values({ id: otherStoreId, slug: 'second', name: 'Second', isActive: true });
-      /**
-       * A user in THAT store, because `fk_idempotency_user_store` requires the key's user to
-       * belong to its store. Reusing this store's user id is refused by the database — which is
-       * itself the tenancy guarantee, so the fixture proves it rather than working around it.
-       */
       const foreignUserId = newId();
       await db().insert(appUser).values({
         id: foreignUserId,
-        storeId: otherStoreId,
-        email: 'ada@example.com',
+        email: 'ada.second@example.com',
         passwordHash: 'x',
       });
 

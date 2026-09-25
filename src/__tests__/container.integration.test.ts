@@ -1,7 +1,3 @@
-import { once } from 'node:events';
-
-import type { Redis } from 'ioredis';
-
 import { eq } from 'drizzle-orm';
 import request from 'supertest';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -29,20 +25,6 @@ import { newId } from '../shared/id.js';
  * which is not a property anybody cares about.
  */
 describe('composition root (integration)', () => {
-  /**
-   * The lock client, asserted present.
-   *
-   * `AppContainer.locks` is `Redis | undefined` because a deployment with no
-   * `REDIS_LOCK_URL` builds no client at all. Every container in this file is built with
-   * one, so an absence here is a wiring bug rather than a case to handle — throwing says
-   * that, where a `?.` would quietly turn it into a passing test that asserted nothing.
-   */
-  function locksOf(container: AppContainer): Redis {
-    const { locks } = container;
-    if (!locks) throw new Error('expected the container to have built a lock client');
-    return locks;
-  }
-
   let testDb: TestDatabase;
   let redis: TestRedis;
   const built: AppContainer[] = [];
@@ -92,7 +74,6 @@ describe('composition root (integration)', () => {
 
       expect(container.config.environment).toBe('test');
       expect(container.db.pool).toBeDefined();
-      expect(container.locks).toBeDefined();
       expect(container.outbox.events).toBeDefined();
       expect(container.app).toBeDefined();
     });
@@ -161,12 +142,11 @@ describe('composition root (integration)', () => {
     it('serves GET /health/ready with 200 when dependencies are healthy', async () => {
       const response = await request(build().app).get('/health/ready');
 
-      // Both probes are the REAL ones the container wired: a live Postgres query and a
-      // live Redis PING.
+      // The REAL probe the container wired: a live Postgres query. Nothing else is required.
       expect(response.status).toBe(200);
       expect(response.body).toEqual({
         status: 'ok',
-        checks: { postgres: 'ok', redis: 'ok' },
+        checks: { postgres: 'ok' },
       });
     });
 
@@ -209,27 +189,7 @@ describe('composition root (integration)', () => {
       expect(response.body.error.code).toBe('VALIDATION_ERROR');
     });
 
-    it('wires rate limiting onto the auth routes', async () => {
-      await seedTestStore(testDb);
-      const app = build().app;
-
-      /**
-       * The limiters are OPTIONAL in `createIdentityRoutes`, so that unit tests can mount the
-       * router without Redis. That makes forgetting to pass them a silent, total loss of
-       * brute-force protection which every other test in the suite would still pass — so the
-       * composition root is asserted to supply them.
-       *
-       * Asserted through the `X-RateLimit-*` headers rather than by exhausting the budget:
-       * the real config allows 10 attempts a minute, and burning ten Argon2 verifications to
-       * learn one boolean would add seconds to every run of this suite.
-       */
-      const response = await request(app).post('/api/v1/auth/login').send({});
-
-      expect(response.headers['x-ratelimit-limit']).toBe(String(testDb.config.authRateLimitIpMax));
-      expect(response.headers['x-ratelimit-remaining']).toBeDefined();
-    });
-
-    it('serves the refresh route with its own rate-limit policy', async () => {
+    it('serves the refresh route', async () => {
       await seedTestStore(testDb);
 
       const response = await request(build().app)
@@ -239,18 +199,6 @@ describe('composition root (integration)', () => {
       // Reachable, and reaching the service rather than 404ing at the router.
       expect(response.status).toBe(401);
       expect(response.body.error.code).toBe('INVALID_REFRESH_TOKEN');
-
-      /**
-       * The refresh limit, NOT the login limit. Wiring `ipPolicy` here by mistake would
-       * throttle every client that rotates on a schedule from behind one NAT gateway, and it
-       * would present to them as a random forced logout rather than as a rate limit.
-       */
-      expect(response.headers['x-ratelimit-limit']).toBe(
-        String(testDb.config.authRateLimitRefreshIpMax),
-      );
-      expect(testDb.config.authRateLimitRefreshIpMax).toBeGreaterThan(
-        testDb.config.authRateLimitIpMax,
-      );
     });
 
     it('protects the catalogue DELETE route with the STAFF scope specifically', async () => {
@@ -418,29 +366,6 @@ describe('composition root (integration)', () => {
        */
       expect((await createProduct(await login())).status).toBe(201);
     });
-
-    it('reports redis unavailable after the lock client is closed', async () => {
-      const container = build();
-
-      // Ready before.
-      await expect(request(container.app).get('/health/ready')).resolves.toMatchObject({
-        status: 200,
-      });
-
-      // Close only the Redis client, leaving Postgres up. This is the closest honest
-      // simulation of a Redis outage without disturbing the shared container.
-      await locksOf(container).quit();
-
-      const response = await request(container.app).get('/health/ready');
-
-      // Redis is `required: true` here because it holds idempotency keys, and the
-      // degradation policy fails closed on anything touching money.
-      expect(response.status).toBe(503);
-      expect(response.body).toEqual({
-        status: 'unavailable',
-        checks: { postgres: 'ok', redis: 'unavailable' },
-      });
-    });
   });
 
   /* ── 3. Outbox wired through the container ─────────────────────────────── */
@@ -577,34 +502,6 @@ describe('composition root (integration)', () => {
       await expect(container.shutdown()).resolves.toBeUndefined();
     }, 30_000);
 
-    it('closes the lock client', async () => {
-      const container = buildContainer({
-        role: 'api',
-        config: buildTestConfig({ databaseUrl: testDb.connectionUri, redisUrl: redis.url }),
-      });
-
-      // Through the readiness probe rather than a bare `ping()`: the probe waits for the
-      // client to reach 'ready', whereas a raw command on a still-connecting socket throws
-      // because the offline queue is disabled.
-      await request(container.app).get('/health/ready');
-      expect(locksOf(container).status).toBe('ready');
-
-      await container.shutdown();
-
-      /**
-       * `quit()` resolves when the QUIT reply arrives, but ioredis transitions to 'end' a
-       * tick later, once the socket actually closes — so asserting the status immediately
-       * is a race. Waiting for the event is deterministic, and if the client never reaches
-       * 'end' the test times out, which is the genuine bug worth catching: a connected
-       * client keeps the event loop alive and the process never exits.
-       */
-      const locks = locksOf(container);
-      if (locks.status !== 'end') {
-        await once(locks, 'end');
-      }
-      expect(locks.status).toBe('end');
-    }, 30_000);
-
     it('survives shutdown when a dependency is already gone', async () => {
       const container = buildContainer({
         role: 'api',
@@ -612,9 +509,6 @@ describe('composition root (integration)', () => {
       });
 
       // Close things out from under it, as an unlucky ordering during a crash would.
-      // `quit()` itself can reject when the socket was never writeable, which is precisely
-      // the "already gone" state being simulated.
-      await locksOf(container).quit().catch(() => undefined);
       await container.db.close();
 
       // Shutdown must still complete: one resource failing to close must not abandon the

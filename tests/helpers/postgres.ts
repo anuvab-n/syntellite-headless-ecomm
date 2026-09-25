@@ -94,8 +94,6 @@ function testEnvironment(databaseUrl: string, redisBaseUrl?: string): NodeJS.Pro
     PORT: '8000',
     DATABASE_URL: databaseUrl,
     DATABASE_POOL_MAX: '5',
-    REDIS_CACHE_URL: `${redis}/10`,
-    REDIS_LOCK_URL: `${redis}/11`,
     REDIS_QUEUE_URL: `${redis}/12`,
     JWT_PRIVATE_KEY: getTestKeyPair().privateKey,
     JWT_PUBLIC_KEY: getTestKeyPair().publicKey,

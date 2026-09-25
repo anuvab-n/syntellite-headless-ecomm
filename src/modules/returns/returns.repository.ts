@@ -620,10 +620,7 @@ export function createReturnsRepository(deps: { db: Database }) {
           order,
           and(eq(returnRequest.orderId, order.id), eq(returnRequest.storeId, order.storeId)),
         )
-        .innerJoin(
-          appUser,
-          and(eq(returnRequest.userId, appUser.id), eq(returnRequest.storeId, appUser.storeId)),
-        )
+        .innerJoin(appUser, eq(returnRequest.userId, appUser.id))
         .where(
           and(
             eq(returnRequest.returnNumber, params.returnNumber),
@@ -730,10 +727,7 @@ export function createReturnsRepository(deps: { db: Database }) {
           order,
           and(eq(returnRequest.orderId, order.id), eq(returnRequest.storeId, order.storeId)),
         )
-        .innerJoin(
-          appUser,
-          and(eq(returnRequest.userId, appUser.id), eq(returnRequest.storeId, appUser.storeId)),
-        )
+        .innerJoin(appUser, eq(returnRequest.userId, appUser.id))
         .where(predicate)
         .orderBy(desc(returnRequest.requestedAt), desc(returnRequest.returnNumber))
         .limit(params.limit)
@@ -742,8 +736,7 @@ export function createReturnsRepository(deps: { db: Database }) {
       /*
        * The count repeats the SAME joins, because the search predicate reaches into `order` and
        * `app_user`. Counting over `return_request` alone would report a total the page could
-       * never reach. Both joins are on `(id, store_id)` composite keys, so neither can multiply
-       * a row; the SKU arm of the search is an EXISTS for the same reason.
+       * never reach.
        */
       const [counted] = await executor(db)
         .select({ total: sql<string>`count(*)` })
@@ -752,10 +745,7 @@ export function createReturnsRepository(deps: { db: Database }) {
           order,
           and(eq(returnRequest.orderId, order.id), eq(returnRequest.storeId, order.storeId)),
         )
-        .innerJoin(
-          appUser,
-          and(eq(returnRequest.userId, appUser.id), eq(returnRequest.storeId, appUser.storeId)),
-        )
+        .innerJoin(appUser, eq(returnRequest.userId, appUser.id))
         .where(predicate);
 
       return {

@@ -96,8 +96,8 @@ export function createOutboxSubsystem(opts: CreateOutboxSubsystemOptions): Outbo
     };
   }
 
-  // transport === 'queue': disabled for now — no queue system, Redis used only for locks and
-  // rate limiting. See the module docblock above for what this used to build.
+  // transport === 'queue': disabled for now — no queue system. See the module docblock above
+  // for what this used to build.
   throw new Error(
     "createOutboxSubsystem: transport 'queue' is disabled for now — BullMQ support was " +
       "removed from outbox.module.ts and queues.ts. Use transport: 'in-process' (the " +

@@ -10,7 +10,7 @@ import type { Logger } from '../shared/logger.js';
  * for a provider API is a sibling file plus one line in the composition root — the same shape
  * `razorpay/gateway.ts` gives the payment provider.
  *
- * Parallel to `redis/rate-limiter.ts`: an adapter for an external system, at the top level
+ * Parallel to `razorpay/gateway.ts`: an adapter for an external system, at the top level
  * rather than inside a domain module, because a domain module that imported a transport could
  * not be tested without one.
  *

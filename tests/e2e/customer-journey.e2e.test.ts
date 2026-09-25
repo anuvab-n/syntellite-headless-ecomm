@@ -344,7 +344,6 @@ describe('customer journey (e2e)', () => {
 
       const rows = await db().select().from(appUser).where(eq(appUser.id, journey.customerId));
       expect(rows).toHaveLength(1);
-      expect(rows[0]?.storeId).toBe(journey.storeId);
       expect(rows[0]?.isStaff).toBe(false);
     });
 
@@ -904,7 +903,6 @@ describe('customer journey (e2e)', () => {
         .where(eq(order.orderNumber, journey.codOrderNumber));
       expect(rows).toHaveLength(1);
       expect(rows[0]?.userId).toBe(journey.customerId);
-      expect(rows[0]?.storeId).toBe(journey.storeId);
 
       const lines = await db().select().from(orderLine).where(eq(orderLine.orderId, rows[0]!.id));
       expect(lines).toHaveLength(1);

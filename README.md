@@ -198,9 +198,6 @@ startup error with a clear message rather than an `undefined` surfacing hours la
 | Variable                 | Example                                          | What it does                                                                                              |
 | ------------------------ | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `DATABASE_URL`           | `postgresql://user:pass@host/db?sslmode=require` | Primary PostgreSQL connection                                                                             |
-| `REDIS_CACHE_URL`        | `redis://localhost:56379/0`                      | Cache database                                                                                            |
-| `REDIS_LOCK_URL`         | `redis://localhost:56379/1`                      | Idempotency keys and rate-limit counters                                                                  |
-| `REDIS_QUEUE_URL`        | `redis://localhost:56379/2`                      | BullMQ job queue                                                                                          |
 | `JWT_PRIVATE_KEY`        | PEM, newlines as `\n`                            | Signs access tokens (`pnpm keys:generate`)                                                                |
 | `JWT_PUBLIC_KEY`         | PEM, newlines as `\n`                            | Verifies them                                                                                             |
 | `JWT_ISSUER`             | `ecom-local`                                     | Token `iss` claim                                                                                         |
@@ -208,10 +205,6 @@ startup error with a clear message rather than an `undefined` surfacing hours la
 | `CORS_ALLOWED_ORIGINS`   | `http://localhost:3000`                          | Comma-separated allowlist. Refuses to boot with `*` in production                                         |
 | `SMTP_HOST`              | `localhost`                                      | Outbound mail host                                                                                        |
 | `S3_BUCKET`, `S3_REGION` | `ecom-dev`, `ap-south-1`                         | **Vestigial.** Nothing reads them, but `config.ts` requires them to boot. There is no file upload feature |
-
-> **`REDIS_LOCK_URL` must point at a Redis with `noeviction`.** It holds idempotency keys, and
-> evicting one of those is a duplicate charge, not a cache miss. The local Compose Redis shares one
-> instance across all three databases for convenience; production must separate them.
 
 ### Needed for specific features
 
@@ -223,27 +216,24 @@ startup error with a clear message rather than an `undefined` surfacing hours la
 | `SMTP_PORT`               | `1025`                                 | Mailpit's port locally; `587` for a real provider                                                 |
 | `MAIL_FROM`               | `no-reply@localhost`                   | Sender address on password-reset email                                                            |
 | `PASSWORD_RESET_URL_BASE` | `http://localhost:3000/reset-password` | Where the reset link points. **This is a frontend URL** — get it from whoever owns the storefront |
+| `REDIS_QUEUE_URL`         | —                                      | Only the outbox's opt-in `queue` transport. The app needs no Redis otherwise                      |
 
 ### Tunable, with sensible defaults
 
-| Variable                         | Default       | Notes                                                |
-| -------------------------------- | ------------- | ---------------------------------------------------- |
-| `PORT`                           | `8000`        |                                                      |
-| `NODE_ENV` / `ENVIRONMENT`       | `development` | `/docs` is not mounted when `ENVIRONMENT=production` |
-| `DEFAULT_STORE_SLUG`             | `default`     | Which store a request resolves to                    |
-| `DEFAULT_CURRENCY`               | `INR`         | One of `INR USD EUR GBP AED JPY`                     |
-| `JWT_ACCESS_TTL_MINUTES`         | `15`          | Access tokens are short-lived by design              |
-| `JWT_REFRESH_TTL_DAYS`           | `30`          |                                                      |
-| `DATABASE_POOL_MAX`              | `10`          |                                                      |
-| `DATABASE_STATEMENT_TIMEOUT_MS`  | `30000`       |                                                      |
-| `AUTH_RATE_LIMIT_WINDOW_SECONDS` | `60`          |                                                      |
-| `AUTH_RATE_LIMIT_IP_MAX`         | `10`          | Login attempts per IP per window                     |
-| `AUTH_RATE_LIMIT_EMAIL_MAX`      | `5`           | Per email address                                    |
-| `AUTH_RATE_LIMIT_REFRESH_IP_MAX` | `60`          |                                                      |
-| `OUTBOX_POLL_INTERVAL_MS`        | `1000`        | How often the dispatcher drains the outbox           |
-| `OUTBOX_BATCH_SIZE`              | `100`         |                                                      |
-| `LOG_LEVEL`                      | `info`        |                                                      |
-| `LOG_FORMAT`                     | `json`        | Use `pretty` locally                                 |
+| Variable                        | Default       | Notes                                                |
+| ------------------------------- | ------------- | ---------------------------------------------------- |
+| `PORT`                          | `8000`        |                                                      |
+| `NODE_ENV` / `ENVIRONMENT`      | `development` | `/docs` is not mounted when `ENVIRONMENT=production` |
+| `DEFAULT_STORE_SLUG`            | `default`     | Which store a request resolves to                    |
+| `DEFAULT_CURRENCY`              | `INR`         | One of `INR USD EUR GBP AED JPY`                     |
+| `JWT_ACCESS_TTL_MINUTES`        | `15`          | Access tokens are short-lived by design              |
+| `JWT_REFRESH_TTL_DAYS`          | `30`          |                                                      |
+| `DATABASE_POOL_MAX`             | `10`          |                                                      |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `30000`       |                                                      |
+| `OUTBOX_POLL_INTERVAL_MS`       | `1000`        | How often the dispatcher drains the outbox           |
+| `OUTBOX_BATCH_SIZE`             | `100`         |                                                      |
+| `LOG_LEVEL`                     | `info`        |                                                      |
+| `LOG_FORMAT`                    | `json`        | Use `pretty` locally                                 |
 
 ---
 
@@ -788,7 +778,6 @@ Beyond the three in [What works and what doesn't](#what-works-and-what-doesnt):
 | Registration succeeded but you have no token                                       | Registration returns the user only. Call `/auth/login`                                                                                                                          |
 | `503` on `method: "online"`                                                        | No Razorpay keys configured. COD works                                                                                                                                          |
 | `409` on a payment attempt                                                         | That order already has a payment. One payment per order, enforced by a unique constraint, with no retry                                                                         |
-| `DEPENDENCY_UNAVAILABLE`, `dependency: rate-limiter`                               | Redis is down or saturated. `docker compose up -d`, and don't run the test suite at the same time                                                                               |
 | No password-reset email                                                            | `pnpm dev:worker` is not running — the API only queues the event. Then check http://localhost:8025                                                                              |
 | `/health/ready` says postgres unavailable, then fine                               | Neon cold start exceeding the 2s timeout. Probe again                                                                                                                           |
 | Tests fail with `Memory allocation error` or scattered `401`s                      | Out of memory. Use `pnpm exec vitest run --fileParallelism=false`                                                                                                               |

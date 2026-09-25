@@ -220,7 +220,6 @@ export async function createOrPromoteAdmin(
   const userId = await withTransaction(db, logger, async () => {
     const row = await identityRepository.insertUser({
       id: newId(),
-      storeId: store.id,
       email: input.email,
       passwordHash,
       firstName: input.firstName ?? '',

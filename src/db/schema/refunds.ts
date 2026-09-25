@@ -207,7 +207,9 @@ export const refund = pgTable(
     requestKey: varchar('request_key', { length: 255 }),
 
     /** The staff member who raised it. NOT NULL: a refund is always somebody's decision. */
-    initiatedBy: uuid('initiated_by').notNull(),
+    initiatedBy: uuid('initiated_by')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     /** When the refund reached a terminal status. See `ck_refund_settled_at`. */
     settledAt: tsColumn('settled_at'),
@@ -271,12 +273,6 @@ export const refund = pgTable(
       columns: [t.returnId, t.storeId],
       foreignColumns: [returnRequest.id, returnRequest.storeId],
       name: 'fk_refund_return_store',
-    }).onDelete('restrict'),
-
-    foreignKey({
-      columns: [t.initiatedBy, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_refund_initiator_store',
     }).onDelete('restrict'),
 
     check('ck_refund_status', sql`${t.status} in ('pending', 'processing', 'succeeded', 'failed')`),

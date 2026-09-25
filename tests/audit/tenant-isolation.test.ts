@@ -25,11 +25,9 @@ import {
  * `lockOwnedOrderByNumber` and the ENTIRE suite still passed. Nothing anywhere proved that
  * predicate does anything.
  *
- * It is not currently exploitable — `app_user.id` is unique across stores and
- * `fk_order_user_store` ties an order's user to the order's store, so filtering by `user_id`
- * alone already lands inside one tenant. The store predicate is defence in depth. But an
- * untested guard is a guard that can be deleted during a refactor without a single test going
- * red, and this one sits on the path returns and cancellation both take.
+ * `app_user` is a single global identity, so one user can own rows in several stores and
+ * filtering by `user_id` alone does NOT land inside one tenant. The store predicate is the
+ * only tenancy guard, and it sits on the path returns and cancellation both take.
  *
  * Tested at the REPOSITORY rather than over HTTP deliberately: reaching two stores through the
  * API means defeating the container's store resolver cache, which would test the harness more
@@ -66,7 +64,6 @@ describe('tenant isolation — order lookups (audit)', () => {
     userA = newId();
     await testDb.handle.db.insert(appUser).values({
       id: userA,
-      storeId: storeA,
       email: `tenant.a.${userA}@example.com`,
       passwordHash: 'x',
       firstName: 'Ada',

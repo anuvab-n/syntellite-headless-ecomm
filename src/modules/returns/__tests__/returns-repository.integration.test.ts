@@ -59,7 +59,6 @@ describe('returns repository — guards the HTTP suites cannot reach (integratio
     const userId = newId();
     await testDb.handle.db.insert(appUser).values({
       id: userId,
-      storeId: storeA,
       email: `repo.${userId}@example.com`,
       passwordHash: 'x',
       firstName: 'Ada',
@@ -277,10 +276,8 @@ describe('returns repository — guards the HTTP suites cannot reach (integratio
     });
 
     it('never finds another tenant return by the customer email', async () => {
-      const [owner] = await testDb.handle.db
-        .select()
-        .from(appUser)
-        .where(eq(appUser.storeId, storeA));
+      // The only user this suite seeds — the owner of store A's return.
+      const [owner] = await testDb.handle.db.select().from(appUser).limit(1);
 
       const mine = await page({ storeId: storeA, q: owner!.email });
       expect(mine.items.map((r) => r.returnNumber)).toContain(returnNumber);

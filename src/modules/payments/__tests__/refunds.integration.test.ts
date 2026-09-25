@@ -1180,7 +1180,6 @@ describe('refunds and return completion (integration)', () => {
         .insert(appUser)
         .values({
           id: foreignUserId,
-          storeId: foreignStoreId,
           email: `foreign.${foreignUserId}@example.com`,
           passwordHash: 'x'.repeat(32),
           firstName: 'F',

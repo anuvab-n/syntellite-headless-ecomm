@@ -12,7 +12,6 @@ import {
   startTestDatabase,
   type TestDatabase,
 } from '../../../../tests/helpers/postgres.ts';
-import type { ResolvedStore } from '../../stores/index.js';
 import { createDefaultStoreResolver, createStoreRepository } from '../../stores/index.js';
 import { createIdentityRepository } from '../identity.repository.js';
 import { createIdentityRoutes } from '../identity.routes.js';
@@ -34,7 +33,6 @@ import { testRecorders } from '../../../../tests/helpers/recording.ts';
  */
 describe('POST /api/v1/auth/register (integration)', () => {
   let testDb: TestDatabase;
-  let store: ResolvedStore;
 
   beforeAll(async () => {
     testDb = await startTestDatabase();
@@ -46,9 +44,9 @@ describe('POST /api/v1/auth/register (integration)', () => {
 
   beforeEach(async () => {
     await testDb.truncate();
-    // Re-seeded after truncate: `app_user.store_id` is NOT NULL, so without a store there
-    // is nothing to register against.
-    store = await seedTestStore(testDb);
+    // Re-seeded after truncate: every request resolves a store, so without one there is
+    // nothing to register against.
+    await seedTestStore(testDb);
   });
 
   const db = () => testDb.handle.db;
@@ -129,17 +127,15 @@ describe('POST /api/v1/auth/register (integration)', () => {
       });
     });
 
-    it('persists the user against the RESOLVED store', async () => {
+    it('persists exactly one global account', async () => {
       const response = await post(validBody);
 
-      const [row] = await db()
+      const rows = await db()
         .select()
         .from(appUser)
         .where(eq(appUser.id, response.body.user.id as string));
 
-      // The store came from `resolveStore`, never from the request body — there is no field
-      // for it in the DTO at all.
-      expect(row?.storeId).toBe(store.id);
+      expect(rows).toHaveLength(1);
     });
 
     it('stores an Argon2id hash that verifies, and never the plaintext', async () => {

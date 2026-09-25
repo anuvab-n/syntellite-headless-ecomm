@@ -10,8 +10,8 @@ import { createDatabase, type Database } from './client.js';
  * Seeding.
  *
  * Creates the minimum a running system needs and nothing more. Right now that is exactly one
- * row: the store every request resolves to. `app_user.store_id` is NOT NULL, so without it
- * registration cannot work at all — this is the bootstrap step, not demo data.
+ * row: the store every request resolves to. Every request is store-scoped, so without it
+ * nothing can be served at all — this is the bootstrap step, not demo data.
  *
  * IDEMPOTENT by construction, not by convention. `pnpm db:seed` is expected to be run
  * repeatedly: by a developer, by a test helper, and potentially by a deploy hook. It relies

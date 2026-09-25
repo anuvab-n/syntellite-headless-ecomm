@@ -190,24 +190,6 @@ const TIMING_EQUALISER_PASSWORD = 'timing-equaliser-not-a-real-credential';
 const MAX_USER_AGENT_LENGTH = 512;
 
 /**
- * The per-account failure budget, as seen by this service.
- *
- * A narrow port, not the `RateLimiter` itself. The service must be able to say "that attempt
- * failed" without knowing that the counter lives in Redis, has a fixed window, or is keyed by
- * a hash — otherwise logging in could not be driven from a CLI or a test without standing up
- * Redis, and the domain layer would depend on infrastructure.
- *
- * Why the SERVICE and not the middleware: only this method knows whether the credentials were
- * valid. Counting in middleware would spend budget on the successful retry after a typo.
- */
-export type LoginAttemptTracker = {
-  /** Count one failed authentication against this address. */
-  recordFailure(params: { storeId: string; email: string }): Promise<void>;
-  /** Forget this address's failures, after proof of ownership. */
-  clear(params: { storeId: string; email: string }): Promise<void>;
-};
-
-/**
  * **Order facts about this store's customers.** Increment 56. The module's first domain port.
  *
  * The staff customer list publishes an order count, a total and a last-order instant per row.
@@ -269,15 +251,9 @@ export function createIdentityService(deps: {
   config: Config;
   logger: Logger;
   /**
-   * Optional so every existing construction site and test keeps working untouched. When
-   * absent, failures simply are not counted — the per-IP limiter still caps CPU, and the
-   * composition root always supplies one, so production is never unprotected.
-   */
-  loginAttempts?: LoginAttemptTracker;
-  /**
    * Order aggregates for the staff customer surface. Increment 56.
    *
-   * Optional for the reason `loginAttempts` is: several suites construct this service to assert
+   * Optional: several suites construct this service to assert
    * authentication behaviour and have no orders module to hand. When absent, the customer reads
    * report zero orders and no last-order date rather than failing — which is the same answer a
    * store with no orders gets, and the composition root always supplies it.
@@ -327,34 +303,6 @@ export function createIdentityService(deps: {
       };
     });
   };
-
-  /**
-   * Report an attempt outcome to the failure budget. Never throws.
-   *
-   * Deliberately best-effort. By the time this runs the authentication decision is already
-   * made, and the enforcement point — the middleware that refused the request — has already
-   * passed. Letting a Redis blip here turn a correct 401 into a 500, or worse, fail a
-   * SUCCESSFUL login because the counter could not be cleared, would trade a real outage for
-   * a marginal gain in accounting accuracy.
-   *
-   * This is not a hole in the fail-closed posture: the CHECK fails closed with a 503. Only
-   * the bookkeeping after the decision is tolerant.
-   */
-  async function trackAttempt(
-    outcome: 'failed' | 'succeeded',
-    params: { storeId: string; email: string },
-  ): Promise<void> {
-    if (!deps.loginAttempts) return;
-
-    try {
-      await (outcome === 'failed'
-        ? deps.loginAttempts.recordFailure(params)
-        : deps.loginAttempts.clear(params));
-    } catch (err) {
-      // No email in the log line — same non-enumeration rule as everywhere else in this file.
-      logger.error({ err, storeId: params.storeId, outcome }, 'login_attempt_tracking_failed');
-    }
-  }
 
   /**
    * The dummy hash, computed once and cached as a promise.
@@ -444,7 +392,6 @@ export function createIdentityService(deps: {
         const user = await withTransaction(db, logger, async () => {
           const row = await repository.insertUser({
             id: newId(),
-            storeId,
             email,
             passwordHash,
             // The column defaults are `''`; the DTO makes these optional, so normalise here
@@ -582,17 +529,6 @@ export function createIdentityService(deps: {
          * database access.
          */
         logger.info({ storeId }, 'login_rejected_invalid_credentials');
-
-        /**
-         * Counted for BOTH branches — unknown email and wrong password alike.
-         *
-         * Counting only real accounts would make the 429 itself an enumeration oracle: five
-         * guesses at a nonexistent address would keep answering 401 while five at a real one
-         * started answering 429. The budget therefore tracks whatever the client sent,
-         * existing or not, which is the same principle that makes `InvalidCredentials`
-         * indistinguishable across causes.
-         */
-        await trackAttempt('failed', { storeId, email });
         throw new InvalidCredentials();
       }
 
@@ -606,27 +542,8 @@ export function createIdentityService(deps: {
        */
       if (!credentials.isActive) {
         logger.warn({ storeId, userId: credentials.id }, 'login_rejected_inactive_user');
-
-        /**
-         * A disabled account still counts, even though reaching here proves the password was
-         * correct. Repeated attempts against a suspended account are still unwanted load, and
-         * exempting them would hand an attacker who has already found valid credentials an
-         * unlimited-attempt path.
-         */
-        await trackAttempt('failed', { storeId, email });
         throw new InvalidCredentials();
       }
-
-      /**
-       * Cleared HERE — at the moment ownership is proven, not at the end of the method.
-       *
-       * Everything below this line is session persistence and token minting, which can fail
-       * for infrastructure reasons that say nothing about whether the caller is legitimate. If
-       * the budget were cleared after all of that, a user with four prior typos who then
-       * authenticated correctly but hit a database blip would still be one failure away from
-       * being locked out — punished for our outage.
-       */
-      await trackAttempt('succeeded', { storeId, email });
 
       const sessionId = newId();
       const familyId = newId();
@@ -662,7 +579,7 @@ export function createIdentityService(deps: {
        */
       const accessToken = await tokens.issueAccessToken({
         userId: credentials.id,
-        storeId: credentials.storeId,
+        storeId,
         isStaff: credentials.isStaff,
         isSuperuser: credentials.isSuperuser,
         sessionId,
@@ -1632,7 +1549,7 @@ export function createIdentityService(deps: {
            */
           const accessToken = await tokens.issueAccessToken({
             userId: outcome.user.id,
-            storeId: outcome.user.storeId,
+            storeId,
             isStaff: outcome.user.isStaff,
             isSuperuser: outcome.user.isSuperuser,
             sessionId: replacementSessionId,

@@ -1,15 +1,9 @@
 import { Router, type RequestHandler } from 'express';
 
 import { asyncHandler } from '../../http/async-handler.js';
-import {
-  RATE_LIMIT_BUCKETS,
-  rateLimitByEmail,
-  rateLimitByIp,
-} from '../../http/middleware/rate-limit.js';
 import { requireAuth, requireUser } from '../../http/middleware/auth.js';
 import { requireStore } from '../../http/middleware/store.js';
 import { validate, validatedBody, validatedParams, validatedQuery } from '../../http/validate.js';
-import type { RateLimiter, RateLimitPolicy } from '../../redis/rate-limiter.js';
 import type { Logger } from '../../shared/logger.js';
 import type { AdminCustomerFilters } from './identity.repository.js';
 import {
@@ -72,33 +66,8 @@ export function createIdentityRoutes(deps: {
    * not get this router at all.
    */
   tokens: TokenService;
-  /** Used by `requireAuth`. Separate from the rate-limit logger, which may be absent. */
+  /** Used by `requireAuth`. */
   logger: Logger;
-  /**
-   * Rate limiting, optional so existing tests can mount the router without Redis.
-   *
-   * When absent the endpoints are UNPROTECTED, which is correct for a unit test asserting
-   * handler behaviour and would be a serious defect in production — so the composition root
-   * always supplies it, and `container.integration.test.ts` asserts that it does.
-   */
-  rateLimit?: {
-    limiter: RateLimiter;
-    ipPolicy: RateLimitPolicy;
-    emailPolicy: RateLimitPolicy;
-    /**
-     * Refresh gets its OWN per-IP policy, much more generous than login's.
-     *
-     * Refresh is a scheduled background call rather than a human action: every active client
-     * rotates every ~15 minutes, so one NAT gateway legitimately produces far more refreshes
-     * than logins. Reusing `ipPolicy` here would throttle the largest customers first, and it
-     * would present to them as a random forced logout.
-     *
-     * Optional so a caller that omits it simply gets no refresh limiting, matching how the
-     * whole `rateLimit` block behaves.
-     */
-    refreshPolicy?: RateLimitPolicy;
-    logger: Logger;
-  };
   /**
    * The `staff` scope guard, pre-built by the composition root — the same instance the
    * catalogue, inventory, orders and payments routers use.
@@ -109,19 +78,14 @@ export function createIdentityRoutes(deps: {
    * privilege a route requires. Added in Increment 51 for `GET /admin/customers`, the module's
    * first staff route.
    *
-   * **Optional, and when it is absent the admin route is NOT MOUNTED** — the same shape
-   * `rateLimit` uses above, and for the same reason: a dozen existing suites mount this router
-   * directly to assert handler behaviour, and none of them has a scope loader.
-   *
-   * Note the asymmetry with `rateLimit`, which mounts its endpoints UNPROTECTED when absent.
-   * That would be indefensible here: an unguarded customer directory is a data breach, not a
-   * missing limit. So the route disappears instead, which is a safe default in a way that
-   * "mount it without the guard" could never be. `container.integration.test.ts` is what proves
-   * the composition root always supplies it.
+   * **Optional, and when it is absent the admin route is NOT MOUNTED**: a dozen existing
+   * suites mount this router directly to assert handler behaviour, and none of them has a
+   * scope loader. An unguarded customer directory is a data breach, so the route disappears
+   * instead. `container.integration.test.ts` proves the composition root always supplies it.
    */
   requireStaff?: RequestHandler;
 }): Router {
-  const { identity, tokens, logger, rateLimit, requireStaff } = deps;
+  const { identity, tokens, logger, requireStaff } = deps;
   const router = Router();
 
   /**
@@ -140,61 +104,13 @@ export function createIdentityRoutes(deps: {
   });
 
   /**
-   * Build the limiter chain for one endpoint, or nothing when rate limiting is not wired.
-   *
-   * Returned as an array and spread into `router.post`, because Express treats an empty array
-   * as "no middleware" — which keeps the route definitions below readable instead of
-   * branching around two different `router.post` calls per endpoint.
-   */
-  const limiters = (options: {
-    ipBucket: string;
-    email: boolean;
-    /** Which per-email bucket. Defaults to login's, which is what login and nothing else wants. */
-    emailBucket?: string | undefined;
-    /** Override the per-IP policy. Refresh uses its own; login and register share the default. */
-    ipPolicy?: RateLimitPolicy | undefined;
-  }): RequestHandler[] => {
-    if (!rateLimit) return [];
-    const { limiter, ipPolicy, emailPolicy, logger } = rateLimit;
-
-    const chain: RequestHandler[] = [
-      rateLimitByIp({
-        limiter,
-        policy: options.ipPolicy ?? ipPolicy,
-        bucket: options.ipBucket,
-        logger,
-      }),
-    ];
-
-    if (options.email) {
-      chain.push(
-        rateLimitByEmail({
-          limiter,
-          policy: emailPolicy,
-          bucket: options.emailBucket ?? RATE_LIMIT_BUCKETS.loginEmail,
-          logger,
-        }),
-      );
-    }
-
-    return chain;
-  };
-
-  /**
    * POST /auth/register
    *
    * 201 with the created user. No tokens: registering and signing in are separate
    * operations, and issuing a session here would be half of an unbuilt login.
-   *
-   * Rate limited by IP only. Registration also runs Argon2 — at the higher HASHING cost, not
-   * the verification cost — so it is the same CPU-exhaustion vector as login, and it is a
-   * signup-spam vector besides. There is no per-email budget because a per-address limit on
-   * registration would let an attacker who guesses an address block its real owner from ever
-   * signing up.
    */
   router.post(
     '/auth/register',
-    ...limiters({ ipBucket: RATE_LIMIT_BUCKETS.registerIp, email: false }),
     validate({ body: RegisterRequestSchema }),
     asyncHandler(async (req, res) => {
       // Throws an InvariantViolation (500) if the router was mounted without
@@ -221,20 +137,11 @@ export function createIdentityRoutes(deps: {
    * indistinguishable, because any difference here is an account-existence oracle: anyone
    * could test an address list against this endpoint and learn who shops here.
    *
-   * That makes rate limiting the actual defence, and it is applied on both dimensions — per IP
-   * so the endpoint cannot be swept, and per EMAIL so one customer's inbox cannot be flooded
-   * with reset mail by someone who knows their address.
-   *
    * No body in the response, and nothing about whether a mail was queued. A client cannot
    * usefully act on that information and an attacker very much can.
    */
   router.post(
     '/auth/forgot-password',
-    ...limiters({
-      ipBucket: RATE_LIMIT_BUCKETS.forgotPasswordIp,
-      email: true,
-      emailBucket: RATE_LIMIT_BUCKETS.forgotPasswordEmail,
-    }),
     validate({ body: ForgotPasswordRequestSchema }),
     asyncHandler(async (req, res) => {
       const store = requireStore(req);
@@ -258,16 +165,11 @@ export function createIdentityRoutes(deps: {
    * owner may have lost control of it, so leaving an attacker's refresh session alive would
    * defeat the point of resetting.
    *
-   * Rate limited per IP only — the request carries a token rather than an address, so there is
-   * no per-account key to bucket on, and guessing a 256-bit token is not a threat a counter
-   * defends against. The limit is there to cap the Argon2 hashing cost of a flood.
-   *
    * `400 INVALID_RESET_TOKEN` covers every failure: unknown, malformed, expired, already used,
    * minted for another store, or belonging to an account since deactivated.
    */
   router.post(
     '/auth/reset-password',
-    ...limiters({ ipBucket: RATE_LIMIT_BUCKETS.resetPasswordIp, email: false }),
     validate({ body: ResetPasswordRequestSchema }),
     asyncHandler(async (req, res) => {
       const store = requireStore(req);
@@ -286,23 +188,9 @@ export function createIdentityRoutes(deps: {
    *
    * The two pieces of request METADATA are extracted here, in the HTTP layer, and handed to
    * the service as plain values — the service never sees an Express object.
-   *
-   * Middleware order here is load-bearing:
-   *
-   *   resolveStore (mounted by the composition root, on the API router)
-   *     -> rateLimitByIp     counts every attempt, caps CPU
-   *     -> rateLimitByEmail  checks the failure budget, counts nothing
-   *     -> validate          400 on a malformed body
-   *     -> handler           Argon2 runs here, and only here
-   *
-   * Both limiters run BEFORE validation, on purpose. A flood of malformed bodies is still a
-   * flood, and validating first would let an attacker burn our CPU on Zod parsing without
-   * ever touching their budget. `resolveStore` must precede both, because the per-email
-   * subject includes the store id.
    */
   router.post(
     '/auth/login',
-    ...limiters({ ipBucket: RATE_LIMIT_BUCKETS.loginIp, email: true }),
     validate({ body: LoginRequestSchema }),
     asyncHandler(async (req, res) => {
       const store = requireStore(req);
@@ -342,20 +230,9 @@ export function createIdentityRoutes(deps: {
    * no cookie dependency, no `res.cookie` call, and no CSRF protection. A browser
    * automatically attaching a refresh cookie to a cross-site request is precisely the attack
    * a body-carried token cannot suffer.
-   *
-   * Rate limited by IP only, with its own generous policy. There is deliberately no per-email
-   * limiter: the request carries no email, so there is nothing to key on, and guessing a
-   * 256-bit token is not a threat that a counter defends against anyway. What the per-IP limit
-   * does defend is the write amplification of a client — or an attacker holding one stolen
-   * token — spinning rotations as fast as the network allows.
    */
   router.post(
     '/auth/refresh',
-    ...limiters({
-      ipBucket: RATE_LIMIT_BUCKETS.refreshIp,
-      email: false,
-      ipPolicy: rateLimit?.refreshPolicy,
-    }),
     validate({ body: RefreshRequestSchema }),
     asyncHandler(async (req, res) => {
       const store = requireStore(req);

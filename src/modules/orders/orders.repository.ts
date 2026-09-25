@@ -1133,6 +1133,15 @@ export function createOrdersRepository(deps: { db: Database }) {
       }));
     },
 
+    /**
+     * Does this customer belong to this store?
+     *
+     * `app_user` is a single global identity — it carries no `store_id` — so "belongs to this
+     * store" is answered the only way it can be now: at least one order placed with this store.
+     * This is what keeps `listStoreOrdersForCustomer`'s 404 honest: a customer who exists
+     * globally but has never ordered from this store must not be distinguishable from staff as
+     * "found, zero orders" — both collapse to `NotFound`.
+     */
     async storeCustomerExists(params: { storeId: string; customerId: string }): Promise<boolean> {
       const [row] = await executor(db)
         .select({ id: appUser.id })
@@ -1140,8 +1149,8 @@ export function createOrdersRepository(deps: { db: Database }) {
         .where(
           and(
             eq(appUser.id, params.customerId),
-            eq(appUser.storeId, params.storeId),
             isNull(appUser.deletedAt),
+            sql`exists (select 1 from ${order} where ${order.userId} = ${appUser.id} and ${order.storeId} = ${params.storeId})`,
           ),
         )
         .limit(1);

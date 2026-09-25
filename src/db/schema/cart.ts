@@ -54,12 +54,10 @@ export const cart = pgTable(
   {
     id: primaryId(),
 
-    /**
-     * No single-column FK to `app_user`. The composite key below covers this reference AND the
-     * store agreement in one constraint; a second, weaker FK to the same parent would be
-     * redundant and would imply the composite one was optional.
-     */
-    userId: uuid('user_id').notNull(),
+    /** `app_user` is global, so tenancy is decided by `store_id` on this row alone. */
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     /**
      * Denormalised, matching `sku`, `stock_item` and `address`: every repository predicate in
@@ -84,23 +82,6 @@ export const cart = pgTable(
     ...timestamps,
   },
   (t) => [
-    /**
-     * Ownership AND tenancy in one constraint: the cart's user must exist, and its store must be
-     * that user's store. A cross-store cart is unrepresentable rather than merely rejected by
-     * application code.
-     *
-     * The target index `uq_app_user_id_store` already exists — Increment 27 created it for
-     * `address` — so this needs no new index on `app_user`.
-     *
-     * `RESTRICT`, matching every other reference to `app_user`: users are soft-deleted, so a
-     * hard delete that still has carts attached is a bug and must fail loudly.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_cart_user_store',
-    }).onDelete('restrict'),
-
     /**
      * **Exactly one ACTIVE cart per customer per store.**
      *

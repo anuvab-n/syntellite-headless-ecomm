@@ -374,10 +374,9 @@ describe('PATCH /api/v1/users/me (integration)', () => {
         storeId: newId(),
       });
 
-      // A tenancy escape: a user who could rewrite their own `store_id` would appear in
-      // another merchant's customer list.
+      // Unknown fields are rejected outright, so nothing about the account can be rewritten.
       expect(response.status).toBe(400);
-      expect((await rowOf(userId))?.storeId).toBe(storeId);
+      expect((await rowOf(userId))?.firstName).not.toBe('Grace');
     });
 
     it('rejects passwordHash', async () => {

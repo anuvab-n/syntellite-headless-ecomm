@@ -1,7 +1,6 @@
 import { sql } from 'drizzle-orm';
 import {
   check,
-  foreignKey,
   index,
   integer,
   jsonb,
@@ -54,7 +53,9 @@ export const idempotencyKey = pgTable(
      * supports it, but Drizzle 0.45's `uniqueIndex` builder does not expose the option, and
      * reaching for a raw index would put the constraint outside what `drizzle-kit` can diff.
      */
-    userId: uuid('user_id').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     /** The client-supplied `Idempotency-Key` header, verbatim. */
     key: varchar('key', { length: 255 }).notNull(),
@@ -119,17 +120,6 @@ export const idempotencyKey = pgTable(
      * for the reason given on that column.
      */
     uniqueIndex('uq_idempotency_key').on(t.storeId, t.userId, t.key, t.endpoint),
-
-    /**
-     * Ownership AND tenancy in one constraint, matching every other reference to `app_user`:
-     * the key's user must exist and must belong to its store. Without it a key could be written
-     * against a user from another tenant, which is the very isolation this column adds.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_idempotency_user_store',
-    }).onDelete('restrict'),
 
     /** The purge scan. Partial, so it covers only rows still worth looking at. */
     index('ix_idempotency_expiry').on(t.expiresAt),

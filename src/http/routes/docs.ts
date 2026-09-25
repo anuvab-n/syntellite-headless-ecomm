@@ -1918,44 +1918,6 @@ const COMMON_ERRORS = {
   ),
 } as const;
 
-/**
- * The 429, documented for the rate-limited auth endpoints only.
- *
- * NOT in `COMMON_ERRORS`, because limits are applied per route. Only the endpoints that run
- * Argon2 carry one today, and promising a 429 on a future catalogue endpoint that has no
- * limiter would be a spec that lies in the other direction.
- *
- * Both signals are documented because both are sent: the header is what an SDK or proxy
- * honours without any client code, the body field is what a UI renders.
- */
-const RATE_LIMIT_ERROR = {
-  '429': {
-    ...errorResponse(
-      [
-        'Too many attempts. Two independent limits apply: one per client IP counting **every** attempt,',
-        'and — on login — one per email address counting **failed** attempts only, which resets on a',
-        'successful sign-in. Retry after the interval in `Retry-After` or `details.retryAfterSeconds`.',
-        'A 429 does not indicate whether the account exists.',
-      ].join(' '),
-      'RATE_LIMITED',
-    ),
-    headers: {
-      'Retry-After': {
-        description: 'Seconds to wait before retrying (RFC 9110 §10.2.3).',
-        schema: { type: 'integer', example: 42 },
-      },
-      'X-RateLimit-Limit': {
-        description: 'Attempts permitted per window for the limit that was hit.',
-        schema: { type: 'integer', example: 10 },
-      },
-      'X-RateLimit-Remaining': {
-        description: 'Attempts left in the current window. Sent on successful responses too.',
-        schema: { type: 'integer', example: 0 },
-      },
-    },
-  },
-} as const;
-
 /** The `{slug}` path parameter, shared by every product endpoint that takes one. */
 /**
  * The media routes address an image by id.
@@ -2076,17 +2038,11 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       title: 'E-commerce Backend API',
       version: '1.0.0',
       description: [
-        'Headless commerce API.',
+        'Headless Commerce REST API.',
         '',
-        '**Store scoping.** Every `/api/v1` route resolves a store before the handler runs. The',
-        'platform is single-store for now (`DEFAULT_STORE_SLUG`), so no header or parameter is',
-        'required — but a user, an email address, and a session all belong to exactly one store.',
-        '',
-        '**Errors.** Every failure returns the same envelope. Switch on `error.code`, never on',
-        '`error.message`, which is prose and may be reworded.',
-        '',
-        '**Unknown fields are rejected.** Request bodies are strict: sending a field that is not',
-        'documented returns `400`, it is not silently ignored.',
+        '**Store Scoping**: All API endpoints are store-scoped.',
+        '**Authentication**: Bearer Token (JWT). Staff endpoints require admin authorization.',
+        '**Error Handling**: Standardized JSON error response format.',
       ].join('\n'),
     },
     servers: [
@@ -2098,59 +2054,43 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
       },
     ],
     tags: [
-      { name: 'Authentication', description: 'Registration and session establishment.' },
+      {
+        name: 'Authentication',
+        description: 'User registration, login, token management, and auth sessions.',
+      },
       {
         name: 'Dashboard',
-        description:
-          'The admin overview screen, in one read. Composition only — every figure is computed by the module that owns the rows, and this endpoint assembles them. The date range is an ANALYTICS window: it governs revenue, order count, the sales series and the top products, and deliberately nothing else. Product and customer counts, order status, low stock and recent orders are as-of-now operational facts, because a customer total silently narrowed to a month would be read as a lifetime figure.',
+        description: 'Admin analytics, sales overview, and store operational metrics.',
       },
-      {
-        name: 'Users',
-        description:
-          'The authenticated user’s own account, and the staff customer directory. `/users/me` is self-scoped for everyone including staff — privilege does not widen it, so there is no impersonation path. `GET /admin/customers` is the separate, store-scoped staff surface: a read-only list, with no detail, order history, search, activation or deactivation.',
-      },
+      { name: 'Users', description: 'Customer profiles and admin customer management.' },
       {
         name: 'Orders',
-        description:
-          "Checkout, the customer's own order history, and the staff order surface. Orders are immutable records: every product, price and address value is copied at checkout, so later catalogue or address edits never change a past order. The `/admin` routes are store-scoped rather than owner-scoped — staff read any order in their own store, and none from another. `/users/me` stays self-scoped for everyone, staff included, so there is no impersonation path.",
+        description: 'Order placement, customer order history, and admin order management.',
       },
       {
         name: 'Payments',
-        description:
-          'Paying for an order. One payment per order, and **payment state is a separate lifecycle from order state** — `order.status` stays `placed` whatever happens to the payment. Two methods: `online` through the configured gateway, and `cod` (cash on delivery), which never touches one. The amount is always exactly `order.total`; a client cannot supply it. The staff surface is exactly one route and it is a READ — `GET /admin/payments`, store-scoped. There is still no refund, retry, reconciliation or settlement surface, and no staff mutation of any kind. Instrument data — card, UPI, bank, token — never reaches this system.',
+        description: 'Payment processing, payment status tracking, and admin refunds.',
       },
       {
         name: 'Webhooks',
-        description:
-          'Provider callbacks. **Not store-scoped and not token-authenticated**: a gateway holds no access token, so authentication is a signature over the exact raw request bytes, and the tenant is derived from the payment the verified provider reference names — never from anything in the request. Endpoints are provider-specific by path, because each provider brings its own signature scheme and event vocabulary.',
+        description: 'Payment provider webhook callbacks and signature verification.',
       },
-      {
-        name: 'Promotions',
-        description:
-          'Coupon-code discounts. Staff configure them under /admin/promotions; a customer applies one to their own cart. There is no customer-facing way to list or discover promotions.',
-      },
+      { name: 'Promotions', description: 'Coupon codes and promotional discount management.' },
       {
         name: 'Cart',
-        description:
-          "The authenticated customer's own shopping cart. No staff or admin surface, and no guest carts.",
+        description: 'Shopping cart operations, line item updates, and applied discounts.',
       },
+      { name: 'Addresses', description: 'Customer shipping and billing address book management.' },
       {
-        name: 'Addresses',
-        description:
-          "The authenticated customer's own address book. No staff or admin surface: addresses are personal data and nothing needs them yet.",
+        name: 'Catalogue',
+        description: 'Product catalog, categories, and SKU variant management.',
       },
-      { name: 'Catalogue', description: 'Products. Admin writes require the staff scope.' },
       {
         name: 'Inventory',
-        description:
-          'Stock levels and the append-only ledger of every change. Staff only; there is no public inventory surface.',
+        description: 'Stock tracking, ledger adjustments, and low-stock alerts.',
       },
-      {
-        name: 'Tax',
-        description:
-          'GST configuration and tax identity. The staff routes configure what customers are charged; the three customer routes reach only the caller own registration.',
-      },
-      { name: 'Health', description: 'Liveness and readiness probes. Not store-scoped.' },
+      { name: 'Tax', description: 'GST configuration and tax identification management.' },
+      { name: 'Health', description: 'System liveness and readiness probe checks.' },
     ],
     components: {
       responses: {
@@ -2786,7 +2726,6 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'An account with this email — or phone — already exists in this store. The message is deliberately generic and does not echo the address.',
               'EMAIL_ALREADY_REGISTERED',
             ),
-            ...RATE_LIMIT_ERROR,
             ...COMMON_ERRORS,
           },
         },
@@ -2873,7 +2812,6 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'Invalid credentials. Identical for an unknown email, a wrong password, a deactivated account, and an erased account.',
               'INVALID_CREDENTIALS',
             ),
-            ...RATE_LIMIT_ERROR,
             ...COMMON_ERRORS,
           },
         },
@@ -2892,10 +2830,6 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             'indistinguishable, because any difference here would be an account-existence oracle —',
             'anyone could test an address list against this endpoint and learn who shops here. The',
             'response says nothing about whether a mail was queued.',
-            '',
-            'That makes rate limiting the actual defence, and it is applied on two dimensions: per',
-            'IP so the endpoint cannot be swept, and per email so one customer cannot be flooded',
-            'with reset mail by somebody who knows their address.',
             '',
             '### The link',
             '',
@@ -2928,10 +2862,6 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               description:
                 'Received. Whether an account exists, and whether a mail was sent, is deliberately not disclosed.',
             },
-            '429': errorResponse(
-              'Too many attempts from this IP, or too many for this address. Retry-After says when to try again.',
-              'RATE_LIMITED',
-            ),
             ...COMMON_ERRORS,
           },
         },
@@ -2990,10 +2920,6 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
             '409': errorResponse(
               'The password was changed by another request while this one was in flight. Retrying is the right response.',
               'CONFLICT',
-            ),
-            '429': errorResponse(
-              'Too many attempts from this IP. Retry-After says when to try again.',
-              'RATE_LIMITED',
             ),
             ...COMMON_ERRORS,
             /*
@@ -6071,7 +5997,6 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
               'The refresh token is invalid. Identical for a fabricated token, an expired one, one already consumed by a previous rotation, one revoked by logout, one revoked because a sibling was replayed, and one belonging to a deactivated account. The response never reveals which — including whether the token ever existed.',
               'INVALID_REFRESH_TOKEN',
             ),
-            ...RATE_LIMIT_ERROR,
             ...COMMON_ERRORS,
           },
         },
@@ -11620,7 +11545,7 @@ export function buildOpenApiSpec(config: Config): Record<string, unknown> {
                       checks: {
                         type: 'object',
                         additionalProperties: { type: 'string', enum: ['ok', 'degraded'] },
-                        example: { postgres: 'ok', redis: 'ok' },
+                        example: { postgres: 'ok' },
                       },
                     },
                   },

@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { check, foreignKey, index, pgTable, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
+import { check, index, pgTable, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 
 import { primaryId, storeIdColumn, tsColumn } from './_shared.js';
 import { appUser } from './identity.js';
@@ -44,7 +44,9 @@ export const passwordResetToken = pgTable(
     storeId: storeIdColumn(() => store.id),
 
     /** Whose password this token can change. */
-    userId: uuid('user_id').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'cascade' }),
 
     /**
      * SHA-256 hex of the token handed to the customer — 64 characters.
@@ -73,16 +75,6 @@ export const passwordResetToken = pgTable(
   (t) => [
     /** The lookup, and the guarantee that one digest identifies at most one token. */
     uniqueIndex('uq_password_reset_token').on(t.tokenHash),
-
-    /**
-     * Ownership AND tenancy in one constraint, matching every other reference to `app_user`.
-     * A token that could name a user from another tenant is a cross-store account takeover.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_password_reset_user_store',
-    }).onDelete('cascade'),
 
     /**
      * The purge scan, and the "invalidate this user's other tokens" write.

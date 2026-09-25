@@ -18,7 +18,6 @@ export {
   REVOKED_REASON_PASSWORD_CHANGE,
   REVOKED_REASON_ROTATION_REUSE,
   type IdentityService,
-  type LoginAttemptTracker,
 } from './identity.service.js';
 export { createIdentityRepository, type IdentityRepository } from './identity.repository.js';
 export { createIdentityRoutes } from './identity.routes.js';

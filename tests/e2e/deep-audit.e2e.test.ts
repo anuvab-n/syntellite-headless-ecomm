@@ -2346,7 +2346,7 @@ describe('deep audit (new customer + new admin, full flow, graded findings)', ()
       .from(returnRequest)
       .where(eq(returnRequest.storeId, storeId));
     const stock = await db().select().from(stockItem).where(eq(stockItem.storeId, storeId));
-    const users = await db().select().from(appUser).where(eq(appUser.storeId, storeId));
+    const users = await db().select().from(appUser);
 
     line(
       `  users       : ${String(users.length)}  (${String(users.filter((user) => user.isStaff).length)} staff)`,

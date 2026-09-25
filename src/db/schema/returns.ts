@@ -137,7 +137,9 @@ export const returnRequest = pgTable(
      * list (`GET /users/me/returns`) filters on it and would otherwise need the order table for
      * a predicate that never changes.
      */
-    userId: uuid('user_id').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     /**
      * The public identifier. `RET-YYYYMMDD-XXXXXX`.
@@ -227,12 +229,6 @@ export const returnRequest = pgTable(
       columns: [t.orderId, t.storeId],
       foreignColumns: [order.id, order.storeId],
       name: 'fk_return_order_store',
-    }).onDelete('restrict'),
-
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_return_user_store',
     }).onDelete('restrict'),
 
     check(

@@ -49,16 +49,7 @@ describe('process lifecycle (integration)', () => {
    * surrounding test times out, which is exactly the leak worth catching: a connected
    * socket keeps the event loop alive and the process never exits.
    */
-  async function expectRedisClosed(client: Redis | undefined): Promise<void> {
-    /**
-     * Accepts `undefined` because `AppContainer.locks` is optional — a deployment with no
-     * `REDIS_LOCK_URL` builds no client. Every container here is built with one, so a
-     * missing client means the wiring broke, and asserting that is the point: skipping the
-     * check instead would let a container that silently stopped creating the client pass a
-     * test named "leaves no Redis connection connected".
-     */
-    expect(client).toBeDefined();
-    if (!client) return;
+  async function expectRedisClosed(client: Redis): Promise<void> {
     if (client.status !== 'end') {
       await once(client, 'end');
     }
@@ -84,7 +75,7 @@ describe('process lifecycle (integration)', () => {
       expect(ready.status).toBe(200);
       expect(await ready.json()).toEqual({
         status: 'ok',
-        checks: { postgres: 'ok', redis: 'ok' },
+        checks: { postgres: 'ok' },
       });
 
       // The exact sequence from main.ts: drain HTTP first, then close the container.
@@ -180,7 +171,6 @@ describe('process lifecycle (integration)', () => {
       // connection, the lock client, and the pool. A hang here means one has no owner —
       // which is precisely the bug found and fixed in Step 6.
       expect(elapsed).toBeLessThan(15_000);
-      await expectRedisClosed(container.locks);
     }, 60_000);
 
     // SKIPPED: BullMQ is commented out for now — see the note above.
@@ -204,7 +194,6 @@ describe('process lifecycle (integration)', () => {
       const queueConnection = container.outbox.queues?.connection;
       expect(queueConnection).toBeDefined();
       if (queueConnection) await expectRedisClosed(queueConnection);
-      await expectRedisClosed(container.locks);
 
       for (const worker of container.outbox.workers?.workers ?? []) {
         expect(worker.isRunning()).toBe(false);

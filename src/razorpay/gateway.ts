@@ -13,7 +13,7 @@ import type { Logger } from '../shared/logger.js';
  * the other. Swapping providers is a new file in a sibling directory and one line in the
  * composition root.
  *
- * Parallel to `redis/rate-limiter.ts`: an adapter for an external system, at the top level
+ * Parallel to `mail/mailer.ts`: an adapter for an external system, at the top level
  * rather than inside a domain module, because a domain module that imported a gateway SDK could
  * no longer be tested without one.
  *

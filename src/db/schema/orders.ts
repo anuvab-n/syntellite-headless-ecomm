@@ -126,7 +126,9 @@ export const order = pgTable(
      * way for this increment, and reversing it later is a deliberate migration rather than a
      * column that silently permits an ownerless order today.
      */
-    userId: uuid('user_id').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => appUser.id, { onDelete: 'restrict' }),
 
     /**
      * The cart this order was made from.
@@ -378,17 +380,6 @@ export const order = pgTable(
      * entry to remove a sort that costs 26kB.
      */
     index('ix_order_store_placed').on(t.storeId, t.placedAt),
-
-    /**
-     * Ownership AND tenancy in one constraint: the order's user must exist, and its store must
-     * be that user's store. A cross-store order is unrepresentable rather than merely refused
-     * by application code.
-     */
-    foreignKey({
-      columns: [t.userId, t.storeId],
-      foreignColumns: [appUser.id, appUser.storeId],
-      name: 'fk_order_user_store',
-    }).onDelete('restrict'),
 
     /**
      * RESTRICT, not CASCADE. Deleting a cart must never take an order with it — that would

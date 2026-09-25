@@ -175,17 +175,6 @@ export class IdempotencyKeyReuse extends BusinessRuleViolation {
   }
 }
 
-/* ── 429 ─────────────────────────────────────────────────────────────────── */
-
-export class RateLimited extends DomainError {
-  readonly code = 'RATE_LIMITED';
-  readonly statusCode = 429;
-
-  constructor(retryAfterSeconds: number) {
-    super('Too many requests. Please retry later.', { details: { retryAfterSeconds } });
-  }
-}
-
 /* ── 503 ─────────────────────────────────────────────────────────────────── */
 
 /**
